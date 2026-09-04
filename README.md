@@ -28,8 +28,8 @@ Default model configuration lives at `~/.pi/agent/advisor.json`:
 
 ```json
 {
-  "primary": { "provider": "<provider>", "model": "gpt-5.6-sol" },
-  "fallback": { "provider": "<provider>", "model": "gpt-5.6-terra" },
+  "primary": { "provider": "<provider>", "model": "example-model-id" },
+  "fallback": { "provider": "<provider>", "model": "example-fallback-model" },
   "reasoningEffort": "high"
 }
 ```
