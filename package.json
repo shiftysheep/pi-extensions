@@ -1,17 +1,47 @@
 {
   "name": "@shiftysheep/pi-extensions",
-  "version": "1.0.0",
-  "description": "Custom Pi extensions: advisor, cron, plan-mode, permission-gate, status-line",
+  "version": "2.0.0",
+  "description": "Custom extensions for pi (advisor, cron-tips, permission-gate, status-line); bundles recommended installs: pi-web-access, pi-subagents (skills+prompts), @juicesharp/rpiv-ask-user-question, @juicesharp/rpiv-todo, @ff-labs/pi-fff.",
   "keywords": [
     "pi-package"
   ],
   "type": "module",
   "license": "MIT",
+  "dependencies": {
+    "@ff-labs/pi-fff": "^0.10.6",
+    "@juicesharp/rpiv-ask-user-question": "^2.9.0",
+    "@juicesharp/rpiv-todo": "^2.9.0",
+    "pi-subagents": "^0.65.0",
+    "pi-web-access": "^0.27.0"
+  },
+  "bundledDependencies": [
+    "@ff-labs/pi-fff",
+    "@juicesharp/rpiv-ask-user-question",
+    "@juicesharp/rpiv-todo",
+    "pi-subagents",
+    "pi-web-access"
+  ],
   "peerDependencies": {
-    "@earendil-works/pi-agent": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions",
+      "node_modules/@ff-labs/pi-fff/src/index.ts",
+      "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
+      "node_modules/@juicesharp/rpiv-todo/index.ts",
+      "node_modules/pi-subagents/index.ts",
+      "node_modules/pi-web-access/index.ts"
+    ],
+    "skills": [
+      "node_modules/pi-subagents/skills"
+    ],
+    "prompts": [
+      "node_modules/pi-subagents/prompts"
+    ]
   }
 }
