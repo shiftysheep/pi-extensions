@@ -1,7 +1,7 @@
 {
   "name": "@shiftysheep/pi-extensions",
   "version": "2.0.3",
-  "description": "Custom extensions for pi (advisor, cron-tips, permission-gate, status-line); bundles recommended installs: pi-web-access, pi-subagents (skills+prompts), @juicesharp/rpiv-ask-user-question, @juicesharp/rpiv-todo, @ff-labs/pi-fff.",
+  "description": "Custom extensions for pi (advisor, cron-tips, permission-gate, status-line); bundles recommended installs: pi-web-access, pi-subagents (skills+prompts), @juicesharp/rpiv-ask-user-question, @juicesharp/rpiv-todo, @ff-labs/pi-fff, @upstash/context7-pi (tools+skills+prompts).",
   "keywords": [
     "pi-package"
   ],
@@ -25,6 +25,7 @@
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
     "@juicesharp/rpiv-todo": "^2.9.0",
+    "@upstash/context7-pi": "^0.1.2",
     "pi-subagents": "^0.65.0",
     "pi-web-access": "^0.28.0"
   },
@@ -32,6 +33,7 @@
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
+    "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"
   ],
@@ -48,14 +50,17 @@
       "node_modules/@ff-labs/pi-fff/src/index.ts",
       "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
       "node_modules/@juicesharp/rpiv-todo/index.ts",
+      "node_modules/@upstash/context7-pi/extensions/context7.ts",
       "node_modules/pi-subagents/index.ts",
       "node_modules/pi-web-access/index.ts"
     ],
     "skills": [
-      "node_modules/pi-subagents/skills"
+      "node_modules/pi-subagents/skills",
+      "node_modules/@upstash/context7-pi/skills"
     ],
     "prompts": [
-      "node_modules/pi-subagents/prompts"
+      "node_modules/pi-subagents/prompts",
+      "node_modules/@upstash/context7-pi/prompts"
     ]
   },
   "devDependencies": {
@@ -71,6 +76,7 @@
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
+    "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"
   ]

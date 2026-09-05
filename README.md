@@ -20,6 +20,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 - `@juicesharp/rpiv-ask-user-question` — structured question prompts (up to 4 at a time, multi-select, previews).
 - `@juicesharp/rpiv-todo` — task list tracking with statuses, dependencies, tombstones.
 - `@ff-labs/pi-fff` — fast fuzzy grep/find tools. Pulls platform-specific native binaries via optional deps; tested on linux-x64, other platforms resolve at install time but are less verified.
+- `@upstash/context7-pi` (official Upstash/Context7 package, + its skill and prompt templates loaded via the package manifest) — `resolve-library-id` and `query-docs` tools for up-to-date library docs, plus a `/c7-docs <library> <question>` prompt. Works without config under IP-based limits; set `CONTEXT7_API_KEY` for higher quotas.
 
 ## Install
 
