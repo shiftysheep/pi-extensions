@@ -1,0 +1,12 @@
+# Python commitizen drives releases here (`cz bump`); the npm `cz` (via
+# `npm run commit`) is only the interactive commit-message wizard.
+[tool.commitizen]
+version = "2.0.2"
+name = "cz_conventional_commits"
+tag_format = "v$version"
+# package.json + package-lock.json + this file's version key are handled
+# automatically by commitizen's npm provider; only extra locations go here.
+version_files = [
+    "README.md:pi-extensions@v\\d+\\.\\d+\\.\\d+",
+]
+changelog = false

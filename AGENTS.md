@@ -48,8 +48,14 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
 Releases are git tags; installs pin the tag:
 `pi install git:github.com/shiftysheep/pi-extensions@vX.Y.Z`
 
-To cut a release: bump `version` in `package.json`, update the install line in the
-README, commit as `vX.Y.Z: <summary>`, and `git tag vX.Y.Z`.
+To cut a release, run **`cz bump --increment PATCH|MINOR|MAJOR`** (Python
+commitizen, config in `.cz.toml`). It bumps the version in `package.json`,
+`package-lock.json`, the README install line, and `.cz.toml` itself, makes a
+`chore(release): vX.Y.Z` commit, and creates the `vX.Y.Z` tag. Then
+`git push --follow-tags`. Use `cz bump --dry-run` to preview.
+
+Note: npm's `cz` (`npm run commit`) is only the interactive commit-message
+wizard; release bumps always go through Python commitizen's `cz bump`.
 
 ## Gotchas
 
