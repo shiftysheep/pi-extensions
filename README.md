@@ -10,7 +10,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 |---|---|
 | `advisor.ts` | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps (`+30m` or ISO) and repeating intervals. State is snapshotted into the session, so schedules survive `/reload` (not process exit). No OS-level cron jobs created. |
-| `permission-gate.ts` | Prompts for confirmation before potentially dangerous bash commands (`rm -rf`, `sudo`, `chmod/chown ... 777`). |
+| `permission-gate.ts` | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`). Not a security boundary — see the file header. |
 | `status-line.ts` | Custom footer with a tok/s estimate while streaming. Pass `undefined` to pi's `setFooter()` to restore the original footer. |
 
 ### Bundled recommended installs (declared as dependencies, resolved by npm at install time)
