@@ -42,9 +42,12 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 {
   "primary": { "provider": "<provider-id>", "model": "<model-id>" },
   "fallback": { "provider": "<provider-id>", "model": "<model-id>" },
-  "reasoningEffort": "high"
+  "reasoningEffort": "high",
+  "exploreBudget": { "toolCalls": 32, "modelRequests": 16 }
 }
 ```
+
+`exploreBudget` (optional) tunes the explore-mode spend caps (positive integers, at most 100 tool calls / 40 model requests); defaults are 24 / 12 when unset.
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). Missing file or invalid JSON fails gracefully to a generic second-model choice.
 
@@ -57,9 +60,10 @@ on a tool call to omit the transcript. Two modes:
   Cheap and fast; it identifies missing evidence instead of inspecting the repo.
 - **`explore`**: the advisor runs as a nested *read-only* agent and may inspect the
   workspace itself with `read`, `grep`, `find`, and `ls`. Bounded by hard spend caps
-  (≤12 tool calls, ≤6 model requests, 10-minute timeout); exhausting a budget returns an
-  explicit **incomplete** result, never an authoritative verdict. Use only when the question
-  requires locating code or verifying repository facts.
+  (≤24 tool calls, ≤12 model requests by default, tunable via `exploreBudget`, 10-minute
+  timeout); exhausting a budget returns an explicit **incomplete** result, never an
+  authoritative verdict. Use only when the question requires locating code or verifying
+  repository facts.
 
 Every result text ends with a model-visible status footer (`[advisor: mode=…, status=…,
 toolCalls=…, elapsed=…s]`); the same envelope plus `model`/`source` is also carried in the

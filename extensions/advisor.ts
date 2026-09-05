@@ -27,8 +27,11 @@ const MAX_QUESTION_CHARS = 20_000;
 const ADVISOR_TOOLS = ["read", "grep", "find", "ls"];
 const ADVISOR_REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 const ADVISOR_EXPLORE_TIMEOUT_MS = 10 * 60 * 1000;
-const ADVISOR_MAX_TOOL_CALLS = 12;
-const ADVISOR_MAX_MODEL_REQUESTS = 6;
+// Defaults for explore-mode spend caps; tunable per install via advisor.json `exploreBudget`.
+const ADVISOR_MAX_TOOL_CALLS = 24;
+const ADVISOR_MAX_MODEL_REQUESTS = 12;
+// Hard ceilings for configured budgets, so a typo can't make an exploration unbounded.
+const EXPLORE_BUDGET_LIMITS = { toolCalls: 100, modelRequests: 40 } as const;
 const APPROX_CHARS_PER_TOKEN = 3.5;
 const MIN_RESPONSE_RESERVE_TOKENS = 1_024;
 
@@ -65,7 +68,8 @@ instead of inventing facts. Your final message is delivered verbatim to the call
 agent, so make it self-contained advice.`;
 
 type AdvisorTarget = { provider?: string; model: string; effort?: AdvisorReasoningEffort };
-type AdvisorConfig = { primary?: AdvisorTarget; fallback?: AdvisorTarget; reasoningEffort?: AdvisorReasoningEffort };
+type AdvisorExploreBudget = { toolCalls: number; modelRequests: number };
+type AdvisorConfig = { primary?: AdvisorTarget; fallback?: AdvisorTarget; reasoningEffort?: AdvisorReasoningEffort; exploreBudget?: AdvisorExploreBudget };
 type AdvisorCandidate = { target: AdvisorTarget; source: string };
 type AdvisorSlot = "primary" | "fallback";
 
@@ -174,11 +178,30 @@ function isReasoningEffort(value: unknown): value is AdvisorReasoningEffort {
 	return typeof value === "string" && (REASONING_EFFORTS as readonly string[]).includes(value);
 }
 
+function parseExploreBudget(value: unknown): AdvisorExploreBudget | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object") throw new Error(`${CONFIG_PATH}: exploreBudget must be an object with toolCalls/modelRequests.`);
+	const candidate = value as { toolCalls?: unknown; modelRequests?: unknown };
+	if (candidate.toolCalls === undefined && candidate.modelRequests === undefined) {
+		throw new Error(`${CONFIG_PATH}: exploreBudget requires at least one of toolCalls/modelRequests.`);
+	}
+	const parseField = (name: "toolCalls" | "modelRequests", v: unknown, fallback: number) => {
+		if (v === undefined) return fallback;
+		if (typeof v !== "number" || !Number.isInteger(v) || v < 1) throw new Error(`${CONFIG_PATH}: exploreBudget.${name} must be a positive integer.`);
+		if (v > EXPLORE_BUDGET_LIMITS[name]) throw new Error(`${CONFIG_PATH}: exploreBudget.${name} must be at most ${EXPLORE_BUDGET_LIMITS[name]}.`);
+		return v;
+	};
+	return {
+		toolCalls: parseField("toolCalls", candidate.toolCalls, ADVISOR_MAX_TOOL_CALLS),
+		modelRequests: parseField("modelRequests", candidate.modelRequests, ADVISOR_MAX_MODEL_REQUESTS),
+	};
+}
+
 function loadConfig(): AdvisorConfig {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 		if (!parsed || typeof parsed !== "object") throw new Error(`${CONFIG_PATH}: top level must be an object.`);
-		const config = parsed as { primary?: unknown; fallback?: unknown; reasoningEffort?: unknown };
+		const config = parsed as { primary?: unknown; fallback?: unknown; reasoningEffort?: unknown; exploreBudget?: unknown };
 		if (config.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(config.reasoningEffort as AdvisorReasoningEffort)) {
 			throw new Error(`${CONFIG_PATH}: reasoningEffort must be one of: ${REASONING_EFFORTS.join(", ")}.`);
 		}
@@ -186,6 +209,7 @@ function loadConfig(): AdvisorConfig {
 			primary: parseTarget(config.primary, "primary"),
 			fallback: parseTarget(config.fallback, "fallback"),
 			reasoningEffort: config.reasoningEffort as AdvisorReasoningEffort | undefined,
+			exploreBudget: parseExploreBudget(config.exploreBudget),
 		};
 	} catch (error: unknown) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
@@ -204,10 +228,11 @@ function loadConfigSafe(): { config: AdvisorConfig; loadError?: string } {
 }
 
 function saveConfig(config: AdvisorConfig): void {
-	const out: { primary?: AdvisorTarget; fallback?: AdvisorTarget; reasoningEffort?: AdvisorReasoningEffort } = {};
+	const out: { primary?: AdvisorTarget; fallback?: AdvisorTarget; reasoningEffort?: AdvisorReasoningEffort; exploreBudget?: AdvisorExploreBudget } = {};
 	if (config.primary) out.primary = config.primary;
 	if (config.fallback) out.fallback = config.fallback;
 	if (config.reasoningEffort) out.reasoningEffort = config.reasoningEffort;
+	if (config.exploreBudget) out.exploreBudget = config.exploreBudget;
 	// Write a temp file in the same directory, then rename atomically, so an interrupted
 	// write or a concurrent reader never sees a truncated/invalid config.
 	const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
@@ -268,6 +293,9 @@ function describeConfig(config: AdvisorConfig, activeModelLabel?: string): strin
 		["primary", formatTarget(config.primary)],
 		["fallback (secondary)", formatTarget(config.fallback)],
 		["default effort", config.reasoningEffort ?? "(medium)"],
+		["explore budget", config.exploreBudget
+			? `${config.exploreBudget.toolCalls} tool calls / ${config.exploreBudget.modelRequests} model requests`
+			: `${ADVISOR_MAX_TOOL_CALLS} tool calls / ${ADVISOR_MAX_MODEL_REQUESTS} model requests (default)`],
 	];
 	// Retry chain: configured slots in order, then the active model as a last resort
 	// when it is not already one of them (see buildCandidates).
@@ -364,7 +392,7 @@ function neutralReasoningEffort(model: Model<any>, effort: AdvisorReasoningEffor
 }
 
 type AdvisorStatus = "completed" | "timed_out" | "aborted" | "budget_exhausted";
-type AdvisorConsultResult = { text: string; usage?: Usage; toolCalls: number; status: AdvisorStatus };
+type AdvisorConsultResult = { text: string; usage?: Usage; toolCalls: number; modelRequests: number; status: AdvisorStatus };
 
 /**
  * Cheap review mode: a single streamSimple call that answers from the question and
@@ -417,10 +445,10 @@ async function consultWithStreamSimple(opts: {
 				},
 			)
 			.result();
-		if (timedOut) return { text: "", usage: response.usage, toolCalls: 0, status: "timed_out" };
-		if (opts.signal?.aborted === true || response.stopReason === "aborted") return { text: "", usage: response.usage, toolCalls: 0, status: "aborted" };
+		if (timedOut) return { text: "", usage: response.usage, toolCalls: 0, modelRequests: 0, status: "timed_out" };
+		if (opts.signal?.aborted === true || response.stopReason === "aborted") return { text: "", usage: response.usage, toolCalls: 0, modelRequests: 0, status: "aborted" };
 		if (response.stopReason === "error") throw new Error(response.errorMessage || "The advisor request failed without an error message.");
-		return { text: textFromContent(response.content).trim() || "The advisor returned no text.", usage: response.usage, toolCalls: 0, status: "completed" };
+		return { text: textFromContent(response.content).trim() || "The advisor returned no text.", usage: response.usage, toolCalls: 0, modelRequests: 0, status: "completed" };
 	} finally {
 		clearTimeout(timer);
 		opts.signal?.removeEventListener("abort", onOuterAbort);
@@ -440,6 +468,8 @@ async function consultWithAgentSession(opts: {
 	transcript: string;
 	effort: AdvisorReasoningEffort;
 	cwd: string;
+	maxToolCalls: number;
+	maxModelRequests: number;
 	signal?: AbortSignal;
 	onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }) => void;
 }): Promise<AdvisorConsultResult> {
@@ -489,7 +519,7 @@ async function consultWithAgentSession(opts: {
 			finalText = lastAssistant ? textFromContent(lastAssistant.content).trim() : "";
 		}
 		// Hard spend caps: exhaustion yields an explicit incomplete result, not a verdict.
-		if (toolCalls > ADVISOR_MAX_TOOL_CALLS || modelRequests > ADVISOR_MAX_MODEL_REQUESTS) {
+		if (toolCalls >= opts.maxToolCalls || modelRequests >= opts.maxModelRequests) {
 			budgetExhausted = true;
 			void session.abort();
 		}
@@ -513,10 +543,10 @@ async function consultWithAgentSession(opts: {
 		unsubscribe();
 	}
 
-	if (timedOut) return { text: finalText, usage: combinedUsage, toolCalls, status: "timed_out" };
-	if (opts.signal?.aborted === true) return { text: finalText, usage: combinedUsage, toolCalls, status: "aborted" };
-	if (budgetExhausted) return { text: finalText, usage: combinedUsage, toolCalls, status: "budget_exhausted" };
-	return { text: finalText || "The advisor returned no text.", usage: combinedUsage, toolCalls, status: "completed" };
+	if (timedOut) return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "timed_out" };
+	if (opts.signal?.aborted === true) return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "aborted" };
+	if (budgetExhausted) return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "budget_exhausted" };
+	return { text: finalText || "The advisor returned no text.", usage: combinedUsage, toolCalls, modelRequests, status: "completed" };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -527,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 		throw new Error(`Unknown slot "${raw}". Expected primary or fallback.`);
 	};
 
-	const usageHints = "Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nIf every configured slot fails, the active model is retried last (shown as \"retry chain\"). Effort \"none\" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: \"review\" (default, single model call) and \"explore\" (read-only sub-agent with read/grep/find/ls, hard spend caps).";
+	const usageHints = "Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nIf every configured slot fails, the active model is retried last (shown as \"retry chain\"). Effort \"none\" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: \"review\" (default, single model call) and \"explore\" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json).";
 
 	pi.registerCommand("advisor", {
 		description: "Configure advisor (second-opinion) models in ~/.pi/agent/advisor.json; no args shows config and offers the picker.",
@@ -631,7 +661,7 @@ export default function (pi: ExtensionAPI) {
 			provider: Type.Optional(Type.String({ description: "Pi provider ID to use, for example openai-codex, anthropic, or ollama." })),
 			model: Type.Optional(Type.String({ description: "Configured Pi model ID to use. Explicit selection does not use configured fallbacks." })),
 			mode: Type.Optional(Type.String({
-				description: 'Consultation mode. "review" (default): a single model call that answers from the question and redacted transcript; it identifies missing evidence rather than inspecting the repo. "explore": the advisor runs a read-only agent (read/grep/find/ls) that may inspect the workspace; bounded by hard tool-call/model-request caps and costs more tokens and time.',
+				description: 'Consultation mode. "review" (default): a single model call that answers from the question and redacted transcript; it identifies missing evidence rather than inspecting the repo. "explore": the advisor runs a read-only agent (read/grep/find/ls) that may inspect the workspace; bounded by hard tool-call/model-request caps (configurable via exploreBudget in advisor.json) and costs more tokens and time.',
 				enum: ["review", "explore"],
 			})),
 			effort: Type.Optional(Type.String({
@@ -665,6 +695,7 @@ export default function (pi: ExtensionAPI) {
 			// Tolerate an unreadable advisor.json so explicit provider/model selections still work.
 			const { config, loadError } = loadConfigSafe();
 			const { candidates, explicit } = buildCandidates(ctx, params.provider, params.model, config);
+			const exploreBudget = config.exploreBudget ?? { toolCalls: ADVISOR_MAX_TOOL_CALLS, modelRequests: ADVISOR_MAX_MODEL_REQUESTS };
 			// Claude-Code style: the advisor sees the transcript automatically; opt out with includeSession:false.
 			const transcript = params.includeSession === false ? "(not included)" : sessionTranscript(ctx);
 			const failures: string[] = [];
@@ -700,6 +731,8 @@ export default function (pi: ExtensionAPI) {
 							transcript,
 							effort: selectedEffort,
 							cwd: ctx.cwd,
+							maxToolCalls: exploreBudget.toolCalls,
+							maxModelRequests: exploreBudget.modelRequests,
 							signal,
 							onUpdate: (update) => onUpdate?.(update),
 						})
@@ -724,8 +757,8 @@ export default function (pi: ExtensionAPI) {
 					if (result.status === "budget_exhausted") {
 						const partial = result.text ? `\nPartial output before the budget was exhausted (incomplete, not a verdict):\n${result.text}` : "";
 						return {
-							content: [{ type: "text", text: `Advisor exploration budget exhausted after ${result.toolCalls} tool calls / ${ADVISOR_MAX_MODEL_REQUESTS} model requests; this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted", "")}` }],
-							details: { model: modelLabel, source: candidate.source, status: "budget_exhausted", mode, toolCalls: result.toolCalls, elapsedMs },
+							content: [{ type: "text", text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted", "")}` }],
+							details: { model: modelLabel, source: candidate.source, status: "budget_exhausted", mode, toolCalls: result.toolCalls, modelRequests: result.modelRequests, elapsedMs },
 							usage: combinedUsage,
 						};
 					}
