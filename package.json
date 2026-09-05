@@ -7,6 +7,20 @@
   ],
   "type": "module",
   "license": "MIT",
+  "scripts": {
+    "lint": "biome check",
+    "format": "biome check --write",
+    "typecheck": "tsc --noEmit",
+    "check": "biome check && tsc --noEmit",
+    "commit": "cz",
+    "commit:msg": "commitlint --edit",
+    "precommit:install": "pre-commit install && pre-commit install -t commit-msg"
+  },
+  "config": {
+    "commitizen": {
+      "path": "cz-conventional-changelog"
+    }
+  },
   "dependencies": {
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
@@ -43,5 +57,21 @@
     "prompts": [
       "node_modules/pi-subagents/prompts"
     ]
-  }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
+    "@types/node": "^26.4.1",
+    "commitizen": "^4.3.2",
+    "cz-conventional-changelog": "^3.3.0",
+    "typescript": "^7.0.2"
+  },
+  "bundleDependencies": [
+    "@ff-labs/pi-fff",
+    "@juicesharp/rpiv-ask-user-question",
+    "@juicesharp/rpiv-todo",
+    "pi-subagents",
+    "pi-web-access"
+  ]
 }

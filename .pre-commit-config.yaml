@@ -1,0 +1,30 @@
+# ruff-equivalent tooling for this TS repo, wired through the pre-commit framework.
+#   biome        -> ruff (lint + format + import sorting, in one pass)
+#   typecheck    -> ty (tsc --noEmit, whole project)
+#   commitlint   -> commitizen's lint side (enforces conventional commit messages)
+repos:
+  - repo: local
+    hooks:
+      - id: biome
+        name: biome (lint + format + import sort)
+        entry: npx --no-install biome check --write
+        language: system
+        pass_filenames: true
+        types: [text]
+        stages: [pre-commit]
+        exclude: ^\.git/
+
+      - id: typecheck
+        name: tsc --noEmit (typecheck)
+        entry: npx --no-install tsc --noEmit
+        language: system
+        pass_filenames: false
+        types: [text]
+        stages: [pre-commit]
+        files: ^extensions/
+
+      - id: commitlint
+        name: commitlint (conventional commits)
+        entry: npx --no-install commitlint --edit
+        language: system
+        stages: [commit-msg]
