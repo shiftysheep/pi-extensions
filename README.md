@@ -8,7 +8,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 
 | Extension | What it does |
 |---|---|
-| `advisor.ts` | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`. |
+| `advisor.ts` | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps (`+30m` or ISO) and repeating intervals. State is snapshotted into the session, so schedules survive `/reload` (not process exit). No OS-level cron jobs created. |
 | `permission-gate.ts` | Prompts for confirmation before potentially dangerous bash commands (`rm -rf`, `sudo`, `chmod/chown ... 777`). |
 | `status-line.ts` | Custom footer with a tok/s estimate while streaming. Pass `undefined` to pi's `setFooter()` to restore the original footer. |
@@ -47,6 +47,53 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 ```
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). Missing file or invalid JSON fails gracefully to a generic second-model choice.
+
+**How a consultation works (Claude-Code-advisor style):** the advisor automatically
+receives the redacted session transcript (including tool calls and results made so far)
+plus your precise question — pass the question, not pasted code. Set `includeSession: false`
+on a tool call to omit the transcript. Two modes:
+
+- **`review`** (default): a single model call answering from the question + transcript.
+  Cheap and fast; it identifies missing evidence instead of inspecting the repo.
+- **`explore`**: the advisor runs as a nested *read-only* agent and may inspect the
+  workspace itself with `read`, `grep`, `find`, and `ls`. Bounded by hard spend caps
+  (≤12 tool calls, ≤6 model requests, 10-minute timeout); exhausting a budget returns an
+  explicit **incomplete** result, never an authoritative verdict. Use only when the question
+  requires locating code or verifying repository facts.
+
+Every result text ends with a model-visible status footer (`[advisor: mode=…, status=…,
+toolCalls=…, elapsed=…s]`); the same envelope plus `model`/`source` is also carried in the
+result `details` for logs and UI (`completed` / `timed_out` / `aborted` / `budget_exhausted`).
+Usage is aggregated across all model requests, including every turn of an exploration.
+
+Models are managed with `/advisor`:
+
+```
+/advisor                              show config + retry chain, then offer the interactive picker (asks per-model effort, too)
+/advisor set <primary>,<fallback>     set both (provider/model ids; provider optional if unambiguous)
+/advisor primary|fallback <spec>      change one slot
+/advisor effort <level>               set the shared default reasoning effort (none..max)
+/advisor clear [slot]                 remove a slot, the default effort ("effort"), or both
+/advisor reset                        back up advisor.json to advisor.json.bak and start clean
+```
+
+Reasoning effort is layered: a tool-call `effort` override wins, then the model-specific
+`effort` in `advisor.json`, then the shared `reasoningEffort`, then `medium`.
+Per-model effort can be written inline with an `@` suffix (e.g. `/advisor primary
+gpt-6-astra@max`) or by editing `advisor.json` (per-slot `"effort"` key).
+
+Behavior notes:
+- **Retry chain**: primary → fallback; if both fail, your *active* model is retried as a
+  last resort. `/advisor show` prints the effective chain so this is never a surprise.
+- **`"none"` effort** requests no reasoning level; the advisor session then uses its own
+  default (an explicit "off" is not expressible through the agent API).
+- **Session redaction** (transcript included by default; `includeSession: false` opts out)
+is best-effort: PEM blocks, authorization
+  headers, common `key = value` / quoted assignments, and known token prefixes
+  (`sk-`, `gh[pousr]_`, `github_pat_`, `xox*`, `AKIA…`) are scrubbed, but don't treat it as
+  a guarantee — prefer not to include secrets in the session you consult from.
+- The config file is written atomically (temp + rename) and validated on read; a broken
+  file never blocks explicit `provider`/`model` tool calls, and `/advisor reset` recovers it.
 
 ## Develop
 
