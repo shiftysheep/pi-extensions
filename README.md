@@ -24,7 +24,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 ## Install
 
 ```bash
-pi install git:github.com/shiftysheep/pi-extensions@v2.0.0
+pi install git:github.com/shiftysheep/pi-extensions@v2.0.1
 pi update --extensions   # reconcile this package to its pinned ref later
 pi -e git:github.com/shiftysheep/pi-extensions    # try without installing (current run only)
 pi config                # enable/disable individual extensions from here or the bundled packages
