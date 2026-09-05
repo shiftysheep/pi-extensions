@@ -10,9 +10,10 @@ repos:
         entry: npx --no-install biome check --write
         language: system
         pass_filenames: true
+        # Biome 2 doesn't check markdown/yaml; passing only-ignored files would fail the hook
         types: [text]
         stages: [pre-commit]
-        exclude: ^\.git/
+        exclude: '^\.git/|\.(md|markdown|txt|ya?ml)$|^LICENSE$'
 
       - id: typecheck
         name: tsc --noEmit (typecheck)
