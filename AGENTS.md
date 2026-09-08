@@ -76,3 +76,12 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
 ```bash
 pre-commit install && pre-commit install -t commit-msg   # or: npm run precommit:install
 ```
+
+## Workflow: feature branches only
+
+- `main` is branch-protected on GitHub (PRs required, CI status check `check`
+  required, enforced for admins) — direct pushes are rejected server-side.
+- The `block-main` pre-commit hook enforces the same rule locally:
+  commits on `main` fail with a hint to run `git switch -c <type>/<short-desc>`.
+- CI runs `npm run check` (biome + tsc) on every PR and push to `main` via
+  `.github/workflows/ci.yml`.
