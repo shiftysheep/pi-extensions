@@ -11,7 +11,8 @@
     "lint": "biome check",
     "format": "biome check --write",
     "typecheck": "tsc --noEmit",
-    "check": "biome check && tsc --noEmit",
+    "test": "node --import tsx --test test/advisor-utils.test.ts",
+    "check": "biome check && tsc --noEmit && npm test",
     "commit": "cz",
     "commit:msg": "commitlint --edit",
     "precommit:install": "pre-commit install && pre-commit install -t commit-msg"
@@ -70,6 +71,7 @@
     "@types/node": "^26.4.1",
     "commitizen": "^4.3.2",
     "cz-conventional-changelog": "^3.3.0",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   },
   "bundleDependencies": [

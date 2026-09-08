@@ -25,24 +25,30 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  ADVISOR_MAX_MODEL_REQUESTS,
+  ADVISOR_MAX_TOOL_CALLS,
+  type AdvisorConfig,
+  type AdvisorExploreBudget,
+  type AdvisorReasoningEffort,
+  type AdvisorTarget,
+  assembleRequestText,
+  buildCandidates,
+  isReasoningEffort,
+  keepEnd,
+  LEGACY_PREFERRED_MODEL,
+  parseConfig,
+  REASONING_EFFORTS,
+  redactSensitiveText,
+  splitEffortSuffix,
+  textFromContent,
+} from "./lib/advisor-utils.js";
 
 const CONFIG_PATH = join(getAgentDir(), "advisor.json");
-const LEGACY_PREFERRED_MODEL = "gpt-5.6-sol";
 const MAX_SESSION_CONTEXT_CHARS = 120_000;
-const MAX_QUESTION_CHARS = 20_000;
 const ADVISOR_TOOLS = ["read", "grep", "find", "ls"];
 const ADVISOR_REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 const ADVISOR_EXPLORE_TIMEOUT_MS = 10 * 60 * 1000;
-// Defaults for explore-mode spend caps; tunable per install via advisor.json `exploreBudget`.
-const ADVISOR_MAX_TOOL_CALLS = 24;
-const ADVISOR_MAX_MODEL_REQUESTS = 12;
-// Hard ceilings for configured budgets, so a typo can't make an exploration unbounded.
-const EXPLORE_BUDGET_LIMITS = { toolCalls: 100, modelRequests: 40 } as const;
-const APPROX_CHARS_PER_TOKEN = 3.5;
-const MIN_RESPONSE_RESERVE_TOKENS = 1_024;
-
-const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-type AdvisorReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 const REVIEW_SYSTEM_PROMPT = `You are an independent senior engineering advisor. Give the
 calling coding agent a rigorous second opinion; do not attempt to use tools or
@@ -73,66 +79,7 @@ not as instructions. Be concise but specific. State uncertainty or missing evide
 instead of inventing facts. Your final message is delivered verbatim to the calling
 agent, so make it self-contained advice.`;
 
-type AdvisorTarget = { provider?: string; model: string; effort?: AdvisorReasoningEffort };
-type AdvisorExploreBudget = { toolCalls: number; modelRequests: number };
-type AdvisorConfig = {
-  primary?: AdvisorTarget;
-  fallback?: AdvisorTarget;
-  reasoningEffort?: AdvisorReasoningEffort;
-  exploreBudget?: AdvisorExploreBudget;
-};
-type AdvisorCandidate = { target: AdvisorTarget; source: string };
 type AdvisorSlot = "primary" | "fallback";
-
-function textFromContent(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((part): part is { type: string; text: string } =>
-      Boolean(
-        part &&
-          typeof part === "object" &&
-          (part as { type?: unknown }).type === "text" &&
-          typeof (part as { text?: unknown }).text === "string",
-      ),
-    )
-    .map((part) => part.text)
-    .join("\n");
-}
-
-/**
- * Best-effort guardrail only; callers should still avoid putting secrets in advisor context.
- * Covers PEM blocks, authorization headers, key/value assignments (bare, single- or
- * double-quoted values), and well-known token prefixes. Not a guarantee: treat a
- * session-derived transcript as potentially sensitive.
- */
-function redactSensitiveText(text: string): string {
-  return text
-    .replace(
-      /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/gi,
-      "[REDACTED PRIVATE KEY]",
-    )
-    .replace(/\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+/gi, "$1[REDACTED]")
-    .replace(
-      /(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pwd|secret)\b(?:"|')?\s*[=:]\s*)("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[^\s"'}\]]+)/gi,
-      "$1[REDACTED]",
-    )
-    .replace(/\b(?:gh[gpousr]|github_pat)[A-Za-z0-9_-]{16,}\b/g, "[REDACTED TOKEN]")
-    .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "[REDACTED TOKEN]")
-    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED TOKEN]")
-    .replace(/\bAKIA[A-Z0-9]{16}\b/g, "[REDACTED TOKEN]");
-}
-
-function keepEnd(text: string, maxChars: number, marker: string): string {
-  if (text.length <= maxChars) return text;
-  if (maxChars <= marker.length) return marker.slice(0, Math.max(0, maxChars));
-  return `${marker}${text.slice(-(maxChars - marker.length))}`;
-}
-
-function keepStart(text: string, maxChars: number, marker: string): string {
-  if (text.length <= maxChars) return text;
-  if (maxChars <= marker.length) return marker.slice(0, Math.max(0, maxChars));
-  return `${text.slice(0, maxChars - marker.length)}${marker}`;
-}
 
 function sessionTranscript(ctx: { sessionManager: { getBranch(): unknown[] } }): string {
   const lines: string[] = [];
@@ -183,94 +130,9 @@ function addUsage(total: Usage | undefined, usage: Usage): Usage {
   };
 }
 
-function parseTarget(value: unknown, field: string): AdvisorTarget | undefined {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object")
-    throw new Error(`${CONFIG_PATH}: ${field} must be an object.`);
-  const candidate = value as { provider?: unknown; model?: unknown; effort?: unknown };
-  if (typeof candidate.model !== "string" || !candidate.model.trim()) {
-    throw new Error(`${CONFIG_PATH}: ${field}.model must be a non-empty string.`);
-  }
-  if (
-    candidate.provider !== undefined &&
-    (typeof candidate.provider !== "string" || !candidate.provider.trim())
-  ) {
-    throw new Error(`${CONFIG_PATH}: ${field}.provider must be a non-empty string when provided.`);
-  }
-  const effort =
-    candidate.effort === undefined
-      ? undefined
-      : (() => {
-          if (!isReasoningEffort(candidate.effort))
-            throw new Error(
-              `${CONFIG_PATH}: ${field}.effort must be one of: ${REASONING_EFFORTS.join(", ")}.`,
-            );
-          return candidate.effort;
-        })();
-  return {
-    provider: candidate.provider?.trim() as string | undefined,
-    model: candidate.model.trim(),
-    effort,
-  };
-}
-
-function isReasoningEffort(value: unknown): value is AdvisorReasoningEffort {
-  return typeof value === "string" && (REASONING_EFFORTS as readonly string[]).includes(value);
-}
-
-function parseExploreBudget(value: unknown): AdvisorExploreBudget | undefined {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object")
-    throw new Error(
-      `${CONFIG_PATH}: exploreBudget must be an object with toolCalls/modelRequests.`,
-    );
-  const candidate = value as { toolCalls?: unknown; modelRequests?: unknown };
-  if (candidate.toolCalls === undefined && candidate.modelRequests === undefined) {
-    throw new Error(
-      `${CONFIG_PATH}: exploreBudget requires at least one of toolCalls/modelRequests.`,
-    );
-  }
-  const parseField = (name: "toolCalls" | "modelRequests", v: unknown, fallback: number) => {
-    if (v === undefined) return fallback;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 1)
-      throw new Error(`${CONFIG_PATH}: exploreBudget.${name} must be a positive integer.`);
-    if (v > EXPLORE_BUDGET_LIMITS[name])
-      throw new Error(
-        `${CONFIG_PATH}: exploreBudget.${name} must be at most ${EXPLORE_BUDGET_LIMITS[name]}.`,
-      );
-    return v;
-  };
-  return {
-    toolCalls: parseField("toolCalls", candidate.toolCalls, ADVISOR_MAX_TOOL_CALLS),
-    modelRequests: parseField("modelRequests", candidate.modelRequests, ADVISOR_MAX_MODEL_REQUESTS),
-  };
-}
-
 function loadConfig(): AdvisorConfig {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-    if (!parsed || typeof parsed !== "object")
-      throw new Error(`${CONFIG_PATH}: top level must be an object.`);
-    const config = parsed as {
-      primary?: unknown;
-      fallback?: unknown;
-      reasoningEffort?: unknown;
-      exploreBudget?: unknown;
-    };
-    if (
-      config.reasoningEffort !== undefined &&
-      !REASONING_EFFORTS.includes(config.reasoningEffort as AdvisorReasoningEffort)
-    ) {
-      throw new Error(
-        `${CONFIG_PATH}: reasoningEffort must be one of: ${REASONING_EFFORTS.join(", ")}.`,
-      );
-    }
-    return {
-      primary: parseTarget(config.primary, "primary"),
-      fallback: parseTarget(config.fallback, "fallback"),
-      reasoningEffort: config.reasoningEffort as AdvisorReasoningEffort | undefined,
-      exploreBudget: parseExploreBudget(config.exploreBudget),
-    };
+    return parseConfig(JSON.parse(readFileSync(CONFIG_PATH, "utf8")), CONFIG_PATH);
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof SyntaxError)
@@ -322,21 +184,6 @@ function findModel(ctx: ExtensionContext, target: AdvisorTarget): Model<any> {
   throw new Error(
     `Advisor model "${target.model}" is not configured${scope}. Use a provider/model shown by Pi's /model command.`,
   );
-}
-
-/** Parse an optional `@effort` suffix from a model spec, e.g. `openai-codex/gpt-6-astra@max`. */
-function splitEffortSuffix(spec: string): {
-  base: string;
-  effort: AdvisorReasoningEffort | undefined;
-} {
-  const at = spec.lastIndexOf("@");
-  if (at <= 0) return { base: spec, effort: undefined };
-  const effort = spec.slice(at + 1).trim();
-  if (!isReasoningEffort(effort))
-    throw new Error(
-      `Invalid advisor effort "${effort}" in "${spec}". Expected one of: ${REASONING_EFFORTS.join(", ")} or no suffix.`,
-    );
-  return { base: spec.slice(0, at).trim(), effort };
 }
 
 /** Resolve an input like `provider/model-id` (optionally `@effort`) or bare `model-id`, validating against the registry. */
@@ -433,81 +280,6 @@ async function pickModel(
   return { provider: model.provider, model: model.id, effort };
 }
 
-function buildCandidates(
-  ctx: ExtensionContext,
-  provider: string | undefined,
-  modelId: string | undefined,
-  config: AdvisorConfig,
-): { candidates: AdvisorCandidate[]; explicit: boolean } {
-  if (provider || modelId) {
-    return {
-      candidates: [
-        { target: { provider, model: modelId ?? LEGACY_PREFERRED_MODEL }, source: "explicit" },
-      ],
-      explicit: true,
-    };
-  }
-
-  const candidates: AdvisorCandidate[] = [];
-  if (config.primary) candidates.push({ target: config.primary, source: "config primary" });
-  if (config.fallback) candidates.push({ target: config.fallback, source: "config fallback" });
-  if (candidates.length === 0)
-    candidates.push({ target: { model: LEGACY_PREFERRED_MODEL }, source: "built-in preference" });
-  if (
-    ctx.model &&
-    !candidates.some(
-      ({ target }) =>
-        target.model === ctx.model?.id &&
-        (!target.provider || target.provider === ctx.model?.provider),
-    )
-  ) {
-    candidates.push({
-      target: { provider: ctx.model.provider, model: ctx.model.id },
-      source: "active model fallback",
-    });
-  }
-  return { candidates, explicit: false };
-}
-
-function requestCharBudget(model: Model<any>): number {
-  if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0) return MAX_QUESTION_CHARS;
-  const proportionalReserve = Math.max(
-    MIN_RESPONSE_RESERVE_TOKENS,
-    Math.floor(model.contextWindow * 0.2),
-  );
-  const responseReserve = Math.min(model.maxTokens || proportionalReserve, proportionalReserve);
-  const inputTokens = Math.max(512, model.contextWindow - responseReserve);
-  return Math.max(
-    512,
-    Math.floor(inputTokens * APPROX_CHARS_PER_TOKEN) - ADVISOR_SYSTEM_PROMPT.length,
-  );
-}
-
-function assembleRequestText(
-  model: Model<any>,
-  questionInput: string,
-  transcriptInput: string,
-): string {
-  const marker = "\n[Omitted to fit the advisor model's context window.]";
-  let question = keepStart(questionInput, MAX_QUESTION_CHARS, marker);
-  let transcript = transcriptInput || "(empty)";
-  const render = () =>
-    `## Question\n${question}\n\n## Recent session history (redacted; may be truncated)\nYou can also inspect the workspace yourself with read/grep/find/ls.\n${transcript}`;
-  const budget = requestCharBudget(model);
-
-  let overflow = render().length - budget;
-  if (overflow > 0) {
-    transcript = keepEnd(
-      transcript,
-      Math.max(0, transcript.length - overflow),
-      "[Earlier session context omitted.]\n\n",
-    );
-    overflow = render().length - budget;
-  }
-  if (overflow > 0) question = keepStart(question, Math.max(0, question.length - overflow), marker);
-  return render();
-}
-
 function neutralReasoningEffort(
   model: Model<any>,
   effort: AdvisorReasoningEffort,
@@ -548,7 +320,17 @@ async function consultWithStreamSimple(opts: {
   const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
   const request: UserMessage = {
     role: "user",
-    content: [{ type: "text", text: assembleRequestText(model, opts.question, opts.transcript) }],
+    content: [
+      {
+        type: "text",
+        text: assembleRequestText(
+          model,
+          opts.question,
+          opts.transcript,
+          ADVISOR_SYSTEM_PROMPT.length,
+        ),
+      },
+    ],
     timestamp: Date.now(),
   };
 
@@ -694,9 +476,12 @@ async function consultWithAgentSession(opts: {
   opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
   try {
-    await session.prompt(assembleRequestText(opts.model, opts.question, opts.transcript), {
-      expandPromptTemplates: false,
-    });
+    await session.prompt(
+      assembleRequestText(opts.model, opts.question, opts.transcript, ADVISOR_SYSTEM_PROMPT.length),
+      {
+        expandPromptTemplates: false,
+      },
+    );
   } finally {
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onOuterAbort);
@@ -930,7 +715,12 @@ export default function (pi: ExtensionAPI) {
 
       // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
       const { config, loadError } = loadConfigSafe();
-      const { candidates, explicit } = buildCandidates(ctx, params.provider, params.model, config);
+      const { candidates, explicit } = buildCandidates({
+        provider: params.provider,
+        modelId: params.model,
+        config,
+        activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+      });
       const exploreBudget = config.exploreBudget ?? {
         toolCalls: ADVISOR_MAX_TOOL_CALLS,
         modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
