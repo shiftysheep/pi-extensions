@@ -14,10 +14,11 @@ that content here, keep it in the README.
 
 ```bash
 npm install                 # deps + dev tools (pi peer deps auto-install)
-npm run check               # the gate: biome check + tsc --noEmit (must pass before committing)
+npm run check               # the gate: biome check + tsc --noEmit + tests (must pass before committing)
 npm run lint                # biome only
 npm run format              # biome check --write
 npm run typecheck           # tsc --noEmit only
+npm test                    # node --test via tsx (tests in test/)
 npm run commit              # interactive conventional-commit prompt (commitizen)
 pre-commit run --all-files  # run all git hooks manually
 ```
@@ -35,6 +36,12 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
 - **Types**: strict mode via `tsconfig.json` (`noEmit`). `any` and non-null assertions
   are warnings, not errors — pi event payloads are loosely typed, but prefer precise
   types where the pi packages export them.
+- **Testing**: pure advisor helpers live in `extensions/lib/advisor-utils.ts` and
+  are covered by `test/advisor-utils.test.ts` (`node --test` via tsx, wired into
+  `check`). Keep new advisor logic testable the same way — pure functions in the
+  utils module, pi-specific wiring in `advisor.ts`. Note: pi auto-loads every `*.ts`
+  directly under `extensions/` as an extension, so shared code goes in a subdir like
+  `extensions/lib/`.
 - **Complexity**: cognitive complexity is capped at 80 (current peak is 75 in
   `advisor.ts`). Don't grow already-large functions; extract helpers instead.
 - **Commits**: conventional commits, enforced by commitlint on the `commit-msg` hook.
