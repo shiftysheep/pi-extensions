@@ -223,13 +223,14 @@ describe("buildCandidates", () => {
     ]);
   });
 
-  it("orders configured slots primary then fallback, then the active model", () => {
+  it("orders configured slots primary then fallback, plus the active model only when opted in", () => {
     const { candidates, explicit } = buildCandidates({
       provider: undefined,
       modelId: undefined,
       config: {
         primary: { provider: "a", model: "m1" },
         fallback: { model: "m2" },
+        activeModelFallback: true,
       },
       activeModel: { provider: "b", id: "active" },
     });
@@ -241,23 +242,35 @@ describe("buildCandidates", () => {
     assert.deepEqual(candidates[2].target, { provider: "b", model: "active" });
   });
 
-  it("falls back to the built-in preference when nothing is configured", () => {
+  it("never appends the active model unless activeModelFallback is enabled", () => {
     const { candidates } = buildCandidates({
       provider: undefined,
       modelId: undefined,
-      config: {},
-      activeModel: undefined,
+      config: { primary: { model: "m1" } },
+      activeModel: { provider: "b", id: "active" },
     });
-    assert.equal(candidates.length, 1);
-    assert.equal(candidates[0].source, "built-in preference");
-    assert.equal(candidates[0].target.model, "gpt-5.6-sol");
+    assert.deepEqual(
+      candidates.map((c) => c.source),
+      ["config primary"],
+    );
+  });
+
+  it("returns an empty chain when nothing is configured (no implicit model)", () => {
+    const { candidates, explicit } = buildCandidates({
+      provider: undefined,
+      modelId: undefined,
+      config: {},
+      activeModel: { provider: "b", id: "active" },
+    });
+    assert.equal(explicit, false);
+    assert.deepEqual(candidates, []);
   });
 
   it("does not duplicate the active model when it is already in the chain", () => {
     const { candidates } = buildCandidates({
       provider: undefined,
       modelId: undefined,
-      config: { primary: { provider: "a", model: "active" } },
+      config: { primary: { provider: "a", model: "active" }, activeModelFallback: true },
       activeModel: { provider: "a", id: "active" },
     });
     assert.deepEqual(
@@ -268,12 +281,25 @@ describe("buildCandidates", () => {
     const { candidates: noProvider } = buildCandidates({
       provider: undefined,
       modelId: undefined,
-      config: { primary: { model: "active" } },
+      config: { primary: { model: "active" }, activeModelFallback: true },
       activeModel: { provider: "a", id: "active" },
     });
     assert.deepEqual(
       noProvider.map((c) => c.source),
       ["config primary"],
+    );
+  });
+
+  it("rejects an explicit provider without a model id", () => {
+    assert.throws(
+      () =>
+        buildCandidates({
+          provider: "openai-codex",
+          modelId: undefined,
+          config: {},
+          activeModel: undefined,
+        }),
+      /An explicit advisor selection needs a model id/,
     );
   });
 });
@@ -399,6 +425,7 @@ describe("parseConfig", () => {
           fallback: { model: "m2" },
           reasoningEffort: "high",
           exploreBudget: { toolCalls: 5 },
+          activeModelFallback: true,
         },
         CONFIG_PATH,
       ),
@@ -408,6 +435,7 @@ describe("parseConfig", () => {
         fallback: { provider: undefined, model: "m2", effort: undefined },
         reasoningEffort: "high",
         exploreBudget: { toolCalls: 5, modelRequests: ADVISOR_MAX_MODEL_REQUESTS },
+        activeModelFallback: true,
       },
     );
   });
@@ -418,6 +446,14 @@ describe("parseConfig", () => {
     assert.equal(config.fallback, undefined);
     assert.equal(config.reasoningEffort, undefined);
     assert.equal(config.exploreBudget, undefined);
+    assert.equal(config.activeModelFallback, undefined);
+  });
+
+  it("rejects a non-boolean activeModelFallback", () => {
+    assert.throws(
+      () => parseConfig({ activeModelFallback: "yes" }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: activeModelFallback must be a boolean.`),
+    );
   });
 
   it("rejects an invalid global reasoningEffort", () => {

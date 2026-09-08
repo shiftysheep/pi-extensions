@@ -29,14 +29,12 @@ import {
   ADVISOR_MAX_MODEL_REQUESTS,
   ADVISOR_MAX_TOOL_CALLS,
   type AdvisorConfig,
-  type AdvisorExploreBudget,
   type AdvisorReasoningEffort,
   type AdvisorTarget,
   assembleRequestText,
   buildCandidates,
   isReasoningEffort,
   keepEnd,
-  LEGACY_PREFERRED_MODEL,
   parseConfig,
   REASONING_EFFORTS,
   redactSensitiveText,
@@ -151,16 +149,12 @@ function loadConfigSafe(): { config: AdvisorConfig; loadError?: string } {
 }
 
 function saveConfig(config: AdvisorConfig): void {
-  const out: {
-    primary?: AdvisorTarget;
-    fallback?: AdvisorTarget;
-    reasoningEffort?: AdvisorReasoningEffort;
-    exploreBudget?: AdvisorExploreBudget;
-  } = {};
+  const out: AdvisorConfig = {};
   if (config.primary) out.primary = config.primary;
   if (config.fallback) out.fallback = config.fallback;
   if (config.reasoningEffort) out.reasoningEffort = config.reasoningEffort;
   if (config.exploreBudget) out.exploreBudget = config.exploreBudget;
+  if (config.activeModelFallback) out.activeModelFallback = config.activeModelFallback;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
   // write or a concurrent reader never sees a truncated/invalid config.
   const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
@@ -224,19 +218,23 @@ function describeConfig(config: AdvisorConfig, activeModelLabel?: string): strin
     ["fallback (secondary)", formatTarget(config.fallback)],
     ["default effort", config.reasoningEffort ?? "(medium)"],
     [
+      "active model fallback",
+      config.activeModelFallback ? "enabled (self-review, last resort)" : "disabled",
+    ],
+    [
       "explore budget",
       config.exploreBudget
         ? `${config.exploreBudget.toolCalls} tool calls / ${config.exploreBudget.modelRequests} model requests`
         : `${ADVISOR_MAX_TOOL_CALLS} tool calls / ${ADVISOR_MAX_MODEL_REQUESTS} model requests (default)`,
     ],
   ];
-  // Retry chain: configured slots in order, then the active model as a last resort
-  // when it is not already one of them (see buildCandidates).
+  // Retry chain: configured slots in order; no implicit model. The active model is
+  // shown only when activeModelFallback is enabled (see buildCandidates).
   const chain: string[] = [];
   if (config.primary) chain.push(formatTarget(config.primary));
   if (config.fallback) chain.push(formatTarget(config.fallback));
-  if (chain.length === 0) chain.push(`${LEGACY_PREFERRED_MODEL} (built-in)`);
-  if (activeModelLabel) {
+  if (chain.length === 0) chain.push("(none configured — run /advisor)");
+  if (config.activeModelFallback && activeModelLabel) {
     const already = [config.primary, config.fallback].some(
       (t) => t && `${t.provider ?? "*"}/${t.model}` === activeModelLabel,
     );
@@ -518,7 +516,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const usageHints =
-    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nIf every configured slot fails, the active model is retried last (shown as "retry chain"). Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json).';
+    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json).';
 
   pi.registerCommand("advisor", {
     description:
@@ -721,6 +719,11 @@ export default function (pi: ExtensionAPI) {
         config,
         activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
       });
+      if (!explicit && candidates.length === 0) {
+        throw new Error(
+          "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
+        );
+      }
       const exploreBudget = config.exploreBudget ?? {
         toolCalls: ADVISOR_MAX_TOOL_CALLS,
         modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
@@ -731,7 +734,8 @@ export default function (pi: ExtensionAPI) {
       const failures: string[] = [];
       let combinedUsage: Usage | undefined;
 
-      for (const candidate of candidates) {
+      for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+        const candidate = candidates[candidateIndex];
         let model: Model<any>;
         try {
           model = findModel(ctx, candidate.target);
@@ -785,8 +789,18 @@ export default function (pi: ExtensionAPI) {
           const elapsedMs = Date.now() - startedAt;
 
           if (result.usage) combinedUsage = addUsage(combinedUsage, result.usage);
-          const statusFooter = (status: string, extra: string) =>
-            `\n\n---\n[advisor: mode=${mode}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${extra}]`;
+          // The footer is the model-visible disclosure: it always names who answered,
+          // whether the chain degraded, and whether independence was lost.
+          const flags: string[] = [];
+          if (candidateIndex > 0) {
+            const first = candidates[0].target;
+            flags.push(`fallbackFrom=${first.provider ?? "*"}/${first.model}`);
+          }
+          const selfReview =
+            ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
+          if (selfReview) flags.push("independent=false");
+          const statusFooter = (status: string) =>
+            `\n\n---\n[advisor: mode=${mode}, model=${modelLabel}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${flags.length > 0 ? `, ${flags.join(", ")}` : ""}${selfReview ? " — this advice came from the model already driving this session; treat it as self-review, not a second opinion" : ""}]`;
           if (result.status === "aborted")
             return {
               content: [{ type: "text", text: "Advisor consultation cancelled." }],
@@ -816,7 +830,7 @@ export default function (pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted", "")}`,
+                  text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted")}`,
                 },
               ],
               details: {
@@ -832,7 +846,7 @@ export default function (pi: ExtensionAPI) {
             };
           }
           return {
-            content: [{ type: "text", text: `${result.text}${statusFooter("completed", "")}` }],
+            content: [{ type: "text", text: `${result.text}${statusFooter("completed")}` }],
             details: {
               model: modelLabel,
               source: candidate.source,
