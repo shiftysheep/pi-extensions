@@ -16,7 +16,6 @@ export const REASONING_EFFORTS = [
 ] as const;
 export type AdvisorReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
-export const LEGACY_PREFERRED_MODEL = "gpt-5.6-sol";
 export const MAX_QUESTION_CHARS = 20_000;
 // Defaults for explore-mode spend caps; tunable per install via advisor.json `exploreBudget`.
 export const ADVISOR_MAX_TOOL_CALLS = 24;
@@ -33,6 +32,8 @@ export type AdvisorConfig = {
   fallback?: AdvisorTarget;
   reasoningEffort?: AdvisorReasoningEffort;
   exploreBudget?: AdvisorExploreBudget;
+  /** Opt in to retrying the caller's active model last (a self-review, disclosed in the result). */
+  activeModelFallback?: boolean;
 };
 export type AdvisorCandidate = { target: AdvisorTarget; source: string };
 
@@ -166,17 +167,22 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
     fallback?: unknown;
     reasoningEffort?: unknown;
     exploreBudget?: unknown;
+    activeModelFallback?: unknown;
   };
   if (config.reasoningEffort !== undefined && !isReasoningEffort(config.reasoningEffort)) {
     throw new Error(
       `${configPath}: reasoningEffort must be one of: ${REASONING_EFFORTS.join(", ")}.`,
     );
   }
+  if (config.activeModelFallback !== undefined && typeof config.activeModelFallback !== "boolean") {
+    throw new Error(`${configPath}: activeModelFallback must be a boolean.`);
+  }
   return {
     primary: parseTarget(config.primary, "primary", configPath),
     fallback: parseTarget(config.fallback, "fallback", configPath),
     reasoningEffort: config.reasoningEffort,
     exploreBudget: parseExploreBudget(config.exploreBudget, configPath),
+    activeModelFallback: config.activeModelFallback,
   };
 }
 
@@ -197,8 +203,10 @@ export function splitEffortSuffix(spec: string): {
 
 /**
  * Build the retry chain: an explicit provider/model selection wins outright;
- * otherwise configured slots in order, the built-in preference when nothing is
- * configured, and the caller's active model as a last resort.
+ * otherwise the configured slots in order. No model is ever picked implicitly:
+ * with no configured slots the caller gets an empty chain, and the caller's
+ * active model is only added as a last resort when `activeModelFallback` is
+ * explicitly enabled in config (a self-review, disclosed in the result).
  */
 export function buildCandidates(opts: {
   provider: string | undefined;
@@ -208,10 +216,12 @@ export function buildCandidates(opts: {
 }): { candidates: AdvisorCandidate[]; explicit: boolean } {
   const { provider, modelId, config, activeModel } = opts;
   if (provider || modelId) {
+    if (!modelId)
+      throw new Error(
+        "An explicit advisor selection needs a model id (a provider alone is ambiguous).",
+      );
     return {
-      candidates: [
-        { target: { provider, model: modelId ?? LEGACY_PREFERRED_MODEL }, source: "explicit" },
-      ],
+      candidates: [{ target: { provider, model: modelId }, source: "explicit" }],
       explicit: true,
     };
   }
@@ -219,9 +229,8 @@ export function buildCandidates(opts: {
   const candidates: AdvisorCandidate[] = [];
   if (config.primary) candidates.push({ target: config.primary, source: "config primary" });
   if (config.fallback) candidates.push({ target: config.fallback, source: "config fallback" });
-  if (candidates.length === 0)
-    candidates.push({ target: { model: LEGACY_PREFERRED_MODEL }, source: "built-in preference" });
   if (
+    config.activeModelFallback &&
     activeModel &&
     !candidates.some(
       ({ target }) =>
