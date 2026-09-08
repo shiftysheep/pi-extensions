@@ -5,6 +5,13 @@
 repos:
   - repo: local
     hooks:
+      - id: block-main
+        name: block direct commits to main
+        entry: scripts/block-main-commits.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
       - id: biome
         name: biome (lint + format + import sort)
         entry: npx --no-install biome check --write
@@ -13,7 +20,7 @@ repos:
         # Biome 2 doesn't check markdown/yaml; passing only-ignored files would fail the hook
         types: [text]
         stages: [pre-commit]
-        exclude: '^\.git/|\.(md|markdown|txt|toml|ya?ml)$|^LICENSE$'
+        exclude: '^\.git/|\.(md|markdown|txt|toml|ya?ml|sh)$|^LICENSE$'
 
       - id: typecheck
         name: tsc --noEmit (typecheck)
