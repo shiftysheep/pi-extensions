@@ -122,14 +122,18 @@ export async function consultWithChildProcess(opts: {
   // alive; only the timer that resolves it does, and that timer is owned/cleared.
   let hardBoundResolve: (() => void) | undefined;
   const hardBound = new Promise<void>((resolve) => (hardBoundResolve = resolve));
-  // Started by the first interrupt (deadline or abort): a fixed margin after the
-  // interrupt, independent of the absolute deadline, so an early abort does not
-  // wait until the original deadline + margin. The margin comfortably exceeds the
-  // SIGTERM->SIGKILL escalation (5s) + the close grace (1s).
-  const HARD_BOUND_AFTER_INTERRUPT_MS = 10_000;
+  // Shared teardown budget: on the first interrupt (deadline or abort) record an
+  // absolute deadline, comfortably beyond the SIGTERM->SIGKILL escalation (5s) +
+  // the close grace (1s). BOTH the close-wait hard backstop and the final
+  // teardown cap draw from this one deadline (the cap uses its remaining time),
+  // so they do not stack — an early abort with an unkillable child waits at most
+  // this margin after the abort, not margin + margin.
+  let teardownDeadline: number | undefined;
+  const TEARDOWN_MARGIN_MS = 15_000;
   const startHardBound = (): void => {
     if (hardBoundTimer !== undefined) return;
-    hardBoundTimer = setTimeout(() => hardBoundResolve?.(), HARD_BOUND_AFTER_INTERRUPT_MS);
+    teardownDeadline = performance.now() + TEARDOWN_MARGIN_MS;
+    hardBoundTimer = setTimeout(() => hardBoundResolve?.(), TEARDOWN_MARGIN_MS);
   };
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (!child || child.pid === undefined) return;
@@ -176,10 +180,16 @@ export async function consultWithChildProcess(opts: {
       clearTimeout(killTimer);
       killTimer = undefined;
     }
+    // No successfully-spawned process (e.g. ENOENT): "exit" will never fire, so
+    // there is nothing to await and the wait would only burn its cap.
+    if (!child || child.pid === undefined) return;
     signalGroup("SIGKILL");
-    // Bounded wait on the child dying; the cap timer is owned and cleared on
-    // settle so it cannot keep the event loop alive after the wait finishes.
-    const TEARDOWN_CAP_MS = 10_000;
+    // Bounded wait on the child dying. It shares the interrupt-driven teardown
+    // deadline with the close-wait backstop (drawing only its remaining time), so
+    // the two do not stack. The cap timer is owned and cleared on settle so it
+    // cannot keep the event loop alive after the wait finishes.
+    const capMs =
+      teardownDeadline !== undefined ? Math.max(0, teardownDeadline - performance.now()) : 10_000;
     await new Promise<void>((resolve) => {
       let settled = false;
       let capTimer: ReturnType<typeof setTimeout> | undefined;
@@ -193,7 +203,7 @@ export async function consultWithChildProcess(opts: {
         resolve();
       };
       groupDead.then(settle);
-      capTimer = setTimeout(settle, TEARDOWN_CAP_MS);
+      capTimer = setTimeout(settle, capMs);
     });
   };
   const acc = new AdvisorEventAccumulator();
@@ -332,6 +342,8 @@ export async function consultWithChildProcess(opts: {
       const settle = () => {
         if (settled) return;
         settled = true;
+        proc.removeListener("close", settle);
+        proc.removeListener("exit", onExit);
         if (closeGraceTimer !== undefined) {
           clearTimeout(closeGraceTimer);
           closeGraceTimer = undefined;
@@ -342,10 +354,14 @@ export async function consultWithChildProcess(opts: {
         }
         resolve();
       };
-      proc.once("close", settle);
-      proc.once("exit", () => {
+      const onExit = () => {
+        // Guard: a late "exit" after settlement (e.g. after the hard backstop
+        // fired) must not create a new grace timer that is never cleared.
+        if (settled) return;
         if (closeGraceTimer === undefined) closeGraceTimer = setTimeout(settle, CLOSE_GRACE_MS);
-      });
+      };
+      proc.on("close", settle);
+      proc.on("exit", onExit);
       hardBound.then(settle);
     });
     if (spawnError)

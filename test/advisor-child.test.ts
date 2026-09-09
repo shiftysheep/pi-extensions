@@ -448,6 +448,44 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     assert.deepEqual(workDirs(), before, "work dir must be removed after the bounded wait");
   });
 
+  it("bounds an early abort with a SIGTERM-ignoring child (shared teardown budget)", {
+    timeout: 20_000,
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-advisor-fake-"));
+    fakeDirs.push(dir);
+    // A child that ignores SIGTERM, so the abort's SIGTERM does not kill it; only
+    // the SIGKILL escalation does. Aborting EARLY (well before the long deadline)
+    // must return within the shared teardown budget (SIGTERM -> SIGKILL escalation
+    // + grace), not wait for the full 120s deadline (which the pre-fix code would
+    // approach by stacking a 10s close-wait bound + a 10s teardown cap).
+    writeFileSync(
+      join(dir, "pi"),
+      "#!/usr/bin/env node\nprocess.on('SIGTERM',()=>{});\nsetTimeout(()=>{},120000);\n",
+    );
+    chmodSync(join(dir, "pi"), 0o755);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+    const t0 = performance.now();
+    const result = await consultWithChildProcess({
+      model: MODEL,
+      modelLabel: "fake/fake-model",
+      question: "q",
+      transcript: "",
+      effort: "low",
+      cwd: process.cwd(),
+      mode: "review",
+      deadline: performance.now() + 120_000,
+      signal: ac.signal,
+      config: { piBinary: join(dir, "pi") },
+    });
+    const elapsed = performance.now() - t0;
+    assert.equal(result.status, "aborted");
+    assert.ok(
+      elapsed < 20_000,
+      `early abort took ${Math.round(elapsed)}ms (must be bounded by the shared budget, not wait for the 120s deadline)`,
+    );
+  });
+
   it("kills an in-group descendant that holds the pipes after the leader exits (early-exit teardown)", {
     timeout: 15_000,
   }, async () => {
