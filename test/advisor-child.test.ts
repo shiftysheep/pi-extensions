@@ -418,7 +418,9 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     );
     chmodSync(bin, 0o755);
     // Race against a test-side bound so a regression (hang) fails the test
-    // rather than stalling the whole suite.
+    // rather than stalling the whole suite. The watchdog is cleared after the
+    // race so it does not retain the test host for the full 8s.
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     const result = await Promise.race([
       consultWithChildProcess({
         model: MODEL,
@@ -431,10 +433,14 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
         deadline: performance.now() + 400,
         config: { piBinary: bin },
       }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("transport hung on an out-of-group descendant")), 8_000),
-      ),
+      new Promise<never>((_, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error("transport hung on an out-of-group descendant")),
+          8_000,
+        );
+      }),
     ]);
+    if (watchdog !== undefined) clearTimeout(watchdog);
     assert.equal(result.status, "timed_out");
     // The escaping descendant is in a new session, so the group signal did not
     // reach it; clean it up explicitly (and remove the work dir it is not in).
