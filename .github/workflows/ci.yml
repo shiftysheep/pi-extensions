@@ -17,12 +17,16 @@ jobs:
       - run: npm run check
 
   # On merge to main: bump the version from the merged commits (feat -> minor,
-  # fix/chore -> patch, breaking -> major) and push the release commit + tag.
+  # fix/chore -> patch, breaking -> major) and release via an automatic PR.
   # cz infers the increment from conventional commits since the last tag; the
   # bump_message/tag_format come from .cz.toml.
+  #
+  # main is branch-protected (PRs only) and a personal-account repo cannot grant
+  # the github-actions app a bypass, so the release commit + tag ship on a
+  # release/vX.Y.Z branch that this job merges once its check passes.
   release:
     needs: check
-    # Skip the release commit this job itself pushes (actor guard breaks the loop).
+    # Skip the release commit this job itself merges (actor guard breaks the loop).
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
     # Serialize releases so back-to-back merges don't race on the tag.
     concurrency:
@@ -31,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,7 +47,9 @@ jobs:
           node-version: 24
       # Exact tag: setup-uv publishes no rolling major tag (v10 does not exist).
       - uses: astral-sh/setup-uv@v10.0.1
-      - name: Bump version and tag
+      - name: Bump version and open release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # A concurrent release may have landed first (see concurrency group);
           # move to the tip of main before bumping.
@@ -50,4 +57,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           uv run --with 'commitizen==4.18.*' cz bump --yes
-          git push origin HEAD:main --follow-tags
+          # cz created the release commit + tag locally; ship them on a branch
+          # and merge through a PR (direct pushes to main are rejected).
+          version=$(git tag --points-at HEAD)
+          git push origin "HEAD:refs/heads/release/${version}" "refs/tags/${version}"
+          pr_url=$(gh pr create --base main --head "release/${version}" \
+            --title "chore(release): ${version}" \
+            --body "Automatic release by the CI release job.")
+          pr_number=${pr_url##*/}
+          # Wait for the required check, then merge (a PR merge is allowed by protection).
+          gh pr checks "$pr_number" --watch
+          gh pr merge "$pr_number" --merge --delete-branch

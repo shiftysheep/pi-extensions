@@ -60,8 +60,11 @@ Releases are git tags; installs pin the tag:
 
 Releases are **automatic**: the `release` job in `.github/workflows/ci.yml`
 runs after `check` on merge to `main`, runs `cz bump --yes` (Python
-commitizen, config in `.cz.toml`), and pushes the `chore(release): vX.Y.Z`
-commit + `vX.Y.Z` tag. The increment is inferred from the conventional
+commitizen, config in `.cz.toml`), then ships the `chore(release): vX.Y.Z`
+commit + `vX.Y.Z` tag on a `release/vX.Y.Z` branch and merges it via an
+automatic PR once its `check` passes (main is branch-protected with PRs
+only, and personal-account repos can't grant the Actions app a bypass). The
+increment is inferred from the conventional
 commits since the last tag: `feat` → minor, `fix`/`chore` → patch,
 `BREAKING CHANGE` → major. It bumps the version in `package.json`,
 `package-lock.json`, the README install line, and `.cz.toml` itself. Do NOT
