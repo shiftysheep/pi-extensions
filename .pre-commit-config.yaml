@@ -3,15 +3,14 @@
 #   typecheck    -> ty (tsc --noEmit, whole project)
 #   commitlint   -> commitizen's lint side (enforces conventional commit messages)
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
   - repo: local
     hooks:
-      - id: block-main
-        name: block direct commits to main
-        entry: scripts/block-main-commits.sh
-        language: system
-        pass_filenames: false
-        stages: [pre-commit]
-
       - id: biome
         name: biome (lint + format + import sort)
         entry: npx --no-install biome check --write
