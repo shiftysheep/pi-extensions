@@ -75,14 +75,24 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 
 `timeoutMs` (optional) sets the consultation timeout in milliseconds, clamped to 30 s–30 min; it covers the whole consultation, fallback chain included (later attempts only get the time left). The per-call `timeoutMs` tool parameter overrides it, and the defaults are 5 min for `review` / 10 min for `explore`.
 
+`piBinary` (optional) sets the path of the `pi` binary the advisor spawns for consultations (default: `pi` on `PATH`, or `$PI_BINARY` if set).
+
 The file is **strictly validated**: unknown keys (top level or in a model slot) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
 **Upgrading from the old `exploreBudget` key:** it no longer exists — remove it from `advisor.json` (keep your model slots) so strict validation passes again. Until then the file is ignored with a warning in the result, and explicit `provider`/`model` tool calls still work.
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
-**How a consultation works (ground-truth style):** the advisor does **not** receive
-your session by default. Cite workspace paths in the question for anything on disk,
+**How a consultation works (ground-truth style):** every consultation runs in an
+*isolated child `pi` process*, never in your session's process. The child gets a
+throwaway agent dir (`mkdtemp`) holding only a copy of `auth.json` (mode `0600`),
+receives the prompt as an `@path` file reference, streams NDJSON events back, and
+its temp dir is removed on every exit path (success, failure, timeout, abort).
+This is a **privilege boundary, not a filesystem sandbox**: the child's read tools
+still reach anything the OS user can read, and the child inherits the user's own
+credential store (`auth.json`) so the advisor model can authenticate.
+
+The advisor does **not** receive your session by default. Cite workspace paths in the question for anything on disk,
 and paste only evidence that exists nowhere on disk (command output, a test failure,
 observed runtime behavior) — point, don't paste. Set `includeSession: true` on a tool
 call to additionally attach the redacted transcript; it is then presented as *optional*
@@ -94,7 +104,7 @@ Two modes:
 
 - **`review`** (default): a single model call answering from the question.
   Cheap and fast; it identifies missing evidence instead of inspecting the repo.
-- **`explore`**: the advisor runs as a nested *read-only* agent and verifies the
+- **`explore`**: the advisor child runs a *read-only* agent and verifies the
   question against the workspace itself with `read`, `grep`, `find`, and `ls`.
   Bounded by the consultation timeout only — there are no tool-call or model-request
   caps; a timed-out exploration returns whatever partial output it had, explicitly

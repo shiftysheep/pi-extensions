@@ -70,6 +70,7 @@ export function saveConfig(config: AdvisorConfig): void {
   if (config.reasoningEffort) out.reasoningEffort = config.reasoningEffort;
   if (config.activeModelFallback) out.activeModelFallback = config.activeModelFallback;
   if (config.timeoutMs !== undefined) out.timeoutMs = config.timeoutMs;
+  if (config.piBinary) out.piBinary = config.piBinary;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
   // write or a concurrent reader never sees a truncated/invalid config.
   const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
@@ -91,6 +92,7 @@ export function describeConfig(config: AdvisorConfig, activeModelLabel?: string)
         ? `${config.timeoutMs} ms per consultation, fallback chain included (clamped 30 s..30 min)`
         : "5 min review / 10 min explore (defaults)",
     ],
+    ["pi binary", config.piBinary ?? '"pi" on PATH (or $PI_BINARY)'],
   ];
   // Retry chain: configured slots in order; no implicit model. The active model is
   // shown only when activeModelFallback is enabled (see buildCandidates).

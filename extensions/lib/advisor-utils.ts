@@ -31,6 +31,8 @@ export type AdvisorConfig = {
   activeModelFallback?: boolean;
   /** Consultation timeout in milliseconds, clamped to [ADVISOR_MIN_TIMEOUT_MS, ADVISOR_MAX_TIMEOUT_MS]. */
   timeoutMs?: number;
+  /** Explicit path to the pi binary the child-process transport spawns (default: "pi" on PATH). */
+  piBinary?: string;
 };
 
 /** Allowed top-level advisor.json keys; anything else is a typo and is rejected. */
@@ -40,6 +42,7 @@ export const ALLOWED_CONFIG_KEYS = [
   "reasoningEffort",
   "activeModelFallback",
   "timeoutMs",
+  "piBinary",
 ] as const;
 
 export const TARGET_KEYS = ["provider", "model", "effort"] as const;
@@ -201,6 +204,12 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   ) {
     throw new Error(`${configPath}: timeoutMs must be a positive number of milliseconds.`);
   }
+  if (
+    config.piBinary !== undefined &&
+    (typeof config.piBinary !== "string" || !config.piBinary.trim())
+  ) {
+    throw new Error(`${configPath}: piBinary must be a non-empty string path to the pi binary.`);
+  }
   const primary = parseTarget(config.primary, "primary", configPath);
   const fallback = parseTarget(config.fallback, "fallback", configPath);
   if (primary && fallback && sameModel(primary, fallback)) {
@@ -214,6 +223,7 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
     reasoningEffort: config.reasoningEffort,
     activeModelFallback: config.activeModelFallback,
     timeoutMs: config.timeoutMs,
+    piBinary: config.piBinary,
   };
 }
 
@@ -488,6 +498,7 @@ export class AdvisorEventAccumulator {
   private combinedUsage: Usage | undefined;
   private findings: string[] = [];
   private lastText = "";
+  private lastErrorMessage: string | undefined;
 
   record(event: {
     type: string;
@@ -505,10 +516,18 @@ export class AdvisorEventAccumulator {
     }
     if (event.type !== "message_end") return;
     const message = event.message as
-      | { role?: string; content?: unknown; usage?: Usage }
+      | {
+          role?: string;
+          content?: unknown;
+          usage?: Usage;
+          stopReason?: string;
+          errorMessage?: string;
+        }
       | undefined;
     if (!message || message.role !== "assistant") return;
     if (message.usage) this.combinedUsage = addUsage(this.combinedUsage, message.usage);
+    if (message.stopReason === "error" && message.errorMessage)
+      this.lastErrorMessage = message.errorMessage;
     const text = textFromContent(message.content).trim();
     this.lastText = text;
     if (text) {
@@ -524,6 +543,100 @@ export class AdvisorEventAccumulator {
   get usage(): Usage | undefined {
     return this.combinedUsage;
   }
+
+  /** Error message from the last assistant message that ended in an error (if any). */
+  get lastError(): string | undefined {
+    return this.lastErrorMessage;
+  }
+}
+
+/**
+ * Prompt file content for the child process: the mode's system prompt plus the
+ * budgeted request text. The child wraps file content in its own tags, so this
+ * is delivered as a single @path argument.
+ */
+export function assembleChildPrompt(systemPrompt: string, requestText: string): string {
+  return `${systemPrompt}\n\n---\n\n${requestText}`;
+}
+
+/** Host environment variables the child process needs to run (and nothing else). */
+export function childBaseEnv(): Record<string, string> {
+  const keys = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+  ] as const;
+  const env: Record<string, string> = {};
+  for (const key of keys) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Resolve the pi binary the child-process transport spawns:
+ * config piBinary > $PI_BINARY > "pi" (resolved on PATH by the OS).
+ */
+export function resolvePiBinary(config: { piBinary?: string } | undefined, env: NodeJS.ProcessEnv) {
+  const fromConfig = config?.piBinary?.trim();
+  if (fromConfig) return fromConfig;
+  const fromEnv = env.PI_BINARY?.trim();
+  if (fromEnv) return fromEnv;
+  return "pi";
+}
+
+/**
+ * Build the argv for the child advisor pi process. The prompt is delivered as a
+ * `@path` file reference (never as inline text) so prompt content cannot be
+ * parsed as options or land in the child's argv.
+ */
+export function buildChildPiArgs(opts: {
+  provider: string;
+  modelId: string;
+  effort: AdvisorReasoningEffort;
+  /** Tools the child may use; empty for review mode (child gets --no-tools). */
+  tools: string[];
+  /** Absolute path to the prompt file inside the child's temp agent dir. */
+  promptPath: string;
+}): string[] {
+  const args = [
+    "--provider",
+    opts.provider,
+    "--model",
+    opts.modelId,
+    "--mode",
+    "json",
+    "--print",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-approve",
+  ];
+  const thinking = effortToThinkingLevel(opts.effort);
+  if (thinking) args.push("--thinking", thinking);
+  args.push(
+    opts.tools.length > 0 ? "--tools" : "--no-tools",
+    ...(opts.tools.length > 0 ? [opts.tools.join(",")] : []),
+  );
+  args.push("--", `@${opts.promptPath}`);
+  return args;
+}
+
+/** Map an advisor effort to the child's --thinking level ("none" means: omit the flag). */
+export function effortToThinkingLevel(effort: AdvisorReasoningEffort): string | undefined {
+  return effort === "none" ? undefined : effort;
 }
 
 /** Render a terminal result's text: optional prefix + advice-capped body + status footer. */

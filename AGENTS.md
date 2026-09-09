@@ -79,6 +79,13 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   boundary (see its file header) — keep it that way, don't harden it into a sandbox.
 - `cron.ts` and `advisor.ts` keep process-level state on `globalThis` so it survives
   pi's `/reload` but not process exit. Preserve that pattern (nonce-guarded in `cron.ts`).
+- Advisor consultations run in an **isolated child `pi` process**
+  (`extensions/advisor/transports.ts`): throwaway agent dir with a 0600 copy of
+  `auth.json`, prompt delivered as an `@path` file, NDJSON events parsed by the
+  shared `AdvisorEventAccumulator`. It is a privilege boundary, **not** a filesystem
+  sandbox — don't harden it into one, and don't move model turns back into the host
+  process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
+  env extensions for the child belong in issue #8's design, not ad-hoc `env` merges.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 
 ## Hook setup (fresh clone / CI)

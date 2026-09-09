@@ -4,20 +4,24 @@
  */
 
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
   AdvisorEventAccumulator,
   addUsage,
+  assembleChildPrompt,
   assembleRequestText,
   buildCandidates,
+  buildChildPiArgs,
   capAdviceText,
   capDiagnosticText,
   capTranscriptEntries,
+  childBaseEnv,
   composeAdviceText,
   createConcurrencyLimiter,
+  effortToThinkingLevel,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
@@ -29,6 +33,7 @@ import {
   remainingBudgetMs,
   requestCharBudget,
   resolveConsultTimeoutMs,
+  resolvePiBinary,
   splitEffortSuffix,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
@@ -497,6 +502,7 @@ describe("parseConfig", () => {
         reasoningEffort: "high",
         activeModelFallback: true,
         timeoutMs: 120_000,
+        piBinary: undefined,
       },
     );
   });
@@ -507,6 +513,18 @@ describe("parseConfig", () => {
     assert.equal(config.fallback, undefined);
     assert.equal(config.reasoningEffort, undefined);
     assert.equal(config.activeModelFallback, undefined);
+  });
+
+  it("passes through piBinary and rejects invalid values", () => {
+    assert.equal(parseConfig({ piBinary: "/opt/pi" }, CONFIG_PATH).piBinary, "/opt/pi");
+    assert.throws(
+      () => parseConfig({ piBinary: "  " }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: piBinary must be a non-empty string path to the pi binary.`),
+    );
+    assert.throws(
+      () => parseConfig({ piBinary: 42 }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: piBinary must be a non-empty string path to the pi binary.`),
+    );
   });
 
   it("rejects a non-boolean activeModelFallback", () => {
@@ -537,7 +555,7 @@ describe("parseConfig", () => {
   it("rejects the removed exploreBudget key as an unknown key", () => {
     assert.throws(
       () => parseConfig({ exploreBudget: { toolCalls: 5 } }, CONFIG_PATH),
-      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs\)/,
+      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs, piBinary\)/,
     );
   });
 
@@ -840,6 +858,24 @@ describe("AdvisorEventAccumulator", () => {
     assert.equal(acc.usage?.output, 3);
   });
 
+  it("captures the last assistant error message from message_end events", () => {
+    const acc = new AdvisorEventAccumulator();
+    assert.equal(acc.lastError, undefined);
+    acc.record({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Codex error: The 'nope' model is not supported.",
+      },
+    });
+    assert.equal(acc.lastError, "Codex error: The 'nope' model is not supported.");
+    // A later successful message does not clear the earlier error record.
+    acc.record({ type: "message_end", message: assistantMsg("recovered", mkUsage(1, 1)) });
+    assert.equal(acc.lastError, "Codex error: The 'nope' model is not supported.");
+  });
+
   it("aggregates usage per assistant message_end, never from agent_end", () => {
     const acc = new AdvisorEventAccumulator();
     acc.record({ type: "turn_start" });
@@ -881,6 +917,83 @@ describe("composeAdviceText", () => {
 
   it("renders completed results without a prefix", () => {
     assert.equal(composeAdviceText("", "advice", "FOOTER"), "adviceFOOTER");
+  });
+});
+
+describe("buildChildPiArgs", () => {
+  it("builds explore-mode args with tools, thinking, and an @path prompt", () => {
+    const args = buildChildPiArgs({
+      provider: "openai-codex",
+      modelId: "gpt-6-astra",
+      effort: "high",
+      tools: ["read", "grep", "find", "ls"],
+      promptPath: "/tmp/pi-advisor-x/prompt.txt",
+    });
+    assert.equal(args[args.indexOf("--provider") + 1], "openai-codex");
+    assert.equal(args[args.indexOf("--model") + 1], "gpt-6-astra");
+    assert.ok(args.includes("--thinking"));
+    assert.ok(args[args.indexOf("--thinking") + 1] === "high");
+    assert.ok(args.includes("--mode"));
+    assert.ok(args.includes("--no-extensions"));
+    assert.ok(args.includes("--no-approve"));
+    assert.ok(args.includes("--tools"));
+    assert.ok(args[args.indexOf("--tools") + 1] === "read,grep,find,ls");
+    assert.ok(!args.includes("--no-tools"));
+    assert.ok(args[args.length - 2] === "--");
+    assert.ok(args[args.length - 1] === "@/tmp/pi-advisor-x/prompt.txt");
+  });
+
+  it("builds review-mode args with --no-tools and no thinking flag for none", () => {
+    const args = buildChildPiArgs({
+      provider: "anthropic",
+      modelId: "claude-x",
+      effort: "none",
+      tools: [],
+      promptPath: "/tmp/p.txt",
+    });
+    assert.ok(args.includes("--no-tools"));
+    assert.ok(!args.includes("--tools"));
+    assert.ok(!args.includes("--thinking"));
+  });
+});
+
+describe("resolvePiBinary", () => {
+  it("prefers config, then env, then the default pi", () => {
+    assert.equal(resolvePiBinary({ piBinary: "/opt/pi" }, { PI_BINARY: "/env/pi" }), "/opt/pi");
+    assert.equal(resolvePiBinary(undefined, { PI_BINARY: "/env/pi" }), "/env/pi");
+    assert.equal(resolvePiBinary({}, {}), "pi");
+    assert.equal(resolvePiBinary({ piBinary: "  " }, {}), "pi");
+  });
+});
+
+describe("effortToThinkingLevel", () => {
+  it("maps every effort except none to itself", () => {
+    assert.equal(effortToThinkingLevel("none"), undefined);
+    assert.equal(effortToThinkingLevel("high"), "high");
+    assert.equal(effortToThinkingLevel("max"), "max");
+  });
+});
+
+describe("childBaseEnv", () => {
+  const saved = { PATH: process.env.PATH, SECRET: process.env.ADVISOR_TEST_SECRET };
+  after(() => {
+    if (saved.PATH === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.PATH;
+    if (saved.SECRET === undefined) delete process.env.ADVISOR_TEST_SECRET;
+    else process.env.ADVISOR_TEST_SECRET = saved.SECRET;
+  });
+  it("carries the allowlisted variables and nothing else", () => {
+    process.env.ADVISOR_TEST_SECRET = "must-not-leak";
+    const env = childBaseEnv();
+    assert.ok(env.PATH !== undefined);
+    assert.ok(!("ADVISOR_TEST_SECRET" in env));
+    assert.ok(!("AWS_SECRET_ACCESS_KEY" in env));
+  });
+});
+
+describe("assembleChildPrompt", () => {
+  it("joins the system prompt and the request text with a separator", () => {
+    assert.equal(assembleChildPrompt("SYS", "REQ"), "SYS\n\n---\n\nREQ");
   });
 });
 
