@@ -57,7 +57,7 @@ jobs:
           # Nothing new to release? (e.g. this push merged a release PR itself,
           # whose only new commit is the merge commit.)
           last_tag=$(git describe --tags --abbrev=0)
-          if [ -z "$(git log --no-merges --oneline \"${last_tag}..HEAD\")" ]; then
+          if [ -z "$(git log --no-merges --oneline "${last_tag}..HEAD")" ]; then
             echo "No non-merge commits since ${last_tag}; nothing to release."
             exit 0
           fi
