@@ -60,15 +60,21 @@ The file is **strictly validated**: unknown keys (top level, in a model slot, or
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
-**How a consultation works (Claude-Code-advisor style):** the advisor automatically
-receives the redacted session transcript (including tool calls and results made so far)
-plus your precise question — pass the question, not pasted code. Set `includeSession: false`
-on a tool call to omit the transcript. Two modes:
+**How a consultation works (ground-truth style):** the advisor does **not** receive
+your session by default. Cite workspace paths in the question for anything on disk,
+and paste only evidence that exists nowhere on disk (command output, a test failure,
+observed runtime behavior) — point, don't paste. Set `includeSession: true` on a tool
+call to additionally attach the redacted transcript; it is then presented as *optional*
+context the advisor must verify against the workspace, with each entry capped (8k
+chars) and the whole transcript capped (120k chars). Accepted trade-off: the advisor
+now depends on you citing the right paths — but that failure mode is visible ("I
+could not find X") rather than silent (confident reasoning from a wrong summary).
+Two modes:
 
-- **`review`** (default): a single model call answering from the question + transcript.
+- **`review`** (default): a single model call answering from the question.
   Cheap and fast; it identifies missing evidence instead of inspecting the repo.
-- **`explore`**: the advisor runs as a nested *read-only* agent and may inspect the
-  workspace itself with `read`, `grep`, `find`, and `ls`. Bounded by hard spend caps
+- **`explore`**: the advisor runs as a nested *read-only* agent and verifies the
+  question against the workspace itself with `read`, `grep`, `find`, and `ls`. Bounded by hard spend caps
   (≤24 tool calls, ≤12 model requests by default, tunable via `exploreBudget`, 10-minute
   timeout); exhausting a budget returns an explicit **incomplete** result, never an
   authoritative verdict. Use only when the question requires locating code or verifying
@@ -113,11 +119,13 @@ Behavior notes:
   never a surprise.
 - **`"none"` effort** requests no reasoning level; the advisor session then uses its own
   default (an explicit "off" is not expressible through the agent API).
-- **Session redaction** (transcript included by default; `includeSession: false` opts out)
-is best-effort: PEM blocks, authorization
-  headers, common `key = value` / quoted assignments, and known token prefixes
-  (`sk-`, `gh[pousr]_`, `github_pat_`, `xox*`, `AKIA…`) are scrubbed, but don't treat it as
-  a guarantee — prefer not to include secrets in the session you consult from.
+- **Session redaction** (only when `includeSession: true` opts in) is best-effort:
+  PEM blocks, authorization headers, common `key = value` / quoted assignments, and
+  known token prefixes (`sk-`, `gh[pousr]_`, `github_pat_`, `xox*`, `AKIA…`) are
+  scrubbed. Known gaps: JWTs, `xapp-` tokens, Google `AIza…` keys, single-line
+  private keys, and `export FOO=…` assignments. Don't treat redaction as a
+  guarantee — the safest way to keep secrets out of the advisor is to never let
+  them enter the session at all.
 - The config file is written atomically (temp + rename) and validated on read; a broken
   file never blocks explicit `provider`/`model` tool calls, and `/advisor reset` recovers it.
 

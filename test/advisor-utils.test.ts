@@ -14,10 +14,12 @@ import {
   buildCandidates,
   capAdviceText,
   capDiagnosticText,
+  capTranscriptEntries,
   createConcurrencyLimiter,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
+  MAX_TRANSCRIPT_ENTRY_CHARS,
   parseConfig,
   parseExploreBudget,
   parseTarget,
@@ -27,6 +29,7 @@ import {
   requestCharBudget,
   resolveConsultTimeoutMs,
   splitEffortSuffix,
+  TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
   withSlot,
 } from "../extensions/lib/advisor-utils.js";
@@ -152,29 +155,110 @@ describe("requestCharBudget", () => {
   });
 });
 
+describe("capTranscriptEntries", () => {
+  it("caps each entry individually before joining", () => {
+    const big = "x".repeat(MAX_TRANSCRIPT_ENTRY_CHARS + 100);
+    const out = capTranscriptEntries(["small", big, "y".repeat(MAX_TRANSCRIPT_ENTRY_CHARS + 1)]);
+    assert.equal(out[0], "small");
+    assert.equal(out[1].length, MAX_TRANSCRIPT_ENTRY_CHARS);
+    assert.ok(out[1].startsWith("xxx"), "entry keeps its head");
+    assert.ok(out[1].endsWith(TRANSCRIPT_ENTRY_CAP_MARKER));
+    assert.equal(out[2].endsWith(TRANSCRIPT_ENTRY_CAP_MARKER), true);
+  });
+
+  it("leaves short entries untouched", () => {
+    assert.deepEqual(capTranscriptEntries(["a", "b c"]) as string[], ["a", "b c"]);
+  });
+});
+
+describe("redact-then-cap (sessionTranscript entry pipeline)", () => {
+  it("redacts a PEM block whose closing delimiter would be severed by the cap", () => {
+    // The PEM block starts near the head of a huge tool result: capping the
+    // entry BEFORE redaction would cut the "-----END ...-----" line, and the
+    // block-level redactor would then leave the key material exposed.
+    const pem = `-----BEGIN RSA PRIVATE KEY-----\n${"A".repeat(2_000)}\n-----END RSA PRIVATE KEY-----`;
+    const entry = `read result follows:\n${pem}\n${"x".repeat(MAX_TRANSCRIPT_ENTRY_CHARS * 3)}`;
+    // The pipeline sessionTranscript uses: redact the complete entry, then cap.
+    const redacted = redactSensitiveText(entry);
+    assert.doesNotMatch(redacted, /A{100}/, "redaction must remove the key body");
+    const [capped] = capTranscriptEntries([redacted]);
+    assert.doesNotMatch(capped, /A{100}/, "capping after redaction must not expose key material");
+    assert.doesNotMatch(capped, /BEGIN RSA/, "no raw PEM header survives");
+  });
+
+  it("shows why capping before redaction would leak", () => {
+    // Counter-factual: cap first (the old, buggy order) severs the END line,
+    // so the block-level redactor no longer matches the incomplete block.
+    const pem = `-----BEGIN RSA PRIVATE KEY-----\n${"A".repeat(MAX_TRANSCRIPT_ENTRY_CHARS + 200)}\n-----END RSA PRIVATE KEY-----`;
+    const entry = `\n${pem}`;
+    const [cappedFirst] = capTranscriptEntries([entry]);
+    const redactedLate = redactSensitiveText(cappedFirst);
+    assert.match(redactedLate, /A{100}/, "capping before redaction exposes key material");
+  });
+});
+
 describe("assembleRequestText", () => {
   const smallModel = { contextWindow: 4_000, maxTokens: 800 };
   const promptChars = 0;
 
-  it("includes the question and transcript verbatim when they fit", () => {
+  it("includes the question and transcript under the optional-context header when they fit", () => {
     const out = assembleRequestText(smallModel, "the question", "the transcript", promptChars);
     assert.ok(out.startsWith("## Question\nthe question"));
+    assert.ok(
+      out.includes(
+        "## Optional context supplied by the caller (redacted, may be truncated; verify against the workspace)",
+      ),
+    );
     assert.ok(out.includes("the transcript"));
     assert.doesNotMatch(out, /Omitted/);
   });
 
-  it("shrinks the transcript before touching the question", () => {
+  it("sends only the question when no transcript was supplied", () => {
+    const out = assembleRequestText(smallModel, "the question", "", promptChars);
+    assert.ok(out.startsWith("## Question\nthe question"));
+    assert.doesNotMatch(out, /session history/);
+    assert.doesNotMatch(out, /Optional context/);
+    assert.doesNotMatch(out, /Omitted/);
+  });
+
+  it("drops the transcript entirely when it cannot coexist with the full question", () => {
+    // Budget (~2.4k chars) < question (30k): the transcript must not survive,
+    // and the question (not the transcript) absorbs the truncation.
+    const question = "Q".repeat(30_000);
+    const transcript = "t".repeat(12_000);
+    const out = assembleRequestText(smallModel, question, transcript, promptChars);
+    const budget = requestCharBudget(smallModel, promptChars);
+    assert.ok(out.length <= budget);
+    assert.doesNotMatch(out, /ttt/, "transcript dropped to make room for the question");
+    assert.doesNotMatch(out, /Optional context/);
+    assert.ok(out.includes("\nQQQ"), "question keeps its head");
+    assert.ok(out.includes("[Omitted to fit the advisor model's context window.]"));
+  });
+
+  it("fits the budget when the question consumes it all and drops the transcript", () => {
+    // A question larger than the whole budget leaves no room for ANY
+    // transcript: it is dropped, and the question is truncated to fit.
+    const tinyModel = { contextWindow: 200, maxTokens: 100 }; // budget = 1792 chars
+    const out = assembleRequestText(tinyModel, "q".repeat(2_000), "t".repeat(5_000), 0);
+    const budget = requestCharBudget(tinyModel, 0);
+    assert.ok(out.length <= budget);
+    assert.doesNotMatch(out, /ttt/, "no room for even a truncated transcript");
+    assert.doesNotMatch(out, /Optional context/);
+    assert.ok(out.includes("\nqqq"), "question keeps its head");
+  });
+
+  it("keeps a truncated transcript tail when it partially fits beside the question", () => {
     const question = "q".repeat(100);
     const transcript = "t".repeat(11_000);
     const out = assembleRequestText(smallModel, question, transcript, promptChars);
     const budget = requestCharBudget(smallModel, promptChars);
     assert.ok(out.length <= budget);
-    assert.ok(out.includes(question), "question must survive transcript shrinking");
+    assert.ok(out.includes(question), "full question survives");
     assert.ok(out.includes("[Earlier session context omitted.]"));
     assert.ok(out.includes("ttt"), "tail of the transcript is kept");
   });
 
-  it("truncates the question only when the transcript cannot absorb the overflow", () => {
+  it("truncates the question alone when there is no transcript", () => {
     const question = "Q".repeat(30_000);
     const out = assembleRequestText(smallModel, question, "", promptChars);
     const budget = requestCharBudget(smallModel, promptChars);

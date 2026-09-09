@@ -339,9 +339,27 @@ export function requestCharBudget(model: BudgetModel, promptChars: number): numb
 }
 
 /**
+ * Cap applied to EACH transcript entry before the transcript is joined, so
+ * one large tool result cannot evict the rest of the caller-supplied context.
+ */
+export const MAX_TRANSCRIPT_ENTRY_CHARS = 8_000;
+/** Marker used when a single transcript entry is capped. */
+export const TRANSCRIPT_ENTRY_CAP_MARKER = "\n[entry truncated]";
+
+/** Cap every entry of a caller-supplied transcript before joining. */
+export function capTranscriptEntries(entries: string[]): string[] {
+  return entries.map((entry) =>
+    keepStart(entry, MAX_TRANSCRIPT_ENTRY_CHARS, TRANSCRIPT_ENTRY_CAP_MARKER),
+  );
+}
+
+/**
  * Assemble the advisor request, shrinking to fit the model's budget. The
- * transcript is trimmed first (it is the least load-bearing part); the
- * question is only truncated once the transcript is already at its floor.
+ * request always starts with the question. When the caller explicitly
+ * supplied a transcript, it is appended under an "optional context" header
+ * and trimmed first on overflow (it is the least load-bearing part); if the
+ * transcript cannot absorb the overflow at all, it is dropped — including
+ * its header — before the question is touched.
  */
 export function assembleRequestText(
   model: BudgetModel,
@@ -350,23 +368,37 @@ export function assembleRequestText(
   promptChars: number,
 ): string {
   const marker = "\n[Omitted to fit the advisor model's context window.]";
-  let question = keepStart(questionInput, MAX_QUESTION_CHARS, marker);
-  let transcript = transcriptInput || "(empty)";
-  const render = () =>
-    `## Question\n${question}\n\n## Recent session history (redacted; may be truncated)\nYou can also inspect the workspace yourself with read/grep/find/ls.\n${transcript}`;
+  const questionSection = `## Question\n${keepStart(questionInput, MAX_QUESTION_CHARS, marker)}`;
+  const transcriptHeader =
+    "## Optional context supplied by the caller (redacted, may be truncated; verify against the workspace)";
   const budget = requestCharBudget(model, promptChars);
 
-  let overflow = render().length - budget;
-  if (overflow > 0) {
-    transcript = keepEnd(
-      transcript,
-      Math.max(0, transcript.length - overflow),
-      "[Earlier session context omitted.]\n\n",
-    );
-    overflow = render().length - budget;
+  if (transcriptInput) {
+    // Optional context may shrink to make room for the question, but it must
+    // never force the question to truncate: drop it entirely if it cannot
+    // coexist with the full question. The overhead is measured, not computed,
+    // so the rendered output is guaranteed to fit the budget.
+    const overhead = `${questionSection}\n\n${transcriptHeader}\n`.length;
+    const room = budget - overhead;
+    if (room >= transcriptInput.length) {
+      return `${questionSection}\n\n${transcriptHeader}\n${transcriptInput}`;
+    }
+    if (room > 0) {
+      // Shrink the transcript (tail-keeping) to exactly fill the room left by
+      // the full question; verify the length before trusting it.
+      const trimmed = keepEnd(transcriptInput, room, "[Earlier session context omitted.]\n\n");
+      if (trimmed.length <= room) {
+        return `${questionSection}\n\n${transcriptHeader}\n${trimmed}`;
+      }
+    }
+    // No room for even a truncated transcript: drop it and fall through.
   }
+  // The question alone, truncated only if the question itself exceeds the
+  // budget (accounting for the "## Question\n" header).
+  let question = keepStart(questionInput, MAX_QUESTION_CHARS, marker);
+  const overflow = question.length + 12 - budget;
   if (overflow > 0) question = keepStart(question, Math.max(0, question.length - overflow), marker);
-  return render();
+  return `## Question\n${question}`;
 }
 
 /** Ceiling for advice returned to the caller (the advisor's job is to save caller context, not spend it twice). */
