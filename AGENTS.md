@@ -36,11 +36,15 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
 - **Types**: strict mode via `tsconfig.json` (`noEmit`). `any` and non-null assertions
   are warnings, not errors — pi event payloads are loosely typed, but prefer precise
   types where the pi packages export them.
-- **Testing**: pure advisor helpers live in `extensions/lib/advisor-utils.ts` and
-  are covered by `test/advisor-utils.test.ts` (`node --test` via tsx, wired into
-  `check`). Keep new advisor logic testable the same way — pure functions in the
-  utils module, pi-specific wiring in `extensions/advisor/` (split modules) and
-  `advisor.ts` (entry). Note: the `pi.extensions` manifest in `package.json` lists
+- **Testing**: pure helpers are covered by `test/*.test.ts` (`node --test` via
+  tsx, wired into `check`): advisor in `extensions/lib/advisor-utils.ts` →
+  `test/advisor-utils.test.ts` (+ `test/advisor-child.test.ts`), sandbox in
+  `extensions/lib/sandbox-utils.ts` + `extensions/permission-gate/rules.ts` →
+  `test/sandbox-utils.test.ts` / `test/permission-gate.test.ts`, plus
+  `test/sandbox-landlock.test.ts` (compiles the C helper; skips cleanly without
+  cc/Landlock). Keep new logic testable the same way — pure functions in the
+  utils/rules modules, pi-specific wiring in `extensions/advisor/` (split
+  modules), `advisor.ts`, and `permission-gate.ts` (entry). Note: the `pi.extensions` manifest in `package.json` lists
   extension files **explicitly** — a new top-level `extensions/<file>.ts` must be
   added there or it will not load (and do not add an `extensions/<subdir>/index.ts`;
   only the manifest's explicit entries load). Shared code goes in subdirs like

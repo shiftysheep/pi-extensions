@@ -10,14 +10,52 @@
 export const SANDBOX_RUNNERS = ["bwrap", "landlock", "sandbox-exec"] as const;
 export type SandboxRunner = (typeof SANDBOX_RUNNERS)[number];
 export type SandboxRunnerChoice = "auto" | SandboxRunner | "none";
+export const SANDBOX_RUNNER_CHOICES = ["auto", "none", ...SANDBOX_RUNNERS] as const;
+
+/** Config file scopes: global (~/.pi/agent) or project (<cwd>/.pi). */
+export type SandboxScope = "global" | "project";
 
 export const SANDBOX_ALLOWED_KEYS = [
   "enabled",
   "runner",
   "writable",
   "home",
+  "homeCaches",
   "network",
   "userCommands",
+] as const;
+
+/**
+ * $HOME-relative cache/tool dirs made writable by default (homeCaches: "rw",
+ * the default) so common dev tooling works out of the box: XDG cache
+ * (pre-commit, pip, uv, virtualenv, huggingface, …), package-manager caches,
+ * and tool install locations. Deliberately excludes credential/config dirs
+ * (.ssh, .aws, .gnupg, .config). Home-relative so they track $HOME; extended
+ * in buildWritableRoots only for dirs that already exist (a missing dir is
+ * skipped, never walked up to $HOME).
+ */
+export const HOME_CACHE_ROOTS = [
+  ".cache",
+  ".npm",
+  ".pnpm-store",
+  ".yarn",
+  ".bun",
+  ".cargo",
+  ".rustup",
+  ".gem",
+  ".m2",
+  ".gradle",
+  ".ivy2",
+  ".nvm",
+  ".volta",
+  ".asdf",
+  ".pyenv",
+  ".rbenv",
+  ".rvm",
+  ".gvm",
+  ".sdkman",
+  ".local/share/uv",
+  ".local/bin",
 ] as const;
 
 export type SandboxConfig = {
@@ -29,6 +67,9 @@ export type SandboxConfig = {
   writable?: string[];
   /** Access to $HOME. Default: "ro". */
   home?: "rw" | "ro";
+  /** Writable $HOME cache/tool dirs (HOME_CACHE_ROOTS). Default: "rw". Set
+   * "ro" for a stricter sandbox that leaves every $HOME subdir read-only. */
+  homeCaches?: "rw" | "ro";
   /** Network policy. Default: "allow". Enforced by bwrap/seatbelt; a no-op
    * (with a warning) on landlock, which cannot restrict networks. */
   network?: "allow" | "deny";
@@ -75,10 +116,10 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
   if (obj.runner !== undefined) {
     if (
       typeof obj.runner !== "string" ||
-      !(["auto", "none", ...SANDBOX_RUNNERS] as string[]).includes(obj.runner)
+      !(SANDBOX_RUNNER_CHOICES as readonly string[]).includes(obj.runner)
     ) {
       throw new Error(
-        `${configPath}: "runner" must be one of: auto, none, ${SANDBOX_RUNNERS.join(", ")}`,
+        `${configPath}: "runner" must be one of: ${SANDBOX_RUNNER_CHOICES.join(", ")}`,
       );
     }
     config.runner = obj.runner as SandboxRunnerChoice;
@@ -98,6 +139,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     }
     config.home = obj.home;
   }
+  if (obj.homeCaches !== undefined) {
+    if (obj.homeCaches !== "rw" && obj.homeCaches !== "ro") {
+      throw new Error(`${configPath}: "homeCaches" must be "rw" or "ro"`);
+    }
+    config.homeCaches = obj.homeCaches;
+  }
   if (obj.network !== undefined) {
     if (obj.network !== "allow" && obj.network !== "deny") {
       throw new Error(`${configPath}: "network" must be "allow" or "deny"`);
@@ -111,6 +158,62 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     config.userCommands = obj.userCommands;
   }
   return config;
+}
+
+/**
+ * Config file path for a scope. Pure: no fs.
+ * `projectDir` is pi's project config dir (<cwd>/.pi) — passed pre-resolved so
+ * this module stays free of pi imports.
+ */
+export function sandboxConfigPath(
+  scope: SandboxScope,
+  paths: { agentDir: string; projectDir: string },
+): string {
+  return scope === "global" ? `${paths.agentDir}/sandbox.json` : `${paths.projectDir}/sandbox.json`;
+}
+
+/**
+ * Merge global + project sandbox configs: per-key, project wins. Undefined
+ * project keys fall back to the global value. Pure.
+ */
+export function mergeSandboxConfigs(
+  globalConfig: SandboxConfig,
+  projectConfig: SandboxConfig,
+): SandboxConfig {
+  const merged: SandboxConfig = { ...globalConfig };
+  for (const key of SANDBOX_ALLOWED_KEYS) {
+    const value = projectConfig[key];
+    if (value !== undefined) (merged as Record<string, unknown>)[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Apply an on/off toggle to one scope's config. Pure.
+ * Turning on defaults the runner to "auto" only when this scope has no
+ * explicit runner AND no explicit runner is effective in the merged config
+ * (`inheritedRunner`), so an existing "bwrap"/"landlock"/... choice in
+ * either scope is preserved.
+ */
+export function applySandboxToggle(
+  config: SandboxConfig,
+  enabled: boolean,
+  inheritedRunner?: SandboxRunnerChoice,
+): SandboxConfig {
+  if (!enabled) return { ...config, enabled: false };
+  return {
+    ...config,
+    enabled: true,
+    ...(config.runner === undefined ? { runner: inheritedRunner ?? ("auto" as const) } : {}),
+  };
+}
+
+/** Split a comma-separated writable-paths line (the config UI input). Pure. */
+export function parseWritableList(input: string): string[] {
+  return input
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /** Single-quote a string for safe embedding in a shell command line. */
@@ -156,6 +259,16 @@ export function buildWritableRoots(
   // `> /dev/null`, /proc/self writes, scratch space.
   for (const systemRoot of ["/tmp", "/dev", "/proc"]) if (exists(systemRoot)) roots.add(systemRoot);
   if (config.home === "rw") add(ctx.homeDir);
+  // Default-writable $HOME cache/tool dirs (opt-out via homeCaches: "ro").
+  // Added only when the dir EXISTS: unlike `writable` entries, a missing cache
+  // dir must NOT fall back to its ancestor via resolveExistingRoot, or a
+  // absent ~/.cargo would silently make all of $HOME writable.
+  if (config.homeCaches !== "ro") {
+    for (const rel of HOME_CACHE_ROOTS) {
+      const abs = `${ctx.homeDir}/${rel}`;
+      if (exists(abs)) roots.add(abs);
+    }
+  }
   // A root subsuming another is redundant.
   return [...roots].filter(
     (r) => ![...roots].some((other) => other !== r && isInsideRoot(r, other)),
