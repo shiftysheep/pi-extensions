@@ -79,6 +79,23 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   boundary (see its file header) — keep it that way, don't harden it into a sandbox.
 - `cron.ts` and `advisor.ts` keep process-level state on `globalThis` so it survives
   pi's `/reload` but not process exit. Preserve that pattern (nonce-guarded in `cron.ts`).
+- Advisor consultations run in an **isolated child `pi` process**
+  (`extensions/advisor/transports.ts`): throwaway agent dir with a 0600 copy of
+  `auth.json`, prompt delivered as an `@path` file, NDJSON events parsed by the
+  shared `AdvisorEventAccumulator`. The child runs `--no-extensions`, so its model
+  resolution is limited to the copied `models.json` / `models-store.json` / `auth.json`
+  — a provider registered only by an extension is not visible to the child. It is a
+  privilege boundary, **not** a filesystem sandbox — don't harden it into one, and
+  don't move model turns back into the host process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
+  env extensions for the child belong in issue #8's design, not ad-hoc `env` merges. Because of that allowlist, a model with
+  no `auth.json` entry whose credential is resolved from a *set env var* (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `AWS_PROFILE`/region, …) does not resolve in the child (the var is stripped); ambient *file* credentials found via the
+  inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. Known limitation addressed by #8. The child's
+  `auth.json` copy has its OAuth refresh token STRIPPED (and is written read-only, transports.ts), so the child can never
+  perform a refresh — that is what protects the host's refresh token from server-side rotation (a read-only file copy
+  alone would NOT prevent it: a refresh rotates the token on the provider's side before any local write). The access
+  token is pre-refreshed in the host first (`preRefreshProviderAuth`) so the child inherits a fresh token it uses
+  directly; a token that expires mid-run degrades to an auth error handled by the fallback chain.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 
 ## Hook setup (fresh clone / CI)

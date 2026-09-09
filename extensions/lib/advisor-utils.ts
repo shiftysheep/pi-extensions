@@ -5,6 +5,7 @@
  * ExtensionContext) so they can be unit-tested without a live session.
  */
 
+import { StringDecoder } from "node:string_decoder";
 import type { Usage } from "@earendil-works/pi-ai";
 
 export const REASONING_EFFORTS = [
@@ -31,6 +32,8 @@ export type AdvisorConfig = {
   activeModelFallback?: boolean;
   /** Consultation timeout in milliseconds, clamped to [ADVISOR_MIN_TIMEOUT_MS, ADVISOR_MAX_TIMEOUT_MS]. */
   timeoutMs?: number;
+  /** Explicit path to the pi binary the child-process transport spawns (default: "pi" on PATH). */
+  piBinary?: string;
 };
 
 /** Allowed top-level advisor.json keys; anything else is a typo and is rejected. */
@@ -40,6 +43,7 @@ export const ALLOWED_CONFIG_KEYS = [
   "reasoningEffort",
   "activeModelFallback",
   "timeoutMs",
+  "piBinary",
 ] as const;
 
 export const TARGET_KEYS = ["provider", "model", "effort"] as const;
@@ -201,6 +205,12 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   ) {
     throw new Error(`${configPath}: timeoutMs must be a positive number of milliseconds.`);
   }
+  if (
+    config.piBinary !== undefined &&
+    (typeof config.piBinary !== "string" || !config.piBinary.trim())
+  ) {
+    throw new Error(`${configPath}: piBinary must be a non-empty string path to the pi binary.`);
+  }
   const primary = parseTarget(config.primary, "primary", configPath);
   const fallback = parseTarget(config.fallback, "fallback", configPath);
   if (primary && fallback && sameModel(primary, fallback)) {
@@ -214,6 +224,7 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
     reasoningEffort: config.reasoningEffort,
     activeModelFallback: config.activeModelFallback,
     timeoutMs: config.timeoutMs,
+    piBinary: config.piBinary,
   };
 }
 
@@ -488,6 +499,9 @@ export class AdvisorEventAccumulator {
   private combinedUsage: Usage | undefined;
   private findings: string[] = [];
   private lastText = "";
+  private lastErrorMessage: string | undefined;
+  private sawAssistant = false;
+  private lastStopReason: string | undefined;
 
   record(event: {
     type: string;
@@ -505,11 +519,38 @@ export class AdvisorEventAccumulator {
     }
     if (event.type !== "message_end") return;
     const message = event.message as
-      | { role?: string; content?: unknown; usage?: Usage }
+      | {
+          role?: string;
+          content?: unknown;
+          usage?: Usage;
+          stopReason?: string;
+          errorMessage?: string;
+        }
       | undefined;
-    if (!message || message.role !== "assistant") return;
-    if (message.usage) this.combinedUsage = addUsage(this.combinedUsage, message.usage);
+    if (message?.role !== "assistant") return;
+    // Compute every derived value before mutating state, so a malformed usage
+    // object (or content) cannot leave the accumulator half-updated: the
+    // completion signal, stop reason, and final text must stay consistent even
+    // if usage aggregation throws.
+    const stopReason = message.stopReason;
+    const isError = stopReason === "error";
+    const errorMessage = isError ? message.errorMessage || "the model request failed" : undefined;
     const text = textFromContent(message.content).trim();
+    let usage: Usage | undefined;
+    if (message.usage) {
+      try {
+        usage = addUsage(this.combinedUsage, message.usage);
+      } catch {
+        // A malformed usage object must not corrupt completion tracking.
+      }
+    }
+    this.sawAssistant = true;
+    if (usage) this.combinedUsage = usage;
+    if (stopReason !== undefined) this.lastStopReason = stopReason;
+    // A failed turn records its error; a successful terminal turn clears the
+    // history, so a transient error followed by a retry is not mislabeled as
+    // "an error after this output".
+    this.lastErrorMessage = errorMessage;
     this.lastText = text;
     if (text) {
       if (this.findings[this.findings.length - 1] !== text) this.findings.push(text);
@@ -524,6 +565,289 @@ export class AdvisorEventAccumulator {
   get usage(): Usage | undefined {
     return this.combinedUsage;
   }
+
+  /** Error message from the last assistant message that ended in an error (if any). */
+  get lastError(): string | undefined {
+    return this.lastErrorMessage;
+  }
+
+  /** Stop reason of the last assistant message (if any assistant message arrived). */
+  get stopReason(): string | undefined {
+    return this.lastStopReason;
+  }
+
+  /** True once at least one assistant message_end event was recorded. */
+  get assistantResponse(): boolean {
+    return this.sawAssistant;
+  }
+}
+
+/**
+ * Prompt file content for the child process: the mode's system prompt plus the
+ * budgeted request text. The child wraps file content in its own tags, so this
+ * is delivered as a single @path argument.
+ */
+export function assembleChildPrompt(systemPrompt: string, requestText: string): string {
+  return `${systemPrompt}\n\n---\n\n${requestText}`;
+}
+
+/** Host environment variables the child process needs to run (and nothing else). */
+export function childBaseEnv(): Record<string, string> {
+  const keys = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+  ] as const;
+  const env: Record<string, string> = {};
+  for (const key of keys) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Resolve the pi binary the child-process transport spawns:
+ * config piBinary > $PI_BINARY > "pi" (resolved on PATH by the OS).
+ */
+export function resolvePiBinary(config: { piBinary?: string } | undefined, env: NodeJS.ProcessEnv) {
+  const fromConfig = config?.piBinary?.trim();
+  if (fromConfig) return fromConfig;
+  const fromEnv = env.PI_BINARY?.trim();
+  if (fromEnv) return fromEnv;
+  return "pi";
+}
+
+/**
+ * Remove OAuth refresh tokens from an auth.json document, so a spawned child
+ * can never perform a token refresh. This is what protects the host's canonical
+ * refresh token: a refresh the child performs would rotate it on the provider's
+ * side (invalidating the host's token) *before* any local persistence, which a
+ * read-only copy of the file does not prevent. With the refresh token stripped,
+ * the child uses its (pre-refreshed, fresh) access token directly; if that
+ * token ever expires mid-run, the child's refresh fails cleanly (no refresh
+ * token to send) and degrades to an auth error handled by the fallback chain,
+ * instead of corrupting the host credential.
+ *
+ * Pure and defensive: returns the input unchanged if it is not a JSON object of
+ * provider -> credential maps; otherwise returns a re-serialized copy with each
+ * credential's `refresh` field removed (all other fields preserved).
+ */
+export function stripRefreshTokens(authJsonText: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(authJsonText);
+  } catch {
+    return authJsonText;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return authJsonText;
+  }
+  const providers = parsed as { [providerId: string]: unknown };
+  for (const id of Object.keys(providers)) {
+    const credential = providers[id];
+    if (typeof credential === "object" && credential !== null && !Array.isArray(credential)) {
+      delete (credential as { [field: string]: unknown }).refresh;
+    }
+  }
+  return JSON.stringify(parsed);
+}
+
+/**
+ * Observed state of a finished, not-interrupted child advisor process, for
+ * decideChildOutcome. Timeout and abort are handled by the caller before this
+ * is reached, so they are not part of the state here.
+ */
+export type ChildCompletionState = {
+  exitCode: number;
+  /** Termination signal, if the child died to one. */
+  signalCode: string | null;
+  /** True once at least one assistant message_end event arrived. */
+  assistantResponse: boolean;
+  /** Stop reason of the last assistant message. */
+  stopReason?: string;
+  lastError?: string;
+  /** Final answer for a completed run; earlier findings when interrupted. */
+  text: string;
+  /** Capped child stderr tail, for diagnostics. */
+  stderr: string;
+};
+
+/**
+ * Decide how a finished, non-interrupted child consultation is reported.
+ *
+ * pi exits 0 even when the model call failed (the error rides in the assistant
+ * message) and even for some startup diagnostics, so the exit code alone is
+ * not a success signal. Only a run that produced nonempty assistant text and
+ * ended in a successful stop reason is "completed"; every failed, empty,
+ * aborted, or abnormal run throws so the caller routes it to the fallback
+ * model. Deadline timeouts and caller aborts are reported by the caller as
+ * "timed_out" / "aborted" and never reach this function.
+ */
+export function decideChildOutcome(state: ChildCompletionState): {
+  text: string;
+  status: "completed";
+} {
+  if (state.signalCode)
+    throw new Error(
+      `the advisor child process was killed by signal ${state.signalCode} before completing`,
+    );
+  if (!state.assistantResponse)
+    throw new Error(
+      state.stderr.trim() ||
+        state.lastError ||
+        `the advisor child process (exit ${state.exitCode}) returned no assistant response`,
+    );
+  if (state.stopReason === "error") throw new Error(state.lastError ?? state.stderr);
+  if (state.stopReason === "aborted") throw new Error("the advisor model call was aborted");
+  // Only a clean "stop" is a completed answer. A response truncated at the
+  // token limit ("length"), cut off for a tool call ("toolUse"), a still
+  // unresolved deferred call ("deferred"), a pending turn, or a missing stop
+  // reason is an incomplete/abnormal run — route it to the fallback model
+  // rather than reporting partial advice as a completed answer. (pi's
+  // AssistantMessage.stopReason is required, so a real finished turn always
+  // carries "stop"; anything else means the run did not actually complete.)
+  if (state.stopReason !== "stop")
+    throw new Error(
+      state.stopReason === undefined
+        ? "the advisor model call ended without a stop reason"
+        : `the advisor model call ended with stopReason "${state.stopReason}" (incomplete answer)`,
+    );
+  if (state.exitCode !== 0)
+    throw new Error(
+      `the advisor child process exited abnormally (exit ${state.exitCode})` +
+        (state.stderr.trim() ? `: ${state.stderr.trim()}` : ""),
+    );
+  if (!state.text) throw new Error("the advisor returned no text");
+  return { text: state.text, status: "completed" };
+}
+
+/**
+ * Decode a stream of child stdout bytes into NDJSON events. Multibyte
+ * characters can split across chunk boundaries (StringDecoder keeps decoding
+ * consistent), and the final event may not be terminated by a newline —
+ * `end()` flushes the decoder and surfaces any remaining partial line. Pass
+ * an `onLine` callback that never throws; malformed lines are dropped by
+ * `parseNdjsonLine`, never by this buffer.
+ */
+export class NdjsonLineBuffer {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending = "";
+
+  write(chunk: Buffer, onLine: (line: string) => void): void {
+    this.pending += this.decoder.write(chunk);
+    let idx = this.pending.indexOf("\n");
+    while (idx >= 0) {
+      const line = this.pending.slice(0, idx);
+      this.pending = this.pending.slice(idx + 1);
+      onLine(line);
+      idx = this.pending.indexOf("\n");
+    }
+  }
+
+  end(onLine: (line: string) => void): void {
+    this.pending += this.decoder.end();
+    if (this.pending.trim()) onLine(this.pending);
+    this.pending = "";
+  }
+}
+
+/**
+ * Split one chunk of child stdout into complete NDJSON lines. Returns the
+ * lines plus the (possibly empty) remainder to prepend to the next chunk.
+ */
+export function splitNdjsonLines(buffer: string): { lines: string[]; rest: string } {
+  const lines: string[] = [];
+  let rest = buffer;
+  let idx = rest.indexOf("\n");
+  while (idx >= 0) {
+    lines.push(rest.slice(0, idx));
+    rest = rest.slice(idx + 1);
+    idx = rest.indexOf("\n");
+  }
+  return { lines, rest };
+}
+
+/**
+ * Parse one NDJSON line into the event shape AdvisorEventAccumulator accepts.
+ * Returns undefined for empty, non-JSON, or non-object lines — malformed
+ * output must never crash the host process.
+ */
+export function parseNdjsonLine(
+  line: string,
+): { type: string; toolName?: string; message?: unknown; messages?: unknown[] } | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+  let event: unknown;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (typeof event !== "object" || event === null) return undefined;
+  const typed = event as {
+    type?: unknown;
+    toolName?: unknown;
+    message?: unknown;
+    messages?: unknown;
+  };
+  if (typeof typed.type !== "string") return undefined;
+  const toolName = typeof typed.toolName === "string" ? typed.toolName : undefined;
+  const messages = Array.isArray(typed.messages) ? typed.messages : undefined;
+  return { type: typed.type, toolName, message: typed.message, messages };
+}
+
+/**
+ * Build the argv for the child advisor pi process. The prompt is delivered as a
+ * `@path` file reference (never as inline text) so prompt content cannot be
+ * parsed as options or land in the child's argv.
+ */
+export function buildChildPiArgs(opts: {
+  provider: string;
+  modelId: string;
+  effort: AdvisorReasoningEffort;
+  /** Tools the child may use; empty for review mode (child gets --no-tools). */
+  tools: string[];
+  /** Absolute path to the prompt file inside the child's temp agent dir. */
+  promptPath: string;
+}): string[] {
+  const args = [
+    "--provider",
+    opts.provider,
+    "--model",
+    opts.modelId,
+    "--mode",
+    "json",
+    "--print",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-approve",
+  ];
+  const thinking = effortToThinkingLevel(opts.effort);
+  if (thinking) args.push("--thinking", thinking);
+  args.push(
+    opts.tools.length > 0 ? "--tools" : "--no-tools",
+    ...(opts.tools.length > 0 ? [opts.tools.join(",")] : []),
+  );
+  args.push("--", `@${opts.promptPath}`);
+  return args;
+}
+
+/** Map an advisor effort to the child's --thinking level ("none" means: omit the flag). */
+export function effortToThinkingLevel(effort: AdvisorReasoningEffort): string | undefined {
+  return effort === "none" ? undefined : effort;
 }
 
 /** Render a terminal result's text: optional prefix + advice-capped body + status footer. */

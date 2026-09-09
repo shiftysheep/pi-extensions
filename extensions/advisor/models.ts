@@ -3,6 +3,7 @@
  * the interactive picker, and target formatting.
  */
 
+import { setTimeout as delay } from "node:timers/promises";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -60,6 +61,50 @@ export function formatTarget(target: AdvisorTarget | undefined): string {
   if (!target) return "(unset)";
   const suffix = target.effort ? `@${target.effort}` : "";
   return `${target.provider ?? "*"}/${target.model}${suffix}`;
+}
+/**
+ * Best-effort pre-refresh of a near-expiry OAuth credential in the host's
+ * canonical credential store, so a spawned child (which copies auth.json into a
+ * throwaway agent dir) inherits an already-fresh access token.
+ *
+ * This is the freshness half of the child credential protection. The child
+ * transport strips the OAuth refresh token from its auth.json copy (see
+ * `stripRefreshTokens`), so the child can never perform a refresh — which is
+ * what actually protects the host, because a refresh would rotate the token on
+ * the provider's side (invalidating the host's refresh token) before any local
+ * write, which a read-only file copy does not prevent. The pre-refresh's job is
+ * to keep the copied access token *fresh* so the child uses it directly and
+ * never needs to refresh: pi only refreshes a token within its ~5-minute
+ * near-expiry window, and with the refresh token stripped, a token that expires
+ * mid-run just degrades to an auth error (handled by the fallback chain) instead
+ * of rotating the host credential.
+ *
+ * `ctx.modelRegistry.getProviderAuth` resolves the provider's auth through pi —
+ * which refreshes a near-expiry token and persists the rotated credential into
+ * the host's real auth.json — so the child copies the fresh access token.
+ *
+ * Best-effort: never throws. A refresh failure (or a hung refresh that the cap
+ * times out) just means the child may report its own auth error and the fallback
+ * chain handles it; we must not block a consultation because a proactive
+ * refresh could not complete. API-key providers (no OAuth) are a fast no-op.
+ */
+export async function preRefreshProviderAuth(
+  ctx: ExtensionContext,
+  providerId: string,
+): Promise<void> {
+  try {
+    const provider = ctx.modelRegistry.getProvider(providerId);
+    if (!provider?.auth?.oauth) return; // API-key / env provider: nothing to refresh.
+    // Cap the wait: a refresh is a short network call, but a hung refresh must
+    // not stall the consultation past its own deadline budget.
+    await Promise.race([
+      ctx.modelRegistry.getProviderAuth(providerId),
+      new Promise((resolve) => delay(15_000).then(() => resolve("timeout"))),
+    ]);
+  } catch {
+    // Intentionally swallowed: the child will surface a real auth error if the
+    // token is actually unusable, and the fallback chain already handles that.
+  }
 }
 export async function pickModel(
   ctx: ExtensionContext,

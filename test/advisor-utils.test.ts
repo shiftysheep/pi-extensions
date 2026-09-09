@@ -4,32 +4,44 @@
  */
 
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { preRefreshProviderAuth } from "../extensions/advisor/models.js";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
   AdvisorEventAccumulator,
   addUsage,
+  assembleChildPrompt,
   assembleRequestText,
   buildCandidates,
+  buildChildPiArgs,
   capAdviceText,
   capDiagnosticText,
   capTranscriptEntries,
+  childBaseEnv,
   composeAdviceText,
   createConcurrencyLimiter,
+  decideChildOutcome,
+  effortToThinkingLevel,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
   MAX_TRANSCRIPT_ENTRY_CHARS,
+  NdjsonLineBuffer,
   parseConfig,
+  parseNdjsonLine,
   parseTarget,
   REASONING_EFFORTS,
   redactSensitiveText,
   remainingBudgetMs,
   requestCharBudget,
   resolveConsultTimeoutMs,
+  resolvePiBinary,
   splitEffortSuffix,
+  splitNdjsonLines,
+  stripRefreshTokens,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
   timeoutPrefix,
@@ -497,6 +509,7 @@ describe("parseConfig", () => {
         reasoningEffort: "high",
         activeModelFallback: true,
         timeoutMs: 120_000,
+        piBinary: undefined,
       },
     );
   });
@@ -507,6 +520,18 @@ describe("parseConfig", () => {
     assert.equal(config.fallback, undefined);
     assert.equal(config.reasoningEffort, undefined);
     assert.equal(config.activeModelFallback, undefined);
+  });
+
+  it("passes through piBinary and rejects invalid values", () => {
+    assert.equal(parseConfig({ piBinary: "/opt/pi" }, CONFIG_PATH).piBinary, "/opt/pi");
+    assert.throws(
+      () => parseConfig({ piBinary: "  " }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: piBinary must be a non-empty string path to the pi binary.`),
+    );
+    assert.throws(
+      () => parseConfig({ piBinary: 42 }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: piBinary must be a non-empty string path to the pi binary.`),
+    );
   });
 
   it("rejects a non-boolean activeModelFallback", () => {
@@ -537,7 +562,7 @@ describe("parseConfig", () => {
   it("rejects the removed exploreBudget key as an unknown key", () => {
     assert.throws(
       () => parseConfig({ exploreBudget: { toolCalls: 5 } }, CONFIG_PATH),
-      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs\)/,
+      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs, piBinary\)/,
     );
   });
 
@@ -674,6 +699,56 @@ describe("remainingBudgetMs", () => {
   });
 });
 
+describe("preRefreshProviderAuth", () => {
+  // Minimal fake: only the modelRegistry surface the helper touches.
+  function fakeCtx(provider: { auth?: { oauth?: unknown; apiKey?: unknown } } | undefined): {
+    ctx: ExtensionContext;
+    count: () => number;
+  } {
+    let n = 0;
+    const ctx = {
+      modelRegistry: {
+        getProvider: () => provider,
+        getProviderAuth: async () => {
+          n += 1;
+          return { auth: { headers: {} }, source: "OAuth" };
+        },
+      },
+    } as unknown as ExtensionContext;
+    return { ctx, count: () => n };
+  }
+
+  it("is a no-op for providers without OAuth (api-key / env)", async () => {
+    const { ctx, count } = fakeCtx({ auth: { apiKey: { resolve: async () => "" } } });
+    await preRefreshProviderAuth(ctx, "anthropic");
+    assert.equal(count(), 0);
+  });
+
+  it("is a no-op when the provider is unknown", async () => {
+    const { ctx, count } = fakeCtx(undefined);
+    await preRefreshProviderAuth(ctx, "nope");
+    assert.equal(count(), 0);
+  });
+
+  it("refreshes through the canonical store for OAuth providers", async () => {
+    const { ctx, count } = fakeCtx({ auth: { oauth: { refresh: async () => ({}) } } });
+    await preRefreshProviderAuth(ctx, "openai-codex");
+    assert.equal(count(), 1);
+  });
+
+  it("swallows a refresh failure (the child reports its own auth error)", async () => {
+    const ctx = {
+      modelRegistry: {
+        getProvider: () => ({ auth: { oauth: { refresh: async () => ({}) } } }),
+        getProviderAuth: async () => {
+          throw new Error("refresh exploded");
+        },
+      },
+    } as unknown as ExtensionContext;
+    await preRefreshProviderAuth(ctx, "openai-codex"); // must not throw
+    assert.equal(true, true);
+  });
+});
 function abortedSignal(): AbortSignal {
   const controller = new AbortController();
   controller.abort();
@@ -840,6 +915,41 @@ describe("AdvisorEventAccumulator", () => {
     assert.equal(acc.usage?.output, 3);
   });
 
+  it("captures the last assistant error message from message_end events", () => {
+    const acc = new AdvisorEventAccumulator();
+    assert.equal(acc.lastError, undefined);
+    assert.equal(acc.assistantResponse, false);
+    acc.record({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Codex error: The 'nope' model is not supported.",
+      },
+    });
+    assert.equal(acc.lastError, "Codex error: The 'nope' model is not supported.");
+    assert.equal(acc.stopReason, "error");
+    assert.equal(acc.assistantResponse, true);
+    // A successful retry clears the error history, so a transient error
+    // followed by success is not mislabeled as an error after the answer.
+    acc.record({ type: "message_end", message: assistantMsg("recovered", mkUsage(1, 1)) });
+    assert.equal(acc.lastError, undefined);
+    // assistantMsg has no stopReason, so the last observed one stands.
+    assert.equal(acc.stopReason, "error");
+  });
+
+  it("records a fallback error message when stopReason is error without errorMessage", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "error" },
+    });
+    assert.equal(acc.lastError, "the model request failed");
+    assert.equal(acc.stopReason, "error");
+    assert.equal(acc.assistantResponse, true);
+  });
+
   it("aggregates usage per assistant message_end, never from agent_end", () => {
     const acc = new AdvisorEventAccumulator();
     acc.record({ type: "turn_start" });
@@ -881,6 +991,312 @@ describe("composeAdviceText", () => {
 
   it("renders completed results without a prefix", () => {
     assert.equal(composeAdviceText("", "advice", "FOOTER"), "adviceFOOTER");
+  });
+});
+
+describe("buildChildPiArgs", () => {
+  it("builds explore-mode args with tools, thinking, and an @path prompt", () => {
+    const args = buildChildPiArgs({
+      provider: "openai-codex",
+      modelId: "gpt-6-astra",
+      effort: "high",
+      tools: ["read", "grep", "find", "ls"],
+      promptPath: "/tmp/pi-advisor-x/prompt.txt",
+    });
+    assert.equal(args[args.indexOf("--provider") + 1], "openai-codex");
+    assert.equal(args[args.indexOf("--model") + 1], "gpt-6-astra");
+    assert.ok(args.includes("--thinking"));
+    assert.ok(args[args.indexOf("--thinking") + 1] === "high");
+    assert.ok(args.includes("--mode"));
+    assert.ok(args.includes("--no-extensions"));
+    assert.ok(args.includes("--no-approve"));
+    assert.ok(args.includes("--tools"));
+    assert.ok(args[args.indexOf("--tools") + 1] === "read,grep,find,ls");
+    assert.ok(!args.includes("--no-tools"));
+    assert.ok(args[args.length - 2] === "--");
+    assert.ok(args[args.length - 1] === "@/tmp/pi-advisor-x/prompt.txt");
+  });
+
+  it("builds review-mode args with --no-tools and no thinking flag for none", () => {
+    const args = buildChildPiArgs({
+      provider: "anthropic",
+      modelId: "claude-x",
+      effort: "none",
+      tools: [],
+      promptPath: "/tmp/p.txt",
+    });
+    assert.ok(args.includes("--no-tools"));
+    assert.ok(!args.includes("--tools"));
+    assert.ok(!args.includes("--thinking"));
+  });
+});
+
+describe("resolvePiBinary", () => {
+  it("prefers config, then env, then the default pi", () => {
+    assert.equal(resolvePiBinary({ piBinary: "/opt/pi" }, { PI_BINARY: "/env/pi" }), "/opt/pi");
+    assert.equal(resolvePiBinary(undefined, { PI_BINARY: "/env/pi" }), "/env/pi");
+    assert.equal(resolvePiBinary({}, {}), "pi");
+    assert.equal(resolvePiBinary({ piBinary: "  " }, {}), "pi");
+  });
+});
+
+describe("stripRefreshTokens", () => {
+  it("removes each provider's refresh token and preserves the other fields", () => {
+    const input = JSON.stringify({
+      "openai-codex": {
+        type: "oauth",
+        access: "at.123",
+        refresh: "rt.456",
+        expires: 1234567890,
+        accountId: "acc",
+      },
+      anthropic: { type: "oauth", access: "at.789", refresh: "rt.012" },
+    });
+    const out = JSON.parse(stripRefreshTokens(input)) as Record<string, Record<string, unknown>>;
+    assert.equal(out["openai-codex"].refresh, undefined);
+    assert.equal(out["openai-codex"].access, "at.123");
+    assert.equal(out["openai-codex"].expires, 1234567890);
+    assert.equal(out["openai-codex"].accountId, "acc");
+    assert.equal(out["openai-codex"].type, "oauth");
+    assert.equal(out.anthropic.refresh, undefined);
+    assert.equal(out.anthropic.access, "at.789");
+    // The input document is not mutated: it still carries the refresh token.
+    const inputAgain = JSON.parse(input) as Record<string, Record<string, unknown>>;
+    assert.equal(inputAgain["openai-codex"].refresh, "rt.456");
+  });
+
+  it("leaves credentials without a refresh field untouched", () => {
+    const input = JSON.stringify({ openai: { type: "api_key", key: "sk-abc" } });
+    const out = JSON.parse(stripRefreshTokens(input)) as Record<string, Record<string, unknown>>;
+    assert.equal(out.openai.key, "sk-abc");
+    assert.equal(out.openai.type, "api_key");
+  });
+
+  it("returns non-object / malformed input unchanged", () => {
+    assert.equal(stripRefreshTokens("not json"), "not json");
+    assert.equal(stripRefreshTokens("[1,2,3]"), "[1,2,3]");
+    assert.equal(stripRefreshTokens(`"just a string"`), `"just a string"`);
+  });
+});
+
+describe("effortToThinkingLevel", () => {
+  it("maps every effort except none to itself", () => {
+    assert.equal(effortToThinkingLevel("none"), undefined);
+    assert.equal(effortToThinkingLevel("high"), "high");
+    assert.equal(effortToThinkingLevel("max"), "max");
+  });
+});
+
+describe("childBaseEnv", () => {
+  const saved = { PATH: process.env.PATH, SECRET: process.env.ADVISOR_TEST_SECRET };
+  after(() => {
+    if (saved.PATH === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.PATH;
+    if (saved.SECRET === undefined) delete process.env.ADVISOR_TEST_SECRET;
+    else process.env.ADVISOR_TEST_SECRET = saved.SECRET;
+  });
+  it("carries the allowlisted variables and nothing else", () => {
+    process.env.ADVISOR_TEST_SECRET = "must-not-leak";
+    const env = childBaseEnv();
+    assert.ok(env.PATH !== undefined);
+    assert.ok(!("ADVISOR_TEST_SECRET" in env));
+    assert.ok(!("AWS_SECRET_ACCESS_KEY" in env));
+  });
+});
+
+describe("assembleChildPrompt", () => {
+  it("joins the system prompt and the request text with a separator", () => {
+    assert.equal(assembleChildPrompt("SYS", "REQ"), "SYS\n\n---\n\nREQ");
+  });
+});
+
+describe("decideChildOutcome", () => {
+  // The caller handles timeout and abort before this is reached, so they are
+  // not part of the state here.
+  const base = {
+    exitCode: 0,
+    signalCode: null,
+    assistantResponse: true,
+    stopReason: "stop",
+    lastError: undefined,
+    text: "advice",
+    stderr: "",
+  };
+
+  it("completes a clean run", () => {
+    assert.deepEqual(decideChildOutcome(base), { text: "advice", status: "completed" });
+  });
+
+  it("throws when the child was killed by an external signal", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, signalCode: "SIGKILL" }),
+      /killed by signal SIGKILL/,
+    );
+  });
+
+  it("throws on exit-0 with no assistant response, using stderr as the detail", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          assistantResponse: false,
+          text: "",
+          stderr: "no auth configured",
+        }),
+      /no auth configured/,
+    );
+  });
+
+  it("throws on exit-0 with no assistant response and no stderr", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, assistantResponse: false, text: "" }),
+      /returned no assistant response/,
+    );
+  });
+
+  it("throws on an error stop reason with no text", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          text: "",
+          stopReason: "error",
+          lastError: "Codex error: boom",
+        }),
+      /Codex error: boom/,
+    );
+  });
+
+  it("throws on an error stop reason even when text was produced", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          stopReason: "error",
+          lastError: "rate limited",
+        }),
+      /rate limited/,
+    );
+  });
+
+  it("throws on an aborted stop reason", () => {
+    assert.throws(() => decideChildOutcome({ ...base, stopReason: "aborted" }), /aborted/);
+  });
+
+  it("throws on a token-truncated (length) stop reason, even with nonempty text", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "length", text: "partial advi" }),
+      /stopReason "length"/,
+    );
+  });
+
+  it("throws on a deferred stop reason (unresolved answer)", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "deferred" }),
+      /stopReason "deferred"/,
+    );
+  });
+
+  it("throws when no stop reason is recorded (a real finished turn always has one)", () => {
+    const { stopReason: _omitted, ...noStop } = base;
+    assert.throws(() => decideChildOutcome(noStop), /ended without a stop reason/);
+  });
+
+  it("throws on a toolUse stop reason (cut off for a tool call, not a final answer)", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "toolUse" }),
+      /stopReason "toolUse"/,
+    );
+  });
+
+  it("throws on a nonzero exit code, even after a successful-looking turn", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, exitCode: 3 }),
+      /exited abnormally \(exit 3\)/,
+    );
+  });
+
+  it("throws on a nonzero exit code with stderr detail", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, exitCode: 3, stderr: "segfault" }),
+      /segfault/,
+    );
+  });
+
+  it("throws when the run produced no text despite a successful stop", () => {
+    assert.throws(() => decideChildOutcome({ ...base, text: "" }), /returned no text/);
+  });
+});
+
+describe("NdjsonLineBuffer", () => {
+  it("emits each newline-terminated line as it completes", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from("a\nb"), (l) => seen.push(l));
+    buf.write(Buffer.from("\nc\n"), (l) => seen.push(l));
+    assert.deepEqual(seen, ["a", "b", "c"]);
+  });
+
+  it("flushes a final line that has no trailing newline", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from('{"type":"x"}'), (l) => seen.push(l)); // no newline
+    assert.equal(seen.length, 0);
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ['{"type":"x"}']);
+  });
+
+  it("does not emit an empty final fragment on end()", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from("a\n"), (l) => seen.push(l));
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ["a"]);
+  });
+
+  it("keeps multibyte characters split across chunks intact", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    const full = Buffer.from("x\u{1F4A9}\n");
+    // Split inside the 4-byte emoji.
+    buf.write(full.subarray(0, 3), (l) => seen.push(l));
+    buf.write(full.subarray(3), (l) => seen.push(l));
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ["x\u{1F4A9}"]);
+  });
+});
+
+describe("splitNdjsonLines", () => {
+  it("splits on newlines and keeps the trailing partial line as rest", () => {
+    assert.deepEqual(splitNdjsonLines("a\nb\nc"), { lines: ["a", "b"], rest: "c" });
+    assert.deepEqual(splitNdjsonLines("a\n"), { lines: ["a"], rest: "" });
+    assert.deepEqual(splitNdjsonLines(""), { lines: [], rest: "" });
+  });
+});
+
+describe("parseNdjsonLine", () => {
+  it("accepts a well-formed event and drops malformed shapes", () => {
+    const parsed = parseNdjsonLine('{"type":"tool_execution_start","toolName":"grep"}');
+    assert.equal(parsed?.type, "tool_execution_start");
+    assert.equal(parsed?.toolName, "grep");
+    assert.equal(parsed?.message, undefined);
+    assert.equal(parseNdjsonLine(""), undefined);
+    assert.equal(parseNdjsonLine("   "), undefined);
+    assert.equal(parseNdjsonLine("not json"), undefined);
+    assert.equal(parseNdjsonLine("null"), undefined);
+    assert.equal(parseNdjsonLine("42"), undefined);
+    assert.equal(parseNdjsonLine("[1,2]"), undefined);
+    assert.equal(parseNdjsonLine('{"noType":true}'), undefined);
+  });
+
+  it("coerces optional fields to their accepted shapes", () => {
+    const parsed = parseNdjsonLine(
+      '{"type":"message_end","toolName":7,"messages":"nope","message":{"role":"assistant"}}',
+    );
+    assert.equal(parsed?.type, "message_end");
+    assert.equal(parsed?.toolName, undefined);
+    assert.equal(parsed?.messages, undefined);
+    assert.deepEqual(parsed?.message, { role: "assistant" });
   });
 });
 
