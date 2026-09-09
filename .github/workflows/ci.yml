@@ -15,3 +15,38 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm run check
+
+  # On merge to main: bump the version from the merged commits (feat -> minor,
+  # fix/chore -> patch, breaking -> major) and push the release commit + tag.
+  # cz infers the increment from conventional commits since the last tag; the
+  # bump_message/tag_format come from .cz.toml.
+  release:
+    needs: check
+    # Skip the release commit this job itself pushes (actor guard breaks the loop).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+    # Serialize releases so back-to-back merges don't race on the tag.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so cz can find the last release tag.
+          fetch-depth: 0
+      # commitizen's npm version provider shells out to `npm version`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: astral-sh/setup-uv@v10
+      - name: Bump version and tag
+        run: |
+          # A concurrent release may have landed first (see concurrency group);
+          # move to the tip of main before bumping.
+          git pull --ff-only origin main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          uv run --with 'commitizen==4.18.*' cz bump --yes
+          git push origin HEAD:main --follow-tags
