@@ -339,9 +339,30 @@ export function requestCharBudget(model: BudgetModel, promptChars: number): numb
 }
 
 /**
+ * Cap applied to EACH transcript entry before the transcript is joined, so
+ * one large tool result cannot evict the rest of the caller-supplied context.
+ */
+export const MAX_TRANSCRIPT_ENTRY_CHARS = 8_000;
+/** Marker used when a single transcript entry is capped. */
+export const TRANSCRIPT_ENTRY_CAP_MARKER = "\n[entry truncated]";
+
+/** Cap every entry of a caller-supplied transcript before joining. */
+export function capTranscriptEntries(entries: string[]): string[] {
+  return entries.map((entry) =>
+    keepStart(entry, MAX_TRANSCRIPT_ENTRY_CHARS, TRANSCRIPT_ENTRY_CAP_MARKER),
+  );
+}
+
+/** Floor for the caller-supplied transcript section: below this it is dropped rather than squeezed. */
+export const MIN_TRANSCRIPT_CHARS = 8_000;
+
+/**
  * Assemble the advisor request, shrinking to fit the model's budget. The
- * transcript is trimmed first (it is the least load-bearing part); the
- * question is only truncated once the transcript is already at its floor.
+ * request always starts with the question. When the caller explicitly
+ * supplied a transcript, it is appended under an "optional context" header
+ * and trimmed first on overflow (it is the least load-bearing part) — but
+ * only down to a floor, so the question is only truncated once the
+ * transcript cannot absorb the overflow any further.
  */
 export function assembleRequestText(
   model: BudgetModel,
@@ -351,16 +372,17 @@ export function assembleRequestText(
 ): string {
   const marker = "\n[Omitted to fit the advisor model's context window.]";
   let question = keepStart(questionInput, MAX_QUESTION_CHARS, marker);
+  const hasTranscript = Boolean(transcriptInput);
   let transcript = transcriptInput || "(empty)";
   const render = () =>
-    `## Question\n${question}\n\n## Recent session history (redacted; may be truncated)\nYou can also inspect the workspace yourself with read/grep/find/ls.\n${transcript}`;
+    `## Question\n${question}${hasTranscript ? `\n\n## Optional context supplied by the caller (redacted, may be truncated; verify against the workspace)\n${transcript}` : ""}`;
   const budget = requestCharBudget(model, promptChars);
 
   let overflow = render().length - budget;
-  if (overflow > 0) {
+  if (overflow > 0 && hasTranscript) {
     transcript = keepEnd(
       transcript,
-      Math.max(0, transcript.length - overflow),
+      Math.max(MIN_TRANSCRIPT_CHARS, transcript.length - overflow),
       "[Earlier session context omitted.]\n\n",
     );
     overflow = render().length - budget;

@@ -14,10 +14,13 @@ import {
   buildCandidates,
   capAdviceText,
   capDiagnosticText,
+  capTranscriptEntries,
   createConcurrencyLimiter,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
+  MAX_TRANSCRIPT_ENTRY_CHARS,
+  MIN_TRANSCRIPT_CHARS,
   parseConfig,
   parseExploreBudget,
   parseTarget,
@@ -27,6 +30,7 @@ import {
   requestCharBudget,
   resolveConsultTimeoutMs,
   splitEffortSuffix,
+  TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
   withSlot,
 } from "../extensions/lib/advisor-utils.js";
@@ -152,14 +156,43 @@ describe("requestCharBudget", () => {
   });
 });
 
+describe("capTranscriptEntries", () => {
+  it("caps each entry individually before joining", () => {
+    const big = "x".repeat(MAX_TRANSCRIPT_ENTRY_CHARS + 100);
+    const out = capTranscriptEntries(["small", big, "y".repeat(MAX_TRANSCRIPT_ENTRY_CHARS + 1)]);
+    assert.equal(out[0], "small");
+    assert.equal(out[1].length, MAX_TRANSCRIPT_ENTRY_CHARS);
+    assert.ok(out[1].startsWith("xxx"), "entry keeps its head");
+    assert.ok(out[1].endsWith(TRANSCRIPT_ENTRY_CAP_MARKER));
+    assert.equal(out[2].endsWith(TRANSCRIPT_ENTRY_CAP_MARKER), true);
+  });
+
+  it("leaves short entries untouched", () => {
+    assert.deepEqual(capTranscriptEntries(["a", "b c"]) as string[], ["a", "b c"]);
+  });
+});
+
 describe("assembleRequestText", () => {
   const smallModel = { contextWindow: 4_000, maxTokens: 800 };
   const promptChars = 0;
 
-  it("includes the question and transcript verbatim when they fit", () => {
+  it("includes the question and transcript under the optional-context header when they fit", () => {
     const out = assembleRequestText(smallModel, "the question", "the transcript", promptChars);
     assert.ok(out.startsWith("## Question\nthe question"));
+    assert.ok(
+      out.includes(
+        "## Optional context supplied by the caller (redacted, may be truncated; verify against the workspace)",
+      ),
+    );
     assert.ok(out.includes("the transcript"));
+    assert.doesNotMatch(out, /Omitted/);
+  });
+
+  it("sends only the question when no transcript was supplied", () => {
+    const out = assembleRequestText(smallModel, "the question", "", promptChars);
+    assert.ok(out.startsWith("## Question\nthe question"));
+    assert.doesNotMatch(out, /session history/);
+    assert.doesNotMatch(out, /Optional context/);
     assert.doesNotMatch(out, /Omitted/);
   });
 
@@ -174,7 +207,19 @@ describe("assembleRequestText", () => {
     assert.ok(out.includes("ttt"), "tail of the transcript is kept");
   });
 
-  it("truncates the question only when the transcript cannot absorb the overflow", () => {
+  it("truncates the question only when the transcript is at its floor", () => {
+    const question = "Q".repeat(30_000);
+    const transcript = "t".repeat(12_000);
+    const out = assembleRequestText(smallModel, question, transcript, promptChars);
+    const budget = requestCharBudget(smallModel, promptChars);
+    assert.ok(out.length <= budget);
+    assert.ok(out.includes("\nQQQ"), "question keeps its head");
+    assert.ok(out.includes("[Omitted to fit the advisor model's context window.]"));
+    // The transcript was squeezed to its floor, not to zero: some tail survives.
+    assert.ok(out.includes("ttt"), "transcript floor keeps a tail");
+  });
+
+  it("truncates the question alone when there is no transcript", () => {
     const question = "Q".repeat(30_000);
     const out = assembleRequestText(smallModel, question, "", promptChars);
     const budget = requestCharBudget(smallModel, promptChars);
