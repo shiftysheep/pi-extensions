@@ -54,7 +54,7 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 
 `activeModelFallback` (optional, default `false`) opts into retrying the session's *active* model as a last resort — a self-review, and the result says so.
 
-`timeoutMs` (optional) sets the consultation timeout in milliseconds, clamped to 30 s–30 min; the per-call `timeoutMs` tool parameter overrides it, and the defaults are 5 min for `review` / 10 min for `explore`.
+`timeoutMs` (optional) sets the consultation timeout in milliseconds, clamped to 30 s–30 min; it covers the whole consultation, fallback chain included (later attempts only get the time left). The per-call `timeoutMs` tool parameter overrides it, and the defaults are 5 min for `review` / 10 min for `explore`.
 
 The file is **strictly validated**: unknown keys (top level, in a model slot, or in `exploreBudget`) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
@@ -96,6 +96,8 @@ Models are managed with `/advisor`:
 /advisor effort <level>               set the shared default reasoning effort (none..max)
 /advisor clear [slot]                 remove a slot, the default effort ("effort"), or both
 /advisor reset                        back up advisor.json to advisor.json.bak and start clean
+
+`/advisor reset` — and any `/advisor set|primary|fallback` run that repairs a broken file — backs the previous file up to `advisor.json.bak` first (only the latest backup is retained).
 ```
 
 Reasoning effort is layered: a tool-call `effort` override wins, then the model-specific
