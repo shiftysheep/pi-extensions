@@ -224,17 +224,11 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   ) {
     throw new Error(`${configPath}: piBinary must be a non-empty string path to the pi binary.`);
   }
-  if (
-    config.awsProfile !== undefined &&
-    (typeof config.awsProfile !== "string" || !config.awsProfile.trim())
-  ) {
-    throw new Error(`${configPath}: awsProfile must be a non-empty string.`);
+  if (config.awsProfile !== undefined && !isAwsFieldValue(config.awsProfile)) {
+    throw new Error(`${configPath}: awsProfile must be a non-empty string without NUL bytes.`);
   }
-  if (
-    config.awsRegion !== undefined &&
-    (typeof config.awsRegion !== "string" || !config.awsRegion.trim())
-  ) {
-    throw new Error(`${configPath}: awsRegion must be a non-empty string.`);
+  if (config.awsRegion !== undefined && !isAwsFieldValue(config.awsRegion)) {
+    throw new Error(`${configPath}: awsRegion must be a non-empty string without NUL bytes.`);
   }
   if (config.env !== undefined && !isChildEnv(config.env)) {
     throw new Error(
@@ -668,17 +662,46 @@ export function buildChildEnv(
     out.AWS_DEFAULT_REGION = config.awsRegion;
   }
   if (config.env) {
-    for (const [key, value] of Object.entries(config.env)) out[key] = value;
+    for (const [key, value] of Object.entries(config.env)) {
+      // Object.defineProperty (not out[key] = value) so a user-supplied key like
+      // "__proto__" becomes an own data property (verbatim forwarding) instead of
+      // invoking the inherited prototype setter and silently dropping the entry.
+      Object.defineProperty(out, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
   }
   return out;
 }
 
-/** True when a config `env` value is an object mapping names to non-empty string values. */
+/**
+ * True when a config `env` value is an object mapping valid names to valid
+ * string values. Names must be non-empty and contain no '=' (ambiguous on POSIX
+ * name=value pairs) or NUL; values must be non-empty and NUL-free (a NUL makes
+ * Node's spawn throw EILSEQ/EINVAL). All string, so no prototype pollution.
+ */
 export function isChildEnv(value: unknown): value is Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.values(value as Record<string, unknown>).every(
-    (v) => typeof v === "string" && v.length > 0,
+  return Object.entries(value as Record<string, unknown>).every(
+    ([name, v]) =>
+      name.length > 0 &&
+      !name.includes("=") &&
+      !name.includes("\u0000") &&
+      typeof v === "string" &&
+      v.length > 0 &&
+      !v.includes("\u0000"),
   );
+}
+
+/**
+ * A single AWS field value (profile/region): a string that is not whitespace-only
+ * and NUL-free (a NUL would make Node's spawn throw; whitespace-only is meaningless).
+ */
+export function isAwsFieldValue(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && !value.includes("\u0000");
 }
 
 /**
