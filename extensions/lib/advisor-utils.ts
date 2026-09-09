@@ -34,7 +34,46 @@ export type AdvisorConfig = {
   exploreBudget?: AdvisorExploreBudget;
   /** Opt in to retrying the caller's active model last (a self-review, disclosed in the result). */
   activeModelFallback?: boolean;
+  /** Consultation timeout in milliseconds, clamped to [ADVISOR_MIN_TIMEOUT_MS, ADVISOR_MAX_TIMEOUT_MS]. */
+  timeoutMs?: number;
 };
+
+/** Allowed top-level advisor.json keys; anything else is a typo and is rejected. */
+export const ALLOWED_CONFIG_KEYS = [
+  "primary",
+  "fallback",
+  "reasoningEffort",
+  "exploreBudget",
+  "activeModelFallback",
+  "timeoutMs",
+] as const;
+
+export const TARGET_KEYS = ["provider", "model", "effort"] as const;
+
+/** Floor and ceiling for consultation timeouts (per-call and config are clamped to this range). */
+export const ADVISOR_MIN_TIMEOUT_MS = 30_000;
+export const ADVISOR_MAX_TIMEOUT_MS = 30 * 60_000;
+/** Default timeout when none is configured: review is one model call, explore is a whole agent session. */
+export const ADVISOR_DEFAULT_REVIEW_TIMEOUT_MS = 5 * 60_000;
+export const ADVISOR_DEFAULT_EXPLORE_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Resolve the effective consultation timeout: per-call override > config >
+ * mode default, clamped to [ADVISOR_MIN_TIMEOUT_MS, ADVISOR_MAX_TIMEOUT_MS].
+ */
+export function resolveConsultTimeoutMs(opts: {
+  perCall?: number;
+  config?: number;
+  mode: "review" | "explore";
+}): number {
+  const requested =
+    opts.perCall ??
+    opts.config ??
+    (opts.mode === "explore"
+      ? ADVISOR_DEFAULT_EXPLORE_TIMEOUT_MS
+      : ADVISOR_DEFAULT_REVIEW_TIMEOUT_MS);
+  return Math.min(ADVISOR_MAX_TIMEOUT_MS, Math.max(ADVISOR_MIN_TIMEOUT_MS, Math.round(requested)));
+}
 export type AdvisorCandidate = { target: AdvisorTarget; source: string };
 
 /** Minimal model shape needed for prompt budgeting (pi's Model satisfies it). */
@@ -103,6 +142,14 @@ export function parseTarget(
   if (!value || typeof value !== "object")
     throw new Error(`${configPath}: ${field} must be an object.`);
   const candidate = value as { provider?: unknown; model?: unknown; effort?: unknown };
+  const unknownTargetKeys = Object.keys(candidate).filter(
+    (k) => !(TARGET_KEYS as readonly string[]).includes(k),
+  );
+  if (unknownTargetKeys.length > 0) {
+    throw new Error(
+      `${configPath}: ${field} has unknown key${unknownTargetKeys.length > 1 ? "s" : ""} ${unknownTargetKeys.map((k) => `"${k}"`).join(", ")} (allowed: ${TARGET_KEYS.join(", ")}).`,
+    );
+  }
   if (typeof candidate.model !== "string" || !candidate.model.trim()) {
     throw new Error(`${configPath}: ${field}.model must be a non-empty string.`);
   }
@@ -137,6 +184,14 @@ export function parseExploreBudget(
   if (!value || typeof value !== "object")
     throw new Error(`${configPath}: exploreBudget must be an object with toolCalls/modelRequests.`);
   const candidate = value as { toolCalls?: unknown; modelRequests?: unknown };
+  const unknownBudgetKeys = Object.keys(candidate).filter(
+    (k) => k !== "toolCalls" && k !== "modelRequests",
+  );
+  if (unknownBudgetKeys.length > 0) {
+    throw new Error(
+      `${configPath}: exploreBudget has unknown key${unknownBudgetKeys.length > 1 ? "s" : ""} ${unknownBudgetKeys.map((k) => `"${k}"`).join(", ")} (allowed: toolCalls, modelRequests).`,
+    );
+  }
   if (candidate.toolCalls === undefined && candidate.modelRequests === undefined) {
     throw new Error(
       `${configPath}: exploreBudget requires at least one of toolCalls/modelRequests.`,
@@ -162,13 +217,17 @@ export function parseExploreBudget(
 export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig {
   if (!parsed || typeof parsed !== "object")
     throw new Error(`${configPath}: top level must be an object.`);
-  const config = parsed as {
-    primary?: unknown;
-    fallback?: unknown;
-    reasoningEffort?: unknown;
-    exploreBudget?: unknown;
-    activeModelFallback?: unknown;
-  };
+  const config = parsed as Record<string, unknown>;
+  // Strict key validation: a typo'd key ("fallBack", "reasoning_effort", ...) used to be
+  // silently ignored, leaving the advisor running on defaults with no warning.
+  const unknownKeys = Object.keys(config).filter(
+    (k) => !(ALLOWED_CONFIG_KEYS as readonly string[]).includes(k),
+  );
+  if (unknownKeys.length > 0) {
+    throw new Error(
+      `${configPath}: unknown key${unknownKeys.length > 1 ? "s" : ""} ${unknownKeys.map((k) => `"${k}"`).join(", ")} (allowed: ${ALLOWED_CONFIG_KEYS.join(", ")}).`,
+    );
+  }
   if (config.reasoningEffort !== undefined && !isReasoningEffort(config.reasoningEffort)) {
     throw new Error(
       `${configPath}: reasoningEffort must be one of: ${REASONING_EFFORTS.join(", ")}.`,
@@ -177,13 +236,34 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   if (config.activeModelFallback !== undefined && typeof config.activeModelFallback !== "boolean") {
     throw new Error(`${configPath}: activeModelFallback must be a boolean.`);
   }
+  if (
+    config.timeoutMs !== undefined &&
+    (typeof config.timeoutMs !== "number" ||
+      !Number.isFinite(config.timeoutMs) ||
+      config.timeoutMs <= 0)
+  ) {
+    throw new Error(`${configPath}: timeoutMs must be a positive number of milliseconds.`);
+  }
+  const primary = parseTarget(config.primary, "primary", configPath);
+  const fallback = parseTarget(config.fallback, "fallback", configPath);
+  if (primary && fallback && sameModel(primary, fallback)) {
+    throw new Error(
+      `${configPath}: primary and fallback are the same model ("${primary.provider ?? "*"}/${primary.model}"), so the fallback would just rerun it; configure a different model or omit one slot.`,
+    );
+  }
   return {
-    primary: parseTarget(config.primary, "primary", configPath),
-    fallback: parseTarget(config.fallback, "fallback", configPath),
+    primary,
+    fallback,
     reasoningEffort: config.reasoningEffort,
     exploreBudget: parseExploreBudget(config.exploreBudget, configPath),
     activeModelFallback: config.activeModelFallback,
+    timeoutMs: config.timeoutMs,
   };
+}
+
+/** True when two targets resolve to the same model (an absent provider matches any provider). */
+function sameModel(a: AdvisorTarget, b: AdvisorTarget): boolean {
+  return a.model === b.model && (!a.provider || !b.provider || a.provider === b.provider);
 }
 
 /** Parse an optional `@effort` suffix from a model spec, e.g. `openai-codex/gpt-6-astra@max`. */

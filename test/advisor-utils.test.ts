@@ -24,6 +24,7 @@ import {
   REASONING_EFFORTS,
   redactSensitiveText,
   requestCharBudget,
+  resolveConsultTimeoutMs,
   splitEffortSuffix,
   textFromContent,
 } from "../extensions/lib/advisor-utils.js";
@@ -431,6 +432,7 @@ describe("parseConfig", () => {
           reasoningEffort: "high",
           exploreBudget: { toolCalls: 5 },
           activeModelFallback: true,
+          timeoutMs: 120_000,
         },
         CONFIG_PATH,
       ),
@@ -441,6 +443,7 @@ describe("parseConfig", () => {
         reasoningEffort: "high",
         exploreBudget: { toolCalls: 5, modelRequests: ADVISOR_MAX_MODEL_REQUESTS },
         activeModelFallback: true,
+        timeoutMs: 120_000,
       },
     );
   });
@@ -459,6 +462,67 @@ describe("parseConfig", () => {
       () => parseConfig({ activeModelFallback: "yes" }, CONFIG_PATH),
       new RegExp(`${CONFIG_PATH}: activeModelFallback must be a boolean.`),
     );
+  });
+
+  it("rejects unknown top-level keys, naming them", () => {
+    assert.throws(
+      () => parseConfig({ fallBack: { model: "m" } }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: unknown key \\"fallBack\\" \\(allowed:`),
+    );
+    assert.throws(
+      () => parseConfig({ reasoning_effort: "high", exploreBudgget: {} }, CONFIG_PATH),
+      /unknown keys "reasoning_effort", "exploreBudgget"/,
+    );
+  });
+
+  it("rejects unknown keys inside a model slot and exploreBudget", () => {
+    assert.throws(
+      () => parseConfig({ primary: { model: "m", providerd: "a" } }, CONFIG_PATH),
+      /primary has unknown key "providerd" \(allowed: provider, model, effort\)/,
+    );
+    assert.throws(
+      () => parseConfig({ exploreBudget: { toolCall: 5 } }, CONFIG_PATH),
+      /exploreBudget has unknown key "toolCall" \(allowed: toolCalls, modelRequests\)/,
+    );
+  });
+
+  it("rejects primary === fallback (same model would just rerun)", () => {
+    assert.throws(
+      () =>
+        parseConfig(
+          {
+            primary: { provider: "a", model: "m" },
+            fallback: { provider: "a", model: "m" },
+          },
+          CONFIG_PATH,
+        ),
+      /primary and fallback are the same model \("a\/m"\)/,
+    );
+    // An absent provider still matches: same model id is the same model.
+    assert.throws(
+      () =>
+        parseConfig(
+          { primary: { model: "m" }, fallback: { provider: "a", model: "m" } },
+          CONFIG_PATH,
+        ),
+      /primary and fallback are the same model/,
+    );
+    // Different providers for the same model id are different models — allowed.
+    assert.doesNotThrow(() =>
+      parseConfig(
+        { primary: { provider: "a", model: "m" }, fallback: { provider: "b", model: "m" } },
+        CONFIG_PATH,
+      ),
+    );
+  });
+
+  it("rejects an invalid timeoutMs", () => {
+    for (const bad of ["fast", -1, 0, NaN, Infinity]) {
+      assert.throws(
+        () => parseConfig({ timeoutMs: bad }, CONFIG_PATH),
+        new RegExp(`${CONFIG_PATH}: timeoutMs must be a positive number of milliseconds.`),
+      );
+    }
   });
 
   it("rejects an invalid global reasoningEffort", () => {
@@ -512,6 +576,27 @@ describe("capAdviceText / capDiagnosticText", () => {
     const capped = capDiagnosticText(text);
     assert.ok(capped.includes("[truncated: 10 more characters omitted]"));
     assert.ok(capped.length < ADVISOR_MAX_ADVICE_CHARS);
+  });
+});
+
+describe("resolveConsultTimeoutMs", () => {
+  it("falls back to the mode default when nothing is set", () => {
+    assert.equal(resolveConsultTimeoutMs({ mode: "review" }), 5 * 60_000);
+    assert.equal(resolveConsultTimeoutMs({ mode: "explore" }), 10 * 60_000);
+  });
+
+  it("prefers per-call over config", () => {
+    assert.equal(
+      resolveConsultTimeoutMs({ perCall: 60_000, config: 300_000, mode: "review" }),
+      60_000,
+    );
+    assert.equal(resolveConsultTimeoutMs({ config: 300_000, mode: "review" }), 300_000);
+  });
+
+  it("clamps to the documented 30 s..30 min range", () => {
+    assert.equal(resolveConsultTimeoutMs({ perCall: 1, mode: "review" }), 30_000);
+    assert.equal(resolveConsultTimeoutMs({ perCall: 10_000_000, mode: "review" }), 30 * 60_000);
+    assert.equal(resolveConsultTimeoutMs({ config: 10, mode: "explore" }), 30_000);
   });
 });
 
