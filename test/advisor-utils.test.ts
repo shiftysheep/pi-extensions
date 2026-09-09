@@ -5,9 +5,12 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
+  AdvisorEventAccumulator,
+  addUsage,
   assembleRequestText,
   buildCandidates,
   capAdviceText,
@@ -28,8 +31,26 @@ import {
   splitEffortSuffix,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
+  timeoutPrefix,
   withSlot,
 } from "../extensions/lib/advisor-utils.js";
+
+function mkUsage(input: number, output: number): Usage {
+  return {
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input, output, cacheRead: 0, cacheWrite: 0, total: input + output },
+  };
+}
+
+const assistantMsg = (text: string, usage?: Usage) => ({
+  role: "assistant",
+  content: [{ type: "text", text }],
+  ...(usage ? { usage } : {}),
+});
 
 const CONFIG_PATH = "/home/user/.pi/agent/advisor.json";
 
@@ -772,5 +793,88 @@ describe("createConcurrencyLimiter", () => {
     );
     // The failed work's finally still released the slot, so this completes.
     await withSlot(async () => {});
+  });
+});
+
+describe("addUsage", () => {
+  it("sums usages and preserves absent optional fields", () => {
+    const sum = addUsage(mkUsage(1, 2), mkUsage(3, 4));
+    assert.equal(sum.input, 4);
+    assert.equal(sum.output, 6);
+    assert.equal(sum.totalTokens, 10);
+    assert.equal(sum.cost.total, 10);
+    assert.equal(sum.reasoning, undefined);
+    const withReasoning = addUsage({ ...mkUsage(1, 2), reasoning: 5 }, mkUsage(3, 4));
+    assert.equal(withReasoning.reasoning, 5);
+  });
+});
+
+describe("AdvisorEventAccumulator", () => {
+  it("keeps earlier findings when the interrupted final assistant turn is empty", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("finding one", mkUsage(1, 1)) });
+    acc.record({ type: "tool_execution_start", toolName: "grep" });
+    acc.record({ type: "turn_start" });
+    // The interrupted final turn: assistant message with no text (thinking/tools only).
+    acc.record({ type: "message_end", message: { role: "assistant", content: [] } });
+    assert.equal(acc.toolCalls, 1);
+    assert.equal(acc.modelRequests, 2);
+    assert.equal(acc.finalText(true), "finding one");
+    // A completed run reports the final answer.
+    assert.equal(acc.finalText(false), "");
+  });
+
+  it("survives a synthetic failure agent_end carrying only an empty message", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("early analysis", mkUsage(2, 3)) });
+    // agent_end after an exception contains only the (empty) failure message —
+    // it must not discard the collected text or usage.
+    acc.record({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [] }],
+    });
+    assert.equal(acc.finalText(true), "early analysis");
+    assert.equal(acc.usage?.output, 3);
+  });
+
+  it("aggregates usage per assistant message_end, never from agent_end", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("a", mkUsage(1, 1)) });
+    acc.record({ type: "message_end", message: assistantMsg("b", mkUsage(2, 2)) });
+    acc.record({
+      type: "agent_end",
+      messages: [assistantMsg("a", mkUsage(1, 1)), assistantMsg("b", mkUsage(2, 2))],
+    });
+    assert.equal(acc.usage?.input, 3);
+    assert.equal(acc.usage?.output, 3);
+  });
+
+  it("completed runs report the last assistant text; duplicates are not repeated", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "message_end", message: assistantMsg("answer") });
+    acc.record({ type: "message_end", message: assistantMsg("answer") });
+    assert.equal(acc.finalText(false), "answer");
+    assert.equal(acc.finalText(true), "answer");
+  });
+});
+
+describe("timeoutPrefix", () => {
+  it("marks explore and review timeouts incomplete, with or without partial output", () => {
+    assert.equal(
+      timeoutPrefix("explore", 60_000, ""),
+      "advisor timed out after 60 seconds (incomplete)",
+    );
+    assert.equal(
+      timeoutPrefix("review", 30_000, ""),
+      "advisor request timed out after 30 seconds (incomplete)",
+    );
+    const withPartial = timeoutPrefix("explore", 90_000, "partial text");
+    assert.ok(withPartial.includes("advisor timed out after 90 seconds (incomplete)"));
+    assert.ok(
+      withPartial.includes("Partial output before the timeout (incomplete, not a verdict):"),
+    );
   });
 });

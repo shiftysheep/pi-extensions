@@ -5,6 +5,8 @@
  * ExtensionContext) so they can be unit-tested without a live session.
  */
 
+import type { Usage } from "@earendil-works/pi-ai";
+
 export const REASONING_EFFORTS = [
   "none",
   "minimal",
@@ -441,4 +443,105 @@ export async function withSlot<T>(
 /** Milliseconds left on a deadline (0 once exhausted); pure so the chain wiring is testable. */
 export function remainingBudgetMs(deadline: number, now: number): number {
   return Math.max(deadline - now, 0);
+}
+
+/** Sum two usage records, preserving optional fields' absence when neither side has them. */
+export function addUsage(total: Usage | undefined, usage: Usage): Usage {
+  if (!total) return structuredClone(usage);
+  const reasoning =
+    total.reasoning !== undefined || usage.reasoning !== undefined
+      ? (total.reasoning ?? 0) + (usage.reasoning ?? 0)
+      : undefined;
+  const cacheWrite1h =
+    total.cacheWrite1h !== undefined || usage.cacheWrite1h !== undefined
+      ? (total.cacheWrite1h ?? 0) + (usage.cacheWrite1h ?? 0)
+      : undefined;
+  return {
+    input: total.input + usage.input,
+    output: total.output + usage.output,
+    cacheRead: total.cacheRead + usage.cacheRead,
+    cacheWrite: total.cacheWrite + usage.cacheWrite,
+    ...(cacheWrite1h === undefined ? {} : { cacheWrite1h }),
+    ...(reasoning === undefined ? {} : { reasoning }),
+    totalTokens: total.totalTokens + usage.totalTokens,
+    cost: {
+      input: total.cost.input + usage.cost.input,
+      output: total.cost.output + usage.cost.output,
+      cacheRead: total.cost.cacheRead + usage.cost.cacheRead,
+      cacheWrite: total.cost.cacheWrite + usage.cost.cacheWrite,
+      total: total.cost.total + usage.cost.total,
+    },
+  };
+}
+
+/**
+ * Accumulate one explore consultation's agent events into its result pieces.
+ *
+ * `agent_end` fires exactly once, at the end of the WHOLE run, and a failed or
+ * interrupted run can end in an empty or synthetic assistant message — so
+ * findings and usage must be collected per `message_end` (one per completed
+ * assistant message), not from the terminal event.
+ */
+export class AdvisorEventAccumulator {
+  toolCalls = 0;
+  modelRequests = 0;
+  private combinedUsage: Usage | undefined;
+  private findings: string[] = [];
+  private lastText = "";
+
+  record(event: {
+    type: string;
+    toolName?: string;
+    message?: unknown;
+    messages?: unknown[];
+  }): void {
+    if (event.type === "turn_start") {
+      this.modelRequests += 1;
+      return;
+    }
+    if (event.type === "tool_execution_start") {
+      this.toolCalls += 1;
+      return;
+    }
+    if (event.type !== "message_end") return;
+    const message = event.message as
+      | { role?: string; content?: unknown; usage?: Usage }
+      | undefined;
+    if (!message || message.role !== "assistant") return;
+    if (message.usage) this.combinedUsage = addUsage(this.combinedUsage, message.usage);
+    const text = textFromContent(message.content).trim();
+    this.lastText = text;
+    if (text) {
+      if (this.findings[this.findings.length - 1] !== text) this.findings.push(text);
+    }
+  }
+
+  /** Final answer for a completed run; earlier findings for an interrupted one. */
+  finalText(interrupted: boolean): string {
+    return interrupted ? this.findings.join("\n\n") : this.lastText;
+  }
+
+  get usage(): Usage | undefined {
+    return this.combinedUsage;
+  }
+}
+
+/**
+ * Prefix for a timed-out consultation's terminal result: the incomplete marker
+ * plus the partial output the caller still produced (advice-cap applied by the
+ * caller, so this stays pure text).
+ */
+export function timeoutPrefix(
+  mode: "review" | "explore",
+  timeoutMs: number,
+  partialText: string,
+): string {
+  const message =
+    mode === "explore"
+      ? `advisor timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`
+      : `advisor request timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`;
+  return (
+    message +
+    (partialText ? "\n\nPartial output before the timeout (incomplete, not a verdict):\n" : "")
+  );
 }

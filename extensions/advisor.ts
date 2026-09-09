@@ -29,8 +29,10 @@ import {
 import { Type } from "typebox";
 import {
   type AdvisorConfig,
+  AdvisorEventAccumulator,
   type AdvisorReasoningEffort,
   type AdvisorTarget,
+  addUsage,
   assembleRequestText,
   buildCandidates,
   capAdviceText,
@@ -46,6 +48,7 @@ import {
   resolveConsultTimeoutMs,
   splitEffortSuffix,
   textFromContent,
+  timeoutPrefix,
   withSlot,
 } from "./lib/advisor-utils.js";
 
@@ -134,34 +137,6 @@ function sessionTranscript(ctx: { sessionManager: { getBranch(): unknown[] } }):
   const redacted = lines.map((line) => redactSensitiveText(line));
   const transcript = redactSensitiveText(capTranscriptEntries(redacted).join("\n\n"));
   return keepEnd(transcript, MAX_SESSION_CONTEXT_CHARS, "[Earlier session context omitted.]\n\n");
-}
-
-function addUsage(total: Usage | undefined, usage: Usage): Usage {
-  if (!total) return structuredClone(usage);
-  const reasoning =
-    total.reasoning !== undefined || usage.reasoning !== undefined
-      ? (total.reasoning ?? 0) + (usage.reasoning ?? 0)
-      : undefined;
-  const cacheWrite1h =
-    total.cacheWrite1h !== undefined || usage.cacheWrite1h !== undefined
-      ? (total.cacheWrite1h ?? 0) + (usage.cacheWrite1h ?? 0)
-      : undefined;
-  return {
-    input: total.input + usage.input,
-    output: total.output + usage.output,
-    cacheRead: total.cacheRead + usage.cacheRead,
-    cacheWrite: total.cacheWrite + usage.cacheWrite,
-    ...(cacheWrite1h === undefined ? {} : { cacheWrite1h }),
-    ...(reasoning === undefined ? {} : { reasoning }),
-    totalTokens: total.totalTokens + usage.totalTokens,
-    cost: {
-      input: total.cost.input + usage.cost.input,
-      output: total.cost.output + usage.cost.output,
-      cacheRead: total.cost.cacheRead + usage.cost.cacheRead,
-      cacheWrite: total.cost.cacheWrite + usage.cost.cacheWrite,
-      total: total.cost.total + usage.cost.total,
-    },
-  };
 }
 
 function loadConfig(): AdvisorConfig {
@@ -431,16 +406,17 @@ async function consultWithStreamSimple(opts: {
         },
       )
       .result();
+    // A review is exactly one model request (0 tool calls by construction).
     if (timedOut)
       return {
         text: "",
         usage: response.usage,
         toolCalls: 0,
-        modelRequests: 0,
+        modelRequests: 1,
         status: "timed_out",
       };
     if (opts.signal?.aborted === true || response.stopReason === "aborted")
-      return { text: "", usage: response.usage, toolCalls: 0, modelRequests: 0, status: "aborted" };
+      return { text: "", usage: response.usage, toolCalls: 0, modelRequests: 1, status: "aborted" };
     if (response.stopReason === "error")
       throw new Error(
         response.errorMessage || "The advisor request failed without an error message.",
@@ -449,7 +425,7 @@ async function consultWithStreamSimple(opts: {
       text: textFromContent(response.content).trim() || "The advisor returned no text.",
       usage: response.usage,
       toolCalls: 0,
-      modelRequests: 0,
+      modelRequests: 1,
       status: "completed",
     };
   } finally {
@@ -502,39 +478,22 @@ async function consultWithAgentSession(opts: {
     sessionManager: SessionManager.inMemory(opts.cwd),
   });
 
-  let toolCalls = 0;
-  let modelRequests = 0;
-  let finalText = "";
-  // Assistant text accumulated across agent_end events: a timed-out exploration
-  // may end in a synthetic failure message, and earlier findings must survive.
-  const producedTexts: string[] = [];
-  let combinedUsage: Usage | undefined;
+  // Per-message accumulation: agent_end fires once at the end of the whole run,
+  // and an interrupted run can end in an empty/synthetic assistant message, so
+  // findings and usage are collected per message_end (one per assistant message).
+  const acc = new AdvisorEventAccumulator();
   const unsubscribe = session.subscribe((event) => {
-    if (event.type === "turn_start") modelRequests += 1;
+    acc.record(event);
     if (event.type === "tool_execution_start") {
-      toolCalls += 1;
       opts.onUpdate?.({
         content: [
           {
             type: "text",
-            text: `${opts.modelLabel} is exploring the workspace (tool call ${toolCalls}: ${event.toolName})...`,
+            text: `${opts.modelLabel} is exploring the workspace (tool call ${acc.toolCalls}: ${event.toolName})...`,
           },
         ],
-        details: { model: opts.modelLabel, toolCalls, toolName: event.toolName },
+        details: { model: opts.modelLabel, toolCalls: acc.toolCalls, toolName: event.toolName },
       });
-    } else if (event.type === "agent_end") {
-      let lastAssistant: { content?: unknown; usage?: Usage } | undefined;
-      for (const message of event.messages) {
-        const anyMessage = message as { role?: string; content?: unknown; usage?: Usage };
-        if (anyMessage.role === "assistant" && anyMessage.usage) {
-          combinedUsage = addUsage(combinedUsage, anyMessage.usage);
-          lastAssistant = anyMessage;
-        }
-      }
-      finalText = lastAssistant ? textFromContent(lastAssistant.content).trim() : "";
-      if (finalText) {
-        if (producedTexts[producedTexts.length - 1] !== finalText) producedTexts.push(finalText);
-      }
     }
   });
 
@@ -568,24 +527,29 @@ async function consultWithAgentSession(opts: {
     session.dispose();
   }
 
-  // On interruption the last message may be empty or synthetic, so fall back
-  // to everything the exploration produced before it stopped.
-  const partialText = finalText || producedTexts.join("\n\n");
+  const interrupted = timedOut || opts.signal?.aborted === true;
+  const text = acc.finalText(interrupted);
   if (timedOut)
     return {
-      text: partialText,
-      usage: combinedUsage,
-      toolCalls,
-      modelRequests,
+      text,
+      usage: acc.usage,
+      toolCalls: acc.toolCalls,
+      modelRequests: acc.modelRequests,
       status: "timed_out",
     };
   if (opts.signal?.aborted === true)
-    return { text: partialText, usage: combinedUsage, toolCalls, modelRequests, status: "aborted" };
+    return {
+      text,
+      usage: acc.usage,
+      toolCalls: acc.toolCalls,
+      modelRequests: acc.modelRequests,
+      status: "aborted",
+    };
   return {
-    text: finalText || "The advisor returned no text.",
-    usage: combinedUsage,
-    toolCalls,
-    modelRequests,
+    text: text || "The advisor returned no text.",
+    usage: acc.usage,
+    toolCalls: acc.toolCalls,
+    modelRequests: acc.modelRequests,
     status: "completed",
   };
 }
@@ -602,6 +566,7 @@ function buildResult(
   statusFooter: (status: string) => string,
   status: AdvisorStatus,
   prefix: string,
+  mode: string,
   elapsedMs: number,
   usage: Usage | undefined,
 ): AgentToolResult<Record<string, unknown>> {
@@ -616,6 +581,7 @@ function buildResult(
       model: modelLabel,
       source,
       status,
+      mode,
       toolCalls: result.toolCalls,
       modelRequests: result.modelRequests,
       elapsedMs,
@@ -777,25 +743,17 @@ async function advisorExecute(
           usage: combinedUsage,
         };
       if (result.status === "timed_out") {
-        // A timed-out exploration keeps whatever it produced: a partial answer
-        // from a paid exploration is strictly better than an abort notice.
         // A timeout is a terminal incomplete result, not a chain failure: the
         // deadline is shared, so no later candidate could have had time anyway.
         // Return the full (advice-capped) partial output with metrics and usage.
-        const message =
-          mode === "explore"
-            ? `advisor timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`
-            : `advisor request timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`;
         return buildResult(
           result,
           modelLabel,
           candidate.source,
           statusFooter,
           "timed_out",
-          message +
-            (result.text
-              ? "\n\nPartial output before the timeout (incomplete, not a verdict):\n"
-              : ""),
+          timeoutPrefix(mode, timeoutMs, result.text),
+          mode,
           elapsedMs,
           combinedUsage,
         );
@@ -807,6 +765,7 @@ async function advisorExecute(
         statusFooter,
         "completed",
         "",
+        mode,
         elapsedMs,
         combinedUsage,
       );
