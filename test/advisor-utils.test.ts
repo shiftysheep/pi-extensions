@@ -23,10 +23,12 @@ import {
   parseTarget,
   REASONING_EFFORTS,
   redactSensitiveText,
+  remainingBudgetMs,
   requestCharBudget,
   resolveConsultTimeoutMs,
   splitEffortSuffix,
   textFromContent,
+  withSlot,
 } from "../extensions/lib/advisor-utils.js";
 
 const CONFIG_PATH = "/home/user/.pi/agent/advisor.json";
@@ -516,6 +518,17 @@ describe("parseConfig", () => {
     );
   });
 
+  it("treats whitespace-padded model ids as the same model", () => {
+    assert.throws(
+      () =>
+        parseConfig(
+          { primary: { provider: "a", model: " m " }, fallback: { model: "m" } },
+          CONFIG_PATH,
+        ),
+      /primary and fallback are the same model/,
+    );
+  });
+
   it("rejects an invalid timeoutMs", () => {
     for (const bad of ["fast", -1, 0, NaN, Infinity]) {
       assert.throws(
@@ -597,6 +610,73 @@ describe("resolveConsultTimeoutMs", () => {
     assert.equal(resolveConsultTimeoutMs({ perCall: 1, mode: "review" }), 30_000);
     assert.equal(resolveConsultTimeoutMs({ perCall: 10_000_000, mode: "review" }), 30 * 60_000);
     assert.equal(resolveConsultTimeoutMs({ config: 10, mode: "explore" }), 30_000);
+  });
+});
+
+describe("remainingBudgetMs", () => {
+  it("reports the time left on a deadline, floored at 0", () => {
+    assert.equal(remainingBudgetMs(100, 40), 60);
+    assert.equal(remainingBudgetMs(100, 100), 0);
+    assert.equal(remainingBudgetMs(100, 150), 0);
+  });
+});
+
+function abortedSignal(): AbortSignal {
+  const controller = new AbortController();
+  controller.abort();
+  return controller.signal;
+}
+
+async function withTimeout(promise: Promise<void>): Promise<void> {
+  await Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("slot never freed")), 500)),
+  ]);
+}
+
+describe("withSlot", () => {
+  it("runs the work and releases the slot, even when the work throws", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    await assert.rejects(
+      withSlot(limiter, undefined, async () => {
+        throw new Error("boom");
+      }),
+      /boom/,
+    );
+    // Slot must be free again: this acquire resolves immediately.
+    await withTimeout(limiter.acquire());
+    limiter.release();
+  });
+
+  it("refuses to start work when aborted while queued (the slot is released)", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    await withTimeout(limiter.acquire()); // hold the only slot
+    const controller = new AbortController();
+    let started = false;
+    const queued = withSlot(limiter, controller.signal, async () => {
+      started = true;
+      return "done";
+    });
+    controller.abort();
+    limiter.release(); // let the queued waiter acquire
+    await assert.rejects(queued, /aborted before the consultation started/);
+    assert.equal(started, false);
+    // Slot was released after the refusal: a fresh acquire resolves immediately.
+    await withTimeout(limiter.acquire());
+    limiter.release();
+  });
+
+  it("refuses immediately when the signal is already aborted", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    let started = false;
+    await assert.rejects(
+      withSlot(limiter, abortedSignal(), () => {
+        started = true;
+        return Promise.resolve("done");
+      }),
+      /aborted before the consultation started/,
+    );
+    assert.equal(started, false);
   });
 });
 

@@ -398,7 +398,12 @@ export function capDiagnosticText(text: string): string {
  * A simple FIFO concurrency limiter: at most `max` units of work run at once;
  * further callers queue and complete in order rather than being rejected.
  */
-export function createConcurrencyLimiter(max: number) {
+export type ConcurrencyLimiter = {
+  acquire(): Promise<void>;
+  release(): void;
+};
+
+export function createConcurrencyLimiter(max: number): ConcurrencyLimiter {
   let active = 0;
   const queue: Array<() => void> = [];
   return {
@@ -421,4 +426,31 @@ export function createConcurrencyLimiter(max: number) {
       if (next) next();
     },
   };
+}
+
+/**
+ * Acquire a concurrency slot, but refuse to start the work if the caller was
+ * aborted while queued — a cancelled consultation must not start paid work
+ * just because it eventually got a slot. The slot is released before throwing.
+ */
+export async function withSlot<T>(
+  limiter: ConcurrencyLimiter,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  await limiter.acquire();
+  if (signal?.aborted) {
+    limiter.release();
+    throw new Error("aborted before the consultation started");
+  }
+  try {
+    return await run();
+  } finally {
+    limiter.release();
+  }
+}
+
+/** Milliseconds left on a deadline (0 once exhausted); pure so the chain wiring is testable. */
+export function remainingBudgetMs(deadline: number, now: number): number {
+  return Math.max(deadline - now, 0);
 }
