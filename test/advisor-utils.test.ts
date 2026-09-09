@@ -666,17 +666,18 @@ describe("withSlot", () => {
     limiter.release();
   });
 
-  it("refuses immediately when the signal is already aborted", async () => {
+  it("refuses immediately when the signal is already aborted, without consuming a slot", async () => {
     const limiter = createConcurrencyLimiter(1);
     let started = false;
-    await assert.rejects(
-      withSlot(limiter, abortedSignal(), () => {
-        started = true;
-        return Promise.resolve("done");
-      }),
-      /aborted before the consultation started/,
-    );
+    const rejected = withSlot(limiter, abortedSignal(), () => {
+      started = true;
+      return Promise.resolve("done");
+    });
+    // The slot was never taken: this acquire resolves immediately, in parallel.
+    await withTimeout(limiter.acquire());
+    await assert.rejects(rejected, /aborted before the consultation started/);
     assert.equal(started, false);
+    limiter.release();
   });
 });
 

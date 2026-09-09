@@ -178,6 +178,35 @@ function loadConfigSafe(): { config: AdvisorConfig; loadError?: string } {
   }
 }
 
+/**
+ * Validate the mutated config with parseConfig BEFORE touching the file (e.g.
+ * `/advisor set a/m,a/m` must not save a same-model pair that the next call
+ * would reject), back up a broken previous file, then save.
+ * Returns true when a backup was made.
+ */
+function saveConfigValidated(config: AdvisorConfig, loadError: string | undefined): boolean {
+  try {
+    parseConfig(config, CONFIG_PATH);
+  } catch (error) {
+    throw new Error(
+      `Not saved: ${(error as Error).message}\nThe previous configuration is unchanged.`,
+    );
+  }
+  let backedUp = false;
+  if (loadError) {
+    // Repairing a broken file: keep the previous bytes instead of overwriting them.
+    try {
+      renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
+      backedUp = true;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
+    }
+  }
+  saveConfig(config);
+  return backedUp;
+}
+
 function saveConfig(config: AdvisorConfig): void {
   const out: AdvisorConfig = {};
   if (config.primary) out.primary = config.primary;
@@ -345,7 +374,8 @@ async function consultWithStreamSimple(opts: {
   transcript: string;
   effort: AdvisorReasoningEffort;
   ctx: ExtensionContext;
-  timeoutMs: number;
+  /** Absolute monotonic-clock deadline (performance.now() base) for the whole consultation. */
+  deadline: number;
   signal?: AbortSignal;
 }): Promise<AdvisorConsultResult> {
   const { model, ctx } = opts;
@@ -370,12 +400,17 @@ async function consultWithStreamSimple(opts: {
     timestamp: Date.now(),
   };
 
+  // The deadline is absolute: time spent in async setup above is already
+  // deducted, and an exhausted budget never starts a model request.
+  if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
+  const remainingMs = remainingBudgetMs(opts.deadline, performance.now());
+  if (remainingMs <= 0) throw new Error("consultation timed out during setup");
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, opts.timeoutMs);
+  }, remainingMs);
   const onOuterAbort = () => controller.abort();
   opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
   try {
@@ -438,7 +473,8 @@ async function consultWithAgentSession(opts: {
   cwd: string;
   maxToolCalls: number;
   maxModelRequests: number;
-  timeoutMs: number;
+  /** Absolute monotonic-clock deadline (performance.now() base) for the whole consultation. */
+  deadline: number;
   signal?: AbortSignal;
   onUpdate?: (update: {
     content: Array<{ type: "text"; text: string }>;
@@ -502,11 +538,15 @@ async function consultWithAgentSession(opts: {
     }
   });
 
+  // The deadline is absolute: session creation above is already deducted.
+  if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
+  const remainingMs = remainingBudgetMs(opts.deadline, performance.now());
+  if (remainingMs <= 0) throw new Error("consultation timed out during setup");
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     void session.abort();
-  }, opts.timeoutMs);
+  }, remainingMs);
   const onOuterAbort = () => {
     void session.abort();
   };
@@ -599,13 +639,14 @@ async function advisorExecute(
   };
   // Timeout priority: per-call > config > mode default (5 min review / 10 min explore),
   // clamped to 30 s..30 min. The budget covers the WHOLE consultation, fallback
-  // chain included: each attempt only gets the time left on the shared deadline.
+  // chain included: every attempt (including its auth/session setup) runs against
+  // one shared absolute deadline, on a monotonic clock.
   const timeoutMs = resolveConsultTimeoutMs({
     perCall: params.timeoutMs,
     config: config.timeoutMs,
     mode,
   });
-  const deadline = Date.now() + timeoutMs;
+  const deadline = performance.now() + timeoutMs;
   // Claude-Code style: the advisor sees the transcript automatically; opt out with includeSession:false.
   const transcript = params.includeSession === false ? "(not included)" : sessionTranscript(ctx);
   const failures: string[] = [];
@@ -613,8 +654,7 @@ async function advisorExecute(
 
   for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
     const candidate = candidates[candidateIndex];
-    const remainingMs = remainingBudgetMs(deadline, Date.now());
-    if (remainingMs <= 0) {
+    if (remainingBudgetMs(deadline, performance.now()) <= 0) {
       failures.push(`${candidate.source}: skipped, consultation timed out before this attempt`);
       continue;
     }
@@ -638,6 +678,13 @@ async function advisorExecute(
       // Fail fast on missing credentials before paying for a model call.
       const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
       if (!auth.ok) throw new Error(auth.error);
+      // Re-check after the async setup: a slow auth round-trip may have eaten
+      // the whole budget, and an aborted call must not start paid work.
+      if (signal?.aborted) throw new Error("aborted before the consultation started");
+      if (remainingBudgetMs(deadline, performance.now()) <= 0) {
+        failures.push(`${candidate.source}: skipped, consultation timed out during setup`);
+        continue;
+      }
 
       onUpdate?.({
         content: [
@@ -656,7 +703,7 @@ async function advisorExecute(
               cwd: ctx.cwd,
               maxToolCalls: exploreBudget.toolCalls,
               maxModelRequests: exploreBudget.modelRequests,
-              timeoutMs: remainingMs,
+              deadline,
               signal,
               onUpdate: (update) => onUpdate?.(update),
             })
@@ -667,7 +714,7 @@ async function advisorExecute(
               transcript,
               effort: selectedEffort,
               ctx,
-              timeoutMs: remainingMs,
+              deadline,
               signal,
             });
       const elapsedMs = Date.now() - startedAt;
@@ -799,8 +846,11 @@ export default function (pi: ExtensionAPI) {
         else config.primary = pickedPrimary;
         if (pickedFallback === "unset") delete config.fallback;
         else config.fallback = pickedFallback;
-        saveConfig(config);
-        ctx.ui.notify(`advisor updated:\n${describeConfig(config)}`, "info");
+        const backedUp = saveConfigValidated(config, loadError);
+        ctx.ui.notify(
+          `advisor updated:\n${describeConfig(config)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
+          "info",
+        );
       }
 
       if (parts.length === 0) {
@@ -888,17 +938,11 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
       }
 
-      // Validate the mutated config BEFORE touching the file: e.g. `/advisor set a/m,a/m`
-      // would otherwise save a same-model pair that parseConfig rejects on the next call.
-      try {
-        parseConfig(config, CONFIG_PATH);
-      } catch (error) {
-        throw new Error(
-          `Not saved: ${(error as Error).message}\nThe previous configuration is unchanged.`,
-        );
-      }
-      saveConfig(config);
-      ctx.ui.notify(`${warn}advisor updated:\n${describeConfig(config, activeLabel)}`, "info");
+      const backedUp = saveConfigValidated(config, loadError);
+      ctx.ui.notify(
+        `${warn}advisor updated:\n${describeConfig(config, activeLabel)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
+        "info",
+      );
     },
   });
 

@@ -430,14 +430,16 @@ export function createConcurrencyLimiter(max: number): ConcurrencyLimiter {
 
 /**
  * Acquire a concurrency slot, but refuse to start the work if the caller was
- * aborted while queued — a cancelled consultation must not start paid work
- * just because it eventually got a slot. The slot is released before throwing.
+ * aborted — already-aborted calls reject immediately without consuming a
+ * slot, and calls aborted while queued refuse to start once their slot
+ * arrives. A cancelled consultation must never start paid work.
  */
 export async function withSlot<T>(
   limiter: ConcurrencyLimiter,
   signal: AbortSignal | undefined,
   run: () => Promise<T>,
 ): Promise<T> {
+  if (signal?.aborted) throw new Error("aborted before the consultation started");
   await limiter.acquire();
   if (signal?.aborted) {
     limiter.release();
