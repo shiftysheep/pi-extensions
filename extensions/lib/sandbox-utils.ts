@@ -20,8 +20,42 @@ export const SANDBOX_ALLOWED_KEYS = [
   "runner",
   "writable",
   "home",
+  "homeCaches",
   "network",
   "userCommands",
+] as const;
+
+/**
+ * $HOME-relative cache/tool dirs made writable by default (homeCaches: "rw",
+ * the default) so common dev tooling works out of the box: XDG cache
+ * (pre-commit, pip, uv, virtualenv, huggingface, …), package-manager caches,
+ * and tool install locations. Deliberately excludes credential/config dirs
+ * (.ssh, .aws, .gnupg, .config). Home-relative so they track $HOME; extended
+ * in buildWritableRoots only for dirs that already exist (a missing dir is
+ * skipped, never walked up to $HOME).
+ */
+export const HOME_CACHE_ROOTS = [
+  ".cache",
+  ".npm",
+  ".pnpm-store",
+  ".yarn",
+  ".bun",
+  ".cargo",
+  ".rustup",
+  ".gem",
+  ".m2",
+  ".gradle",
+  ".ivy2",
+  ".nvm",
+  ".volta",
+  ".asdf",
+  ".pyenv",
+  ".rbenv",
+  ".rvm",
+  ".gvm",
+  ".sdkman",
+  ".local/share/uv",
+  ".local/bin",
 ] as const;
 
 export type SandboxConfig = {
@@ -33,6 +67,9 @@ export type SandboxConfig = {
   writable?: string[];
   /** Access to $HOME. Default: "ro". */
   home?: "rw" | "ro";
+  /** Writable $HOME cache/tool dirs (HOME_CACHE_ROOTS). Default: "rw". Set
+   * "ro" for a stricter sandbox that leaves every $HOME subdir read-only. */
+  homeCaches?: "rw" | "ro";
   /** Network policy. Default: "allow". Enforced by bwrap/seatbelt; a no-op
    * (with a warning) on landlock, which cannot restrict networks. */
   network?: "allow" | "deny";
@@ -101,6 +138,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
       throw new Error(`${configPath}: "home" must be "rw" or "ro"`);
     }
     config.home = obj.home;
+  }
+  if (obj.homeCaches !== undefined) {
+    if (obj.homeCaches !== "rw" && obj.homeCaches !== "ro") {
+      throw new Error(`${configPath}: "homeCaches" must be "rw" or "ro"`);
+    }
+    config.homeCaches = obj.homeCaches;
   }
   if (obj.network !== undefined) {
     if (obj.network !== "allow" && obj.network !== "deny") {
@@ -216,6 +259,16 @@ export function buildWritableRoots(
   // `> /dev/null`, /proc/self writes, scratch space.
   for (const systemRoot of ["/tmp", "/dev", "/proc"]) if (exists(systemRoot)) roots.add(systemRoot);
   if (config.home === "rw") add(ctx.homeDir);
+  // Default-writable $HOME cache/tool dirs (opt-out via homeCaches: "ro").
+  // Added only when the dir EXISTS: unlike `writable` entries, a missing cache
+  // dir must NOT fall back to its ancestor via resolveExistingRoot, or a
+  // absent ~/.cargo would silently make all of $HOME writable.
+  if (config.homeCaches !== "ro") {
+    for (const rel of HOME_CACHE_ROOTS) {
+      const abs = `${ctx.homeDir}/${rel}`;
+      if (exists(abs)) roots.add(abs);
+    }
+  }
   // A root subsuming another is redundant.
   return [...roots].filter(
     (r) => ![...roots].some((other) => other !== r && isInsideRoot(r, other)),

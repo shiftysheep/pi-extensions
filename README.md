@@ -207,6 +207,7 @@ So a project can opt in or out independently of your global default — e.g. glo
   "runner": "auto",
   "writable": ["~/scratch"],
   "home": "ro",
+  "homeCaches": "rw",
   "network": "allow",
   "userCommands": false
 }
@@ -217,11 +218,12 @@ So a project can opt in or out independently of your global default — e.g. glo
 - `/sandbox` — live status (runner, writable roots, network policy, fallback reason, config paths).
 - `/sandbox on` — enable, writing the **project** scope; the runner defaults to `"auto"` (an explicit `runner` already set in either scope is kept).
 - `/sandbox off` — disable, writing the **project** scope (overrides a global `"enabled": true`).
-- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `userCommands`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
+- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `homeCaches`, `userCommands`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
 
 - `runner` — `auto` (default), `bwrap`, `landlock`, `sandbox-exec`, or `none`. On Linux, `auto` prefers **bubblewrap** (user/pid namespaces, can also deny the network) and falls back to the **Landlock** helper — a tiny C program (`extensions/permission-gate/landlock-helper.c`) compiled on first use with `cc` to `~/.cache/pi-extensions/pi-sandbox-landlock`. On macOS only `sandbox-exec` (Seatbelt) is available; that profile is untested on this machine — validate it on a real Mac before relying on it.
-- `writable` — extra writable paths (leading `~` expands; relative = cwd-relative; non-existent paths fall back to their deepest existing ancestor). The workspace (cwd), `/tmp`, `/dev`, and `/proc` are always writable; everything else — **including `$HOME`** — is read-only unless listed.
+- `writable` — extra writable paths (leading `~` expands; relative = cwd-relative; non-existent paths fall back to their deepest existing ancestor). The workspace (cwd), `/tmp`, `/dev`, and `/proc` are always writable; everything else — **including `$HOME`** — is read-only unless listed or covered by `homeCaches`.
 - `home` — `"ro"` (default) or `"rw"` for `$HOME`.
+- `homeCaches` — `"rw"` (default) or `"ro"`. When `rw`, a curated set of `$HOME` cache/tool dirs is writable so common dev tooling works out of the box: `~/.cache` (XDG cache — pre-commit, pip, uv, virtualenv, …), `~/.npm`, `~/.pnpm-store`, `~/.yarn`, `~/.bun`, `~/.cargo`, `~/.rustup`, `~/.gem`, `~/.m2`, `~/.gradle`, `~/.ivy2`, `~/.nvm`, `~/.volta`, `~/.asdf`, `~/.pyenv`, `~/.rbenv`, `~/.rvm`, `~/.gvm`, `~/.sdkman`, `~/.local/share/uv`, `~/.local/bin` (see `HOME_CACHE_ROOTS` in `extensions/lib/sandbox-utils.ts`). Only dirs that **already exist** are added — a missing dir is skipped, never resolved up to `$HOME`. Credential/config dirs (`.ssh`, `.aws`, `.gnupg`, `.config`) are deliberately excluded; set `"ro"` for a stricter sandbox, or list extra dirs in `writable`.
 - `network` — `"allow"` (default) or `"deny"`. Enforced by bwrap (`--unshare-net`) and seatbelt; a **no-op with a warning on landlock** (Landlock cannot restrict networks).
 - `userCommands` — `true` also sandboxes user `!` commands (they normally bypass the agent's tool pipeline entirely).
 

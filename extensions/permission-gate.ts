@@ -33,6 +33,7 @@
  *     "runner": "auto",         // auto | bwrap | landlock | sandbox-exec | none
  *     "writable": ["~/cache"],  // extra writable paths (cwd, /tmp, /dev, /proc are always writable)
  *     "home": "ro",             // ro | rw — access to $HOME (default ro)
+ *     "homeCaches": "rw",       // rw | ro — writable $HOME cache dirs (default rw; see HOME_CACHE_ROOTS)
  *     "network": "allow",       // allow | deny (deny is a no-op+warning on landlock)
  *     "userCommands": false     // also sandbox user `!` commands
  *   }
@@ -294,6 +295,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       description: "access to your $HOME inside the sandbox",
     },
     {
+      value: "homeCaches",
+      label: `homeCaches: ${draft.homeCaches ?? "rw"}`,
+      description: "writable $HOME cache dirs (~/.cache, ~/.npm, ~/.cargo, …); ro = strict",
+    },
+    {
       value: "userCommands",
       label: `userCommands: ${draft.userCommands ?? "false"}`,
       description: "also sandbox user ! commands",
@@ -552,6 +558,21 @@ export default function (pi: ExtensionAPI) {
         { value: "rw", label: "rw", description: "$HOME is writable" },
       ]);
       return v === undefined ? undefined : { home: v as "ro" | "rw" };
+    }
+    if (option === "homeCaches") {
+      const v = await promptSelect(ctx, "Writable $HOME cache dirs", [
+        {
+          value: "rw",
+          label: "rw",
+          description: "~/.cache, ~/.npm, ~/.cargo, … are writable (default)",
+        },
+        {
+          value: "ro",
+          label: "ro",
+          description: "every $HOME subdir stays read-only (stricter)",
+        },
+      ]);
+      return v === undefined ? undefined : { homeCaches: v as "rw" | "ro" };
     }
     if (option === "userCommands") {
       const v = await promptSelect(ctx, "Sandbox user ! commands", [

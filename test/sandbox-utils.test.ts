@@ -35,6 +35,9 @@ const FS = new Set([
   "/proc",
   "/etc",
   "/home/u/proj/sub",
+  "/home/u/.cache",
+  "/home/u/.npm",
+  "/home/u/.cargo",
 ]);
 const exists = (p: string) => FS.has(p);
 
@@ -50,6 +53,7 @@ describe("parseSandboxConfig", () => {
         runner: "landlock",
         writable: ["~/cache", "data/"],
         home: "rw",
+        homeCaches: "ro",
         network: "deny",
         userCommands: true,
       },
@@ -58,6 +62,7 @@ describe("parseSandboxConfig", () => {
     assert.equal(cfg.enabled, true);
     assert.equal(cfg.runner, "landlock");
     assert.equal(cfg.home, "rw");
+    assert.equal(cfg.homeCaches, "ro");
     assert.equal(cfg.network, "deny");
     assert.equal(cfg.userCommands, true);
   });
@@ -73,6 +78,7 @@ describe("parseSandboxConfig", () => {
     assert.throws(() => parseSandboxConfig({ runner: "docker" }, P), /"runner" must be one of/);
     assert.throws(() => parseSandboxConfig({ writable: ["a", 2] }, P), /"writable" must be/);
     assert.throws(() => parseSandboxConfig({ home: "maybe" }, P), /"home" must be/);
+    assert.throws(() => parseSandboxConfig({ homeCaches: "maybe" }, P), /"homeCaches" must be/);
     assert.throws(() => parseSandboxConfig({ network: "sometimes" }, P), /"network" must be/);
   });
 });
@@ -136,6 +142,30 @@ describe("buildWritableRoots", () => {
     const roots = buildWritableRoots({ writable: ["~/cache", "data/new"] }, CTX, exists);
     assert.ok(roots.includes("/home/u")); // ~/cache -> ancestor /home/u
     assert.ok(!roots.includes("/home/u/proj/data/new")); // doesn't exist
+  });
+  it("adds existing $HOME cache dirs by default (homeCaches rw)", () => {
+    const roots = buildWritableRoots({}, CTX, exists);
+    assert.ok(roots.includes("/home/u/.cache"));
+    assert.ok(roots.includes("/home/u/.npm"));
+    assert.ok(roots.includes("/home/u/.cargo"));
+    assert.ok(!roots.includes("/home/u")); // $HOME itself still ro
+  });
+  it("skips a missing cache dir instead of walking up to $HOME", () => {
+    // /home/u/.rustup is NOT in FS; it must be skipped, not resolved to /home/u.
+    const roots = buildWritableRoots({}, CTX, exists);
+    assert.ok(!roots.includes("/home/u/.rustup"));
+    assert.ok(!roots.includes("/home/u")); // no silent $HOME write access
+  });
+  it("omits $HOME cache dirs when homeCaches is ro", () => {
+    const roots = buildWritableRoots({ homeCaches: "ro" }, CTX, exists);
+    assert.ok(!roots.includes("/home/u/.cache"));
+    assert.ok(!roots.includes("/home/u/.npm"));
+    assert.ok(!roots.includes("/home/u/.cargo"));
+  });
+  it("drops cache dirs subsumed by home rw", () => {
+    const roots = buildWritableRoots({ home: "rw" }, CTX, exists);
+    assert.ok(roots.includes("/home/u"));
+    assert.ok(!roots.includes("/home/u/.cache")); // subsumed by /home/u
   });
 });
 
