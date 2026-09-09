@@ -55,6 +55,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionUIContext,
+  Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   CONFIG_DIR_NAME,
@@ -62,6 +63,7 @@ import {
   getAgentDir,
   isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
+import { type SelectItem, SelectList, type SelectListTheme, Text } from "@earendil-works/pi-tui";
 import {
   applySandboxToggle,
   buildWritableRoots,
@@ -165,6 +167,129 @@ function writeScopeConfig(file: string, config: SandboxConfig): void {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
   fs.renameSync(tmp, file);
+}
+
+// --- select prompts with dim per-option descriptions ---
+// ctx.ui.select renders plain strings only; ui.custom + pi-tui's SelectList
+// (the component the built-in selectors use) renders {label, description}
+// with the description dimmed.
+
+function sandboxSelectTheme(theme: Theme): SelectListTheme {
+  return {
+    selectedPrefix: (text) => theme.fg("accent", text),
+    selectedText: (text) => theme.fg("accent", text),
+    description: (text) => theme.fg("dim", text),
+    scrollInfo: (text) => theme.fg("dim", text),
+    noMatch: (text) => theme.fg("dim", text),
+  };
+}
+
+class SandboxSelectPrompt {
+  onDone: (value: string | undefined) => void = () => {};
+  dispose?: () => void;
+  private readonly title: Text;
+  private readonly list: SelectList;
+  private readonly hint: Text;
+
+  constructor(theme: Theme, titleText: string, items: SelectItem[]) {
+    this.title = new Text(theme.fg("accent", theme.bold(titleText)), 1, 0);
+    this.list = new SelectList(items, Math.min(items.length, 12), sandboxSelectTheme(theme));
+    this.list.onSelect = (item) => this.onDone(item.value);
+    this.list.onCancel = () => this.onDone(undefined);
+    this.hint = new Text(theme.fg("dim", "↑/↓ or j/k: move · enter: select · esc: cancel"), 1, 0);
+  }
+
+  render(width: number): string[] {
+    return [...this.title.render(width), ...this.list.render(width), ...this.hint.render(width)];
+  }
+
+  handleInput(data: string): void {
+    this.list.handleInput(data);
+  }
+
+  invalidate(): void {
+    this.title.invalidate();
+    this.list.invalidate();
+    this.hint.invalidate();
+  }
+}
+
+/** Select prompt with a dim description on every option. Returns the chosen
+ *  item's value (undefined when cancelled). Falls back to ctx.ui.select (plain
+ *  labels, no descriptions) in UI modes without ui.custom. */
+function promptSelect(
+  ctx: ExtensionCommandContext,
+  title: string,
+  items: SelectItem[],
+): Promise<string | undefined> {
+  if (typeof ctx.ui.custom !== "function") {
+    return ctx.ui.select(
+      title,
+      items.map((item) => item.label),
+      { signal: ctx.signal },
+    );
+  }
+  return ctx.ui.custom<string | undefined>((_tui, theme, _keybindings, done) => {
+    const prompt = new SandboxSelectPrompt(theme, title, items);
+    let unsubAbort: (() => void) | undefined;
+    if (ctx.signal) {
+      unsubAbort = () => done(undefined);
+      ctx.signal.addEventListener("abort", unsubAbort, { once: true });
+    }
+    prompt.onDone = (value) => {
+      unsubAbort?.();
+      done(value);
+    };
+    prompt.dispose = () => unsubAbort?.();
+    return prompt;
+  });
+}
+
+/** Dim hint for each runner choice in the config UI. */
+const RUNNER_DESCRIPTIONS: Record<SandboxRunnerChoice, string> = {
+  auto: "best available (bwrap → landlock → sandbox-exec)",
+  none: "no OS sandbox (gate-only mode)",
+  bwrap: "force bubblewrap (Linux)",
+  landlock: "force Landlock (Linux 5.13+; network policy not enforced)",
+  "sandbox-exec": "force macOS Seatbelt",
+};
+
+/** The config menu rows: label = current value, description = dim hint. */
+function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
+  return [
+    {
+      value: "enabled",
+      label: `enabled: ${draft.enabled ?? "false"}`,
+      description: "master switch — when on, bash runs inside the OS sandbox",
+    },
+    {
+      value: "runner",
+      label: `runner: ${draft.runner ?? "auto"}`,
+      description: "sandbox backend: auto (best available) or forced",
+    },
+    {
+      value: "network",
+      label: `network: ${draft.network ?? "allow"}`,
+      description: "outbound network for sandboxed commands",
+    },
+    {
+      value: "home",
+      label: `home: ${draft.home ?? "ro"}`,
+      description: "access to your $HOME inside the sandbox",
+    },
+    {
+      value: "userCommands",
+      label: `userCommands: ${draft.userCommands ?? "false"}`,
+      description: "also sandbox user ! commands",
+    },
+    {
+      value: "writable",
+      label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
+      description: "extra directories sandboxed commands may write to",
+    },
+    { value: "save", label: "— save —", description: "write the config file and re-apply" },
+    { value: "cancel", label: "— cancel —", description: "discard changes" },
+  ];
 }
 
 export default function (pi: ExtensionAPI) {
@@ -379,26 +504,48 @@ export default function (pi: ExtensionAPI) {
     option: string,
     draft: SandboxConfig,
   ): Promise<Partial<SandboxConfig> | undefined> {
-    const select = (title: string, options: string[]) =>
-      ctx.ui.select(title, options, { signal: ctx.signal });
     if (option.startsWith("enabled")) {
-      const v = await select("Sandbox enabled", ["true", "false"]);
+      const v = await promptSelect(ctx, "Sandbox enabled", [
+        { value: "true", label: "true", description: "wrap bash commands in the OS sandbox" },
+        { value: "false", label: "false", description: "gate-only — prompts, no OS isolation" },
+      ]);
       return v === undefined ? undefined : { enabled: v === "true" };
     }
     if (option.startsWith("runner")) {
-      const v = await select("Sandbox runner", [...SANDBOX_RUNNER_CHOICES]);
+      const v = await promptSelect(
+        ctx,
+        "Sandbox runner",
+        SANDBOX_RUNNER_CHOICES.map((choice) => ({
+          value: choice,
+          label: choice,
+          description: RUNNER_DESCRIPTIONS[choice],
+        })),
+      );
       return v === undefined ? undefined : { runner: v as SandboxRunnerChoice };
     }
     if (option.startsWith("network")) {
-      const v = await select("Sandbox network policy", ["allow", "deny"]);
+      const v = await promptSelect(ctx, "Sandbox network policy", [
+        { value: "allow", label: "allow", description: "sandboxed commands can reach the network" },
+        { value: "deny", label: "deny", description: "block outbound network (no-op on landlock)" },
+      ]);
       return v === undefined ? undefined : { network: v as "allow" | "deny" };
     }
     if (option.startsWith("home")) {
-      const v = await select("$HOME access", ["ro", "rw"]);
+      const v = await promptSelect(ctx, "$HOME access in the sandbox", [
+        { value: "ro", label: "ro", description: "$HOME is read-only (default)" },
+        { value: "rw", label: "rw", description: "$HOME is writable" },
+      ]);
       return v === undefined ? undefined : { home: v as "ro" | "rw" };
     }
     if (option.startsWith("userCommands")) {
-      const v = await select("Sandbox user ! commands", ["true", "false"]);
+      const v = await promptSelect(ctx, "Sandbox user ! commands", [
+        { value: "true", label: "true", description: "user ! commands also run sandboxed" },
+        {
+          value: "false",
+          label: "false",
+          description: "user ! commands bypass the sandbox (default)",
+        },
+      ]);
       return v === undefined ? undefined : { userCommands: v === "true" };
     }
     const v = await ctx.ui.input(
@@ -418,11 +565,18 @@ export default function (pi: ExtensionAPI) {
     const files = sandboxConfigFiles(ctx.cwd);
     const scopeLabel = (scope: SandboxScope) =>
       `${scope} — ${files[scope]}${scope === "project" && !trusted ? " (not trusted)" : ""}`;
-    const scopeChoice = await ctx.ui.select(
-      "Sandbox config scope",
-      [scopeLabel("project"), scopeLabel("global")],
-      { signal: ctx.signal },
-    );
+    const scopeChoice = await promptSelect(ctx, "Sandbox config scope", [
+      {
+        value: "project",
+        label: scopeLabel("project"),
+        description: "this repo only — shared with the project (needs trust)",
+      },
+      {
+        value: "global",
+        label: scopeLabel("global"),
+        description: "applies to all your projects",
+      },
+    ]);
     if (scopeChoice === undefined) {
       ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
       return;
@@ -447,21 +601,18 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     for (;;) {
-      const choice = await ctx.ui.select(`Sandbox config (${scopeLabel(scope)})`, [
-        `enabled: ${draft.enabled ?? "false"}`,
-        `runner: ${draft.runner ?? "auto"}`,
-        `network: ${draft.network ?? "allow"}`,
-        `home: ${draft.home ?? "ro"}`,
-        `userCommands: ${draft.userCommands ?? "false"}`,
-        `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
-        "— save —",
-        "— cancel —",
-      ]);
-      if (choice === undefined || choice === "— cancel —") {
+      const choice = await promptSelect(
+        ctx,
+        `Sandbox config (${scopeLabel(scope)})`,
+        sandboxOptionItems(draft),
+      );
+      // The ui.custom path returns the item value ("save"); the plain-select
+      // fallback returns the label ("— save —").
+      if (choice === undefined || choice === "cancel" || choice === "— cancel —") {
         ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
         return;
       }
-      if (choice === "— save —") break;
+      if (choice === "save" || choice === "— save —") break;
       const edited = await editSandboxOption(ctx, choice, draft);
       if (edited === undefined) {
         ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
