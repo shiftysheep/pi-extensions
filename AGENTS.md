@@ -39,9 +39,12 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
 - **Testing**: pure advisor helpers live in `extensions/lib/advisor-utils.ts` and
   are covered by `test/advisor-utils.test.ts` (`node --test` via tsx, wired into
   `check`). Keep new advisor logic testable the same way — pure functions in the
-  utils module, pi-specific wiring in `advisor.ts`. Note: pi auto-loads every `*.ts`
-  directly under `extensions/` as an extension, so shared code goes in a subdir like
-  `extensions/lib/`.
+  utils module, pi-specific wiring in `extensions/advisor/` (split modules) and
+  `advisor.ts` (entry). Note: the `pi.extensions` manifest in `package.json` lists
+  extension files **explicitly** — a new top-level `extensions/<file>.ts` must be
+  added there or it will not load (and do not add an `extensions/<subdir>/index.ts`;
+  only the manifest's explicit entries load). Shared code goes in subdirs like
+  `extensions/lib/` or `extensions/advisor/`.
 - **Complexity**: cognitive complexity is capped at 80 (current peak is 75 in
   `advisor.ts`). Don't grow already-large functions; extract helpers instead.
 - **Commits**: conventional commits, enforced by commitlint on the `commit-msg` hook.
