@@ -8,7 +8,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 
 | Extension | What it does |
 |---|---|
-| `advisor.ts` | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
+| `advisor.ts` (+ `advisor/` modules) | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps (`+30m` or ISO) and repeating intervals. State is snapshotted into the session, so schedules survive `/reload` (not process exit). No OS-level cron jobs created. |
 | `permission-gate.ts` | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`). Not a security boundary — see the file header. |
 | `status-line.ts` | Custom footer with a tok/s estimate while streaming. Pass `undefined` to pi's `setFooter()` to restore the original footer. |
@@ -29,6 +29,28 @@ pi install git:github.com/shiftysheep/pi-extensions@v2.1.0
 pi update --extensions   # reconcile this package to its pinned ref later
 pi -e git:github.com/shiftysheep/pi-extensions    # try without installing (current run only)
 pi config                # enable/disable individual extensions from here or the bundled packages
+```
+
+### Install a single custom extension (per-capability install)
+
+The package's `pi` manifest lists each `extensions/*.ts` entry explicitly, so you can install the repo and load only the extension(s) you want — e.g. just the advisor, without cron, the permission gate, the status line, or any bundled pack:
+
+```bash
+# from the package's settings object (pi config / settings.json).
+# Empty skills/prompts arrays keep the bundled packs' resources off too:
+{
+  "source": "git:github.com/shiftysheep/pi-extensions@v2.1.0",
+  "extensions": ["extensions/advisor.ts"],
+  "skills": [],
+  "prompts": []
+}
+```
+
+Or, for a local checkout, pass the extension file directly as a single-extension source (no npm deps needed — it only uses pi's bundled core packages; pi keeps a reference to the file, so keep `extensions/advisor/` and `extensions/lib/` in place):
+
+```bash
+pi install /path/to/pi-extensions/extensions/advisor.ts
+pi -e ./extensions/advisor.ts    # current run only
 ```
 
 Third-party packs are plain npm dependencies: pi runs `npm install` after cloning, so installs need registry access and pin whatever version range resolves at that time. Our own entries carry caret ranges matching what this machine currently ships.

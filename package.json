@@ -47,7 +47,10 @@
   },
   "pi": {
     "extensions": [
-      "./extensions",
+      "./extensions/advisor.ts",
+      "./extensions/cron.ts",
+      "./extensions/permission-gate.ts",
+      "./extensions/status-line.ts",
       "node_modules/@ff-labs/pi-fff/src/index.ts",
       "node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
       "node_modules/@juicesharp/rpiv-todo/index.ts",
