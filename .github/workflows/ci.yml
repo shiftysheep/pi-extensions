@@ -54,13 +54,22 @@ jobs:
           # A concurrent release may have landed first (see concurrency group);
           # move to the tip of main before bumping.
           git pull --ff-only origin main
+          # Nothing new to release? (e.g. this push merged a release PR itself,
+          # whose only new commit is the merge commit.)
+          last_tag=$(git describe --tags --abbrev=0)
+          if [ -z "$(git log --no-merges --oneline \"${last_tag}..HEAD\")" ]; then
+            echo "No non-merge commits since ${last_tag}; nothing to release."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           uv run --with 'commitizen==4.18.*' cz bump --yes
           # cz created the release commit + tag locally; ship them on a branch
           # and merge through a PR (direct pushes to main are rejected).
           version=$(git tag --points-at HEAD)
-          git push origin "HEAD:refs/heads/release/${version}" "refs/tags/${version}"
+          # force-with-lease: a retried run may already have pushed stale
+          # release/vX.Y.Z branch + tag refs from an earlier attempt.
+          git push --force-with-lease origin "HEAD:refs/heads/release/${version}" "refs/tags/${version}"
           pr_url=$(gh pr create --base main --head "release/${version}" \
             --title "chore(release): ${version}" \
             --body "Automatic release by the CI release job.")
