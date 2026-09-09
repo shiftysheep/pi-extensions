@@ -77,10 +77,20 @@ jobs:
           # force-with-lease: a retried run may already have pushed stale
           # release/vX.Y.Z branch + tag refs from an earlier attempt.
           git push --force-with-lease origin "HEAD:refs/heads/release/${version}" "refs/tags/${version}"
-          pr_url=$(gh pr create --base main --head "release/${version}" \
-            --title "chore(release): ${version}" \
-            --body "Automatic release by the CI release job.")
-          pr_number=${pr_url##*/}
+          # Reuse the release PR if a previous attempt left one open.
+          pr_number=$(gh pr list --head "release/${version}" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr_number" ]; then
+            pr_url=$(gh pr create --base main --head "release/${version}" \
+              --title "chore(release): ${version}" \
+              --body "Automatic release by the CI release job.")
+            pr_number=${pr_url##*/}
+          fi
+          # Checks take a moment to register after the PR is created; --watch
+          # fails immediately if none are reported yet.
+          for i in $(seq 1 20); do
+            [ "$(gh pr view "$pr_number" --json statusCheckRollup --jq '.statusCheckRollup | length')" != "0" ] && break
+            sleep 15
+          done
           # Wait for the required check, then merge (a PR merge is allowed by protection).
           gh pr checks "$pr_number" --watch
           gh pr merge "$pr_number" --merge --delete-branch
