@@ -55,6 +55,8 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 
 The file is **strictly validated**: unknown keys (top level or in a model slot) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
+**Upgrading from the old `exploreBudget` key:** it no longer exists — remove it from `advisor.json` (keep your model slots) so strict validation passes again. Until then the file is ignored with a warning in the result, and explicit `provider`/`model` tool calls still work.
+
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
 **How a consultation works (ground-truth style):** the advisor does **not** receive
@@ -74,8 +76,9 @@ Two modes:
   question against the workspace itself with `read`, `grep`, `find`, and `ls`.
   Bounded by the consultation timeout only — there are no tool-call or model-request
   caps; a timed-out exploration returns whatever partial output it had, explicitly
-  marked **incomplete**. Actual tool calls and elapsed time are always reported in
-  the status footer for cost visibility. Use when the question requires locating code
+  marked **incomplete**. Actual tool calls and model requests are always reported
+  in the result (`toolCalls`/`elapsed` in the footer, `modelRequests` in the
+  details) for cost visibility. Use when the question requires locating code
   or verifying repository facts.
 
 Every result text ends with a model-visible status footer (`[advisor: mode=…, model=…,

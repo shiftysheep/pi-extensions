@@ -463,7 +463,8 @@ async function consultWithStreamSimple(opts: {
  * question (plus the redacted transcript only when the caller opted in) and
  * verifies it against the workspace with read/grep/find/ls before answering.
  * Bounded by the consultation timeout only — tool-call and model-request
- * counts are reported (cost visibility) but never abort a consultation.
+ * counts are reported in the result (cost visibility) but never abort a
+ * consultation.
  */
 async function consultWithAgentSession(opts: {
   model: Model<any>;
@@ -504,6 +505,9 @@ async function consultWithAgentSession(opts: {
   let toolCalls = 0;
   let modelRequests = 0;
   let finalText = "";
+  // Assistant text accumulated across agent_end events: a timed-out exploration
+  // may end in a synthetic failure message, and earlier findings must survive.
+  const producedTexts: string[] = [];
   let combinedUsage: Usage | undefined;
   const unsubscribe = session.subscribe((event) => {
     if (event.type === "turn_start") modelRequests += 1;
@@ -528,6 +532,9 @@ async function consultWithAgentSession(opts: {
         }
       }
       finalText = lastAssistant ? textFromContent(lastAssistant.content).trim() : "";
+      if (finalText) {
+        if (producedTexts[producedTexts.length - 1] !== finalText) producedTexts.push(finalText);
+      }
     }
   });
 
@@ -561,16 +568,59 @@ async function consultWithAgentSession(opts: {
     session.dispose();
   }
 
+  // On interruption the last message may be empty or synthetic, so fall back
+  // to everything the exploration produced before it stopped.
+  const partialText = finalText || producedTexts.join("\n\n");
   if (timedOut)
-    return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "timed_out" };
+    return {
+      text: partialText,
+      usage: combinedUsage,
+      toolCalls,
+      modelRequests,
+      status: "timed_out",
+    };
   if (opts.signal?.aborted === true)
-    return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "aborted" };
+    return { text: partialText, usage: combinedUsage, toolCalls, modelRequests, status: "aborted" };
   return {
     text: finalText || "The advisor returned no text.",
     usage: combinedUsage,
     toolCalls,
     modelRequests,
     status: "completed",
+  };
+}
+
+/**
+ * Terminal result for a finished attempt: advice-capped text plus the status
+ * footer and structured details. `prefix` lets a timed-out attempt keep its
+ * full (capped) partial output instead of collapsing to a short error string.
+ */
+function buildResult(
+  result: AdvisorConsultResult,
+  modelLabel: string,
+  source: string,
+  statusFooter: (status: string) => string,
+  status: AdvisorStatus,
+  prefix: string,
+  elapsedMs: number,
+  usage: Usage | undefined,
+): AgentToolResult<Record<string, unknown>> {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `${prefix}${capAdviceText(result.text)}${statusFooter(status)}`,
+      },
+    ],
+    details: {
+      model: modelLabel,
+      source,
+      status,
+      toolCalls: result.toolCalls,
+      modelRequests: result.modelRequests,
+      elapsedMs,
+    },
+    usage,
   };
 }
 
@@ -729,32 +779,37 @@ async function advisorExecute(
       if (result.status === "timed_out") {
         // A timed-out exploration keeps whatever it produced: a partial answer
         // from a paid exploration is strictly better than an abort notice.
-        const partial =
-          mode === "explore" && result.text
-            ? `\nPartial output before the timeout (incomplete, not a verdict):\n${capAdviceText(result.text)}`
-            : "";
+        // A timeout is a terminal incomplete result, not a chain failure: the
+        // deadline is shared, so no later candidate could have had time anyway.
+        // Return the full (advice-capped) partial output with metrics and usage.
         const message =
           mode === "explore"
             ? `advisor timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`
             : `advisor request timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`;
-        if (explicit) throw new Error(`${modelLabel}: ${message}${partial}`);
-        failures.push(`${candidate.source} (${modelLabel}): ${message}${partial}`);
-        continue;
-      }
-      return {
-        content: [
-          { type: "text", text: `${capAdviceText(result.text)}${statusFooter("completed")}` },
-        ],
-        details: {
-          model: modelLabel,
-          source: candidate.source,
-          status: "completed",
-          mode,
-          toolCalls: result.toolCalls,
+        return buildResult(
+          result,
+          modelLabel,
+          candidate.source,
+          statusFooter,
+          "timed_out",
+          message +
+            (result.text
+              ? "\n\nPartial output before the timeout (incomplete, not a verdict):\n"
+              : ""),
           elapsedMs,
-        },
-        usage: combinedUsage,
-      };
+          combinedUsage,
+        );
+      }
+      return buildResult(
+        result,
+        modelLabel,
+        candidate.source,
+        statusFooter,
+        "completed",
+        "",
+        elapsedMs,
+        combinedUsage,
+      );
     } catch (error) {
       if (signal?.aborted) {
         return {
@@ -785,7 +840,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const usageHints =
-    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level or a model slot) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself; bounded by the consultation timeout only — tool-call and model-request counts are reported in the footer for cost visibility but never abort a consultation). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
+    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level or a model slot) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself; bounded by the consultation timeout only — tool-call count, model-request count, and elapsed time are reported for cost visibility, but never abort a consultation). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
 
   pi.registerCommand("advisor", {
     description:
