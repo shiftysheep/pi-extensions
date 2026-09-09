@@ -26,8 +26,20 @@ describe("recursive rm (filesystem)", () => {
     }
   });
   it("matches inside compound commands", () => {
-    assert.equal(findDangerousRule("ls && sudo rm -rf /")?.name, "privilege escalation"); // first match wins
+    assert.equal(findDangerousRule("ls && sudo rm -rf /")?.name, "privilege escalation");
     assert.equal(findDangerousRule("cd /x; rm -R sub")?.name, "recursive rm");
+  });
+  it("system-category matches win over filesystem ones in mixed commands", () => {
+    // While the sandbox is active, filesystem matches are suppressed; a mixed
+    // command must still be gated on its system-category part.
+    const mixed = findDangerousRule("rm -rf build; sudo apt update");
+    assert.equal(mixed?.name, "privilege escalation");
+    assert.equal(shouldGate(mixed, true), true);
+    assert.equal(
+      findDangerousRule("rm -rf build; dd if=/dev/zero of=/dev/sda")?.name,
+      "raw device write (dd)",
+    );
+    assert.equal(findDangerousRule("rm -rf build; shutdown -h now")?.name, "power action");
   });
 });
 

@@ -10,7 +10,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 |---|---|
 | `advisor.ts` (+ `advisor/` modules) | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps (`+30m` or ISO) and repeating intervals. State is snapshotted into the session, so schedules survive `/reload` (not process exit). No OS-level cron jobs created. |
-| `permission-gate.ts` (+ `permission-gate/` modules) | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`, raw-device `dd`, `mkfs`, power actions). Optionally adds an **OS filesystem sandbox** (bubblewrap / Landlock on Linux, `sandbox-exec` on macOS) that makes the agent's bash commands read-only outside writable roots — opt-in via `~/.pi/agent/sandbox.json`. The gate alone is not a security boundary; the sandbox is an OS-level boundary. See [Configuration](#configuration). |
+| `permission-gate.ts` (+ `permission-gate/` modules) | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`, raw-device `dd`, `mkfs`, power actions). Optionally adds an **OS filesystem sandbox** (bubblewrap / Landlock on Linux, `sandbox-exec` on macOS) that makes the agent's bash commands read-only outside writable roots — opt-in via `sandbox.json` (global `~/.pi/agent/` or project `.pi/`). Toggle with `/sandbox on|off`, edit with `/sandbox config`. The gate alone is not a security boundary; the sandbox is an OS-level boundary. See [Configuration](#configuration). |
 | `status-line.ts` | Custom footer with a tok/s estimate while streaming. Pass `undefined` to pi's `setFooter()` to restore the original footer. |
 
 ### Bundled recommended installs (declared as dependencies, resolved by npm at install time)
@@ -194,7 +194,12 @@ Behavior notes:
 
 ### permission-gate / sandbox
 
-The heuristic gate is always on. The **filesystem sandbox** is opt-in: create `~/.pi/agent/sandbox.json` with `"enabled": true` (absent file = disabled, behavior identical to the gate alone).
+The heuristic gate is always on. The **filesystem sandbox** is opt-in: set `"enabled": true` in a `sandbox.json` (absent file = disabled, behavior identical to the gate alone). Two scopes are supported and merged **per-key, project wins**:
+
+- **global** — `~/.pi/agent/sandbox.json`
+- **project** — `<cwd>/.pi/sandbox.json` (only honored when the project is *trusted*; untrusted projects contribute nothing and can't be written to)
+
+So a project can opt in or out independently of your global default — e.g. global `"enabled": false` + project `"enabled": true`, or vice versa.
 
 ```json
 {
@@ -207,6 +212,13 @@ The heuristic gate is always on. The **filesystem sandbox** is opt-in: create `~
 }
 ```
 
+**Commands** (all take effect immediately, no `/reload` needed):
+
+- `/sandbox` — live status (runner, writable roots, network policy, fallback reason, config paths).
+- `/sandbox on` — enable, writing the **project** scope; the runner defaults to `"auto"` (an explicit `runner` already set in either scope is kept).
+- `/sandbox off` — disable, writing the **project** scope (overrides a global `"enabled": true`).
+- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `userCommands`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
+
 - `runner` — `auto` (default), `bwrap`, `landlock`, `sandbox-exec`, or `none`. On Linux, `auto` prefers **bubblewrap** (user/pid namespaces, can also deny the network) and falls back to the **Landlock** helper — a tiny C program (`extensions/permission-gate/landlock-helper.c`) compiled on first use with `cc` to `~/.cache/pi-extensions/pi-sandbox-landlock`. On macOS only `sandbox-exec` (Seatbelt) is available; that profile is untested on this machine — validate it on a real Mac before relying on it.
 - `writable` — extra writable paths (leading `~` expands; relative = cwd-relative; non-existent paths fall back to their deepest existing ancestor). The workspace (cwd), `/tmp`, `/dev`, and `/proc` are always writable; everything else — **including `$HOME`** — is read-only unless listed.
 - `home` — `"ro"` (default) or `"rw"` for `$HOME`.
@@ -215,7 +227,7 @@ The heuristic gate is always on. The **filesystem sandbox** is opt-in: create `~
 
 While the sandbox is active, the gate's *filesystem* rules (recursive `rm`, world-writable `chmod`) are suppressed — the kernel enforces them instead — while *system* rules (privilege escalation, `dd of=/dev/…` to raw devices, `mkfs`, `shutdown`/`reboot`/`poweroff`/`halt`) stay armed. `write`/`edit` tool calls target a path directly (no shell), so they get a separate guard: paths outside the writable roots prompt for confirmation. If no runner is available at session start (no bwrap + no Landlock kernel/compiler, or a broken bwrap — e.g. AppArmor `restrict_unprivileged_userns` on some Ubuntu setups), the extension warns, runs commands **unsandboxed**, and re-arms all gate rules.
 
-The sandbox is a mistake/runaway-command boundary, not a security boundary against malicious code: it isolates the filesystem only, landlock cannot block the network, and the landlock helper's `PR_SET_NO_PRIVS` only stops setuid escalation. `/sandbox` prints the live status (runner, writable roots, network policy, fallback reason).
+The sandbox is a mistake/runaway-command boundary, not a security boundary against malicious code: it isolates the filesystem only, landlock cannot block the network, and the landlock helper's `PR_SET_NO_PRIVS` only stops setuid escalation. `/sandbox` prints the live status (runner, writable roots, network policy, fallback reason); `/sandbox on|off|config` manage it (see above).
 
 ## Develop
 

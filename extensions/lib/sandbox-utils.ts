@@ -10,6 +10,10 @@
 export const SANDBOX_RUNNERS = ["bwrap", "landlock", "sandbox-exec"] as const;
 export type SandboxRunner = (typeof SANDBOX_RUNNERS)[number];
 export type SandboxRunnerChoice = "auto" | SandboxRunner | "none";
+export const SANDBOX_RUNNER_CHOICES = ["auto", "none", ...SANDBOX_RUNNERS] as const;
+
+/** Config file scopes: global (~/.pi/agent) or project (<cwd>/.pi). */
+export type SandboxScope = "global" | "project";
 
 export const SANDBOX_ALLOWED_KEYS = [
   "enabled",
@@ -75,10 +79,10 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
   if (obj.runner !== undefined) {
     if (
       typeof obj.runner !== "string" ||
-      !(["auto", "none", ...SANDBOX_RUNNERS] as string[]).includes(obj.runner)
+      !(SANDBOX_RUNNER_CHOICES as readonly string[]).includes(obj.runner)
     ) {
       throw new Error(
-        `${configPath}: "runner" must be one of: auto, none, ${SANDBOX_RUNNERS.join(", ")}`,
+        `${configPath}: "runner" must be one of: ${SANDBOX_RUNNER_CHOICES.join(", ")}`,
       );
     }
     config.runner = obj.runner as SandboxRunnerChoice;
@@ -111,6 +115,62 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     config.userCommands = obj.userCommands;
   }
   return config;
+}
+
+/**
+ * Config file path for a scope. Pure: no fs.
+ * `projectDir` is pi's project config dir (<cwd>/.pi) — passed pre-resolved so
+ * this module stays free of pi imports.
+ */
+export function sandboxConfigPath(
+  scope: SandboxScope,
+  paths: { agentDir: string; projectDir: string },
+): string {
+  return scope === "global" ? `${paths.agentDir}/sandbox.json` : `${paths.projectDir}/sandbox.json`;
+}
+
+/**
+ * Merge global + project sandbox configs: per-key, project wins. Undefined
+ * project keys fall back to the global value. Pure.
+ */
+export function mergeSandboxConfigs(
+  globalConfig: SandboxConfig,
+  projectConfig: SandboxConfig,
+): SandboxConfig {
+  const merged: SandboxConfig = { ...globalConfig };
+  for (const key of SANDBOX_ALLOWED_KEYS) {
+    const value = projectConfig[key];
+    if (value !== undefined) (merged as Record<string, unknown>)[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Apply an on/off toggle to one scope's config. Pure.
+ * Turning on defaults the runner to "auto" only when this scope has no
+ * explicit runner AND no explicit runner is effective in the merged config
+ * (`inheritedRunner`), so an existing "bwrap"/"landlock"/... choice in
+ * either scope is preserved.
+ */
+export function applySandboxToggle(
+  config: SandboxConfig,
+  enabled: boolean,
+  inheritedRunner?: SandboxRunnerChoice,
+): SandboxConfig {
+  if (!enabled) return { ...config, enabled: false };
+  return {
+    ...config,
+    enabled: true,
+    ...(config.runner === undefined ? { runner: inheritedRunner ?? ("auto" as const) } : {}),
+  };
+}
+
+/** Split a comma-separated writable-paths line (the config UI input). Pure. */
+export function parseWritableList(input: string): string[] {
+  return input
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /** Single-quote a string for safe embedding in a shell command line. */

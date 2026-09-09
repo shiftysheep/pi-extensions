@@ -6,15 +6,19 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  applySandboxToggle,
   buildSeatbeltProfile,
   buildWritableRoots,
   isInsideAnyRoot,
   isInsideRoot,
+  mergeSandboxConfigs,
   normalizeSandboxPath,
   parseSandboxConfig,
+  parseWritableList,
   type RunnerContext,
   resolveExistingRoot,
   type SandboxConfig,
+  sandboxConfigPath,
   shellQuote,
   wrapCommand,
   wrapWithBwrap,
@@ -212,17 +216,111 @@ describe("wrapWithSandboxExec", () => {
 
 describe("wrapCommand dispatch", () => {
   const policy = { writableRoots: ["/tmp"], network: "allow" as const };
-  const cfg: SandboxConfig = {};
   it("routes to each runner", () => {
     assert.ok(wrapCommand("bwrap", "ls", policy, CTX).startsWith("bwrap "));
     assert.ok(wrapCommand("landlock", "ls", policy, CTX).includes("--rw '/tmp'"));
     assert.ok(wrapCommand("sandbox-exec", "ls", policy, CTX).startsWith("sandbox-exec "));
-    void cfg;
   });
   it("throws on unknown runner", () => {
     assert.throws(
       () => wrapCommand("docker" as never, "ls", policy, CTX),
       /unknown sandbox runner/,
     );
+  });
+});
+
+describe("sandboxConfigPath", () => {
+  const paths = { agentDir: "/home/u/.pi/agent", projectDir: "/home/u/proj/.pi" };
+  it("global maps under the agent dir", () => {
+    assert.equal(sandboxConfigPath("global", paths), "/home/u/.pi/agent/sandbox.json");
+  });
+  it("project maps under the project .pi dir", () => {
+    assert.equal(sandboxConfigPath("project", paths), "/home/u/proj/.pi/sandbox.json");
+  });
+});
+
+describe("mergeSandboxConfigs", () => {
+  it("returns global when project is empty", () => {
+    const merged = mergeSandboxConfigs({ enabled: true, runner: "bwrap" }, {});
+    assert.deepEqual(merged, { enabled: true, runner: "bwrap" });
+  });
+  it("project keys override global per-key", () => {
+    const merged = mergeSandboxConfigs(
+      { enabled: true, runner: "bwrap", network: "deny", home: "rw" },
+      { enabled: false, network: "allow" },
+    );
+    assert.equal(merged.enabled, false); // project wins
+    assert.equal(merged.network, "allow"); // project wins
+    assert.equal(merged.runner, "bwrap"); // falls back to global
+    assert.equal(merged.home, "rw"); // falls back to global
+  });
+  it("does not mutate its inputs", () => {
+    const g = { enabled: true };
+    const p = { network: "deny" as const };
+    mergeSandboxConfigs(g, p);
+    assert.deepEqual(g, { enabled: true });
+    assert.deepEqual(p, { network: "deny" });
+  });
+  it("project can re-enable a globally-disabled sandbox", () => {
+    const merged = mergeSandboxConfigs({ enabled: false }, { enabled: true });
+    assert.equal(merged.enabled, true);
+  });
+  it("project writable: [] overrides a non-empty global list (empty is defined)", () => {
+    const merged = mergeSandboxConfigs({ writable: ["~/g"] }, { writable: [] });
+    assert.deepEqual(merged.writable, []);
+  });
+});
+
+describe("applySandboxToggle", () => {
+  it("on with no runner defaults runner to auto", () => {
+    assert.deepEqual(applySandboxToggle({}, true), { enabled: true, runner: "auto" });
+  });
+  it("on keeps an inherited explicit runner instead of defaulting to auto", () => {
+    assert.deepEqual(applySandboxToggle({}, true, "bwrap"), { enabled: true, runner: "bwrap" });
+    assert.deepEqual(applySandboxToggle({}, true, "none"), { enabled: true, runner: "none" });
+  });
+  it("on keeps this scope's own runner over the inherited one", () => {
+    assert.deepEqual(applySandboxToggle({ runner: "landlock" }, true, "bwrap"), {
+      enabled: true,
+      runner: "landlock",
+    });
+  });
+  it("on keeps an explicit runner", () => {
+    assert.deepEqual(applySandboxToggle({ runner: "bwrap" }, true), {
+      enabled: true,
+      runner: "bwrap",
+    });
+  });
+  it("on preserves other options", () => {
+    assert.deepEqual(applySandboxToggle({ network: "deny", home: "rw" }, true), {
+      network: "deny",
+      home: "rw",
+      enabled: true,
+      runner: "auto",
+    });
+  });
+  it("off sets enabled false and keeps the rest", () => {
+    assert.deepEqual(applySandboxToggle({ enabled: true, runner: "landlock" }, false), {
+      enabled: false,
+      runner: "landlock",
+    });
+  });
+  it("does not mutate its input", () => {
+    const cfg: SandboxConfig = { runner: "bwrap" };
+    applySandboxToggle(cfg, true);
+    assert.deepEqual(cfg, { runner: "bwrap" });
+  });
+});
+
+describe("parseWritableList", () => {
+  it("splits, trims, and drops empties", () => {
+    assert.deepEqual(parseWritableList("~/a, ~/b , c/"), ["~/a", "~/b", "c/"]);
+  });
+  it("returns [] for blank input", () => {
+    assert.deepEqual(parseWritableList(""), []);
+    assert.deepEqual(parseWritableList("  ,,  "), []);
+  });
+  it("single unquoted path", () => {
+    assert.deepEqual(parseWritableList("/tmp/x"), ["/tmp/x"]);
   });
 });

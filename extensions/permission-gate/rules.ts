@@ -135,9 +135,16 @@ const RULES: GateRule[] = [
 
 export type GateMatch = { name: string; category: RuleCategory };
 
-/** Returns the first matching rule, or undefined. */
+/**
+ * Returns the matching rule to surface: a SYSTEM-category match wins over a
+ * filesystem one, so a mixed command (e.g. `rm -rf build; sudo apt`) is gated
+ * on the system rule even while the sandbox is active (where filesystem
+ * matches would be suppressed). First match within a category; undefined when
+ * nothing matches.
+ */
 export function findDangerousRule(command: string): GateMatch | undefined {
-  const rule = RULES.find((r) => r.test(command));
+  const matches = RULES.filter((r) => r.test(command));
+  const rule = matches.find((r) => r.category === "system") ?? matches[0];
   return rule ? { name: rule.name, category: rule.category } : undefined;
 }
 
