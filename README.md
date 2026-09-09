@@ -99,14 +99,18 @@ reach anything the OS user can read, and the child inherits the user's own
 credential store so the advisor
 model can authenticate. The child runs with a **minimal environment allowlist**
 (`childBaseEnv`: `PATH`, `HOME`, `TMPDIR`, `USER`, `SHELL`, locale and `XDG_*`)
-— it gets the file-backed credential store (`auth.json`) but *not* ambient shell
-credentials. So a model authenticated purely via environment variables
-(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_PROFILE`/`AWS_REGION`, a GCP ADC
-file, …) that has **no entry in `auth.json`** will not resolve in the child:
-use `/login` or a stored API key for such models, or see issue #8 for the
+— it gets the file-backed credential store (`auth.json`) plus `HOME`, but *not*
+the host's ambient environment. Consequences for models with **no entry in
+`auth.json`**: credentials resolved purely from a **set environment variable**
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_PROFILE`/`AWS_REGION`/`AWS_ACCESS_KEY_ID`,
+`GOOGLE_CLOUD_PROJECT`/`LOCATION`, …) do not resolve, because those variables
+are stripped; but ambient **file** credentials discovered through the standard
+`HOME`-relative locations (e.g. a GCP application-default-credentials file, or
+the default `~/.aws` profile) still work, because the child inherits `HOME`. For
+env-var-based models, use `/login` or a stored API key, or see issue #8 for the
 child-scoped environment. OAuth tokens are pre-refreshed into the host's
-`auth.json` before the child copies it, so a near-expiry `/login` session still
-works. A failed or no-response child run is never reported as a
+`auth.json` before the child copies it (a mitigation, not a guarantee), so a
+near-expiry `/login` session still works. A failed or no-response child run is never reported as a
 completed answer — it either degrades to the fallback model or the partial output
 is explicitly marked incomplete.
 

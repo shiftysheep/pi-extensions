@@ -191,15 +191,14 @@ async function advisorExecute(
     }
 
     const modelLabel = `${model.provider}/${model.id}`;
-    // Pre-refresh a near-expiry OAuth credential in the HOST's canonical
-    // credential store before the child copies auth.json. The child runs in an
-    // isolated agent dir, so a refresh it performs on its own copy is deleted
-    // with the temp dir and the host is left with the pre-rotation refresh
-    // token — which, for rotating/single-use refresh tokens, is now invalid.
-    // Refreshing here (into the real auth.json) means the child copies an
-    // already-fresh token and never refreshes on its own, so the host and the
-    // child never race on the same refresh token. Best-effort: a failure here
-    // just lets the child report its own auth error and the chain falls back.
+    // Best-effort pre-refresh of a near-expiry OAuth credential in the HOST's
+    // canonical credential store before the child copies auth.json, so the child
+    // is less likely to refresh on its own (throwaway) copy — which, for a
+    // rotating refresh token, would invalidate the host's token. This is a
+    // mitigation, not a guarantee: a token just outside pi's ~5-minute refresh
+    // window can still cross into it during the child's run and be rotated on
+    // the child's copy (see preRefreshProviderAuth; full fix is issue #8).
+    // A failure here just lets the child report its own auth error and fall back.
     await preRefreshProviderAuth(ctx, model.provider);
     // Effort priority: tool-call override > per-model config > global default > medium.
     const selectedEffort =

@@ -239,11 +239,22 @@ export async function consultWithChildProcess(opts: {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4_000);
     });
 
-    // A spawn failure (ENOENT, bad argv) surfaces as the child's "error" event;
-    // a successful spawn always ends in "close", so awaiting close is enough.
+    // A spawn failure (ENOENT, bad argv) surfaces as the child's "error" event.
+    // A successful spawn ends in "close" — but "close" requires ALL pipe holders
+    // to die, and a descendant (e.g. a piBinary wrapper that spawned its own
+    // subprocess and moved it to a new session) can outlive the immediate child
+    // while still holding a pipe. So bound the wait: once the immediate child
+    // has exited, give the pipes a short grace to flush the child's final output,
+    // then stop waiting even if a descendant still holds them. Waiting on an
+    // out-of-group descendant would hang the slot and the credential dir.
     let spawnError: Error | undefined;
     proc.once("error", (error) => (spawnError = error));
-    await new Promise<void>((resolve) => proc.once("close", () => resolve()));
+    const closePromise = new Promise<void>((resolve) => proc.once("close", () => resolve()));
+    // The normal path resolves on "close" (the child exited and its pipe closed).
+    // The backstop resolves shortly after the child exits if "close" is held open
+    // by a descendant; the child's own output is already flushed by then.
+    const CLOSE_GRACE_MS = 1_000;
+    await Promise.race([closePromise, groupDead.then(() => delay(CLOSE_GRACE_MS))]);
     if (spawnError)
       throw new Error(
         `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${spawnError.message}`,

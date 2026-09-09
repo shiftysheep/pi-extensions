@@ -376,6 +376,63 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     assert.deepEqual(workDirs(), before, "work dir must be removed after group teardown");
   });
 
+  it("does not hang when an out-of-group descendant holds the pipe", async () => {
+    const before = workDirs();
+    const dir = mkdtempSync(join(tmpdir(), "pi-advisor-fake-"));
+    fakeDirs.push(dir);
+    // The descendant moves itself to a NEW session (detached => setsid) so the
+    // transport's group signal cannot reach it, and it INHERITS the immediate
+    // pi's stdout (so it holds the pipe). It stays alive. Without a bound on the
+    // "close" wait, the transport would hang forever here: the immediate child
+    // dies on the deadline's SIGKILL, but "close" never fires because this
+    // out-of-group descendant keeps the pipe open.
+    const pidFile = join(tmpdir(), `pi-advisor-escape-pid-${process.pid}-${Date.now()}`);
+    writeFileSync(
+      join(dir, "desc.js"),
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));\n` +
+        "setInterval(()=>{},50);\n",
+    );
+    const bin = join(dir, "pi");
+    writeFileSync(
+      bin,
+      "#!/usr/bin/env node\n" +
+        "require('node:child_process').spawn(process.execPath,[" +
+        JSON.stringify(join(dir, "desc.js")) +
+        "],{detached:true,stdio:['ignore','inherit','ignore']});\n" +
+        "setTimeout(()=>{},120000);\n",
+    );
+    chmodSync(bin, 0o755);
+    // Race against a test-side bound so a regression (hang) fails the test
+    // rather than stalling the whole suite.
+    const result = await Promise.race([
+      consultWithChildProcess({
+        model: MODEL,
+        modelLabel: "fake/fake-model",
+        question: "q",
+        transcript: "",
+        effort: "low",
+        cwd: process.cwd(),
+        mode: "review",
+        deadline: performance.now() + 400,
+        config: { piBinary: bin },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("transport hung on an out-of-group descendant")), 8_000),
+      ),
+    ]);
+    assert.equal(result.status, "timed_out");
+    // The escaping descendant is in a new session, so the group signal did not
+    // reach it; clean it up explicitly (and remove the work dir it is not in).
+    try {
+      const escPid = Number(readFileSync(pidFile, "utf8").trim());
+      process.kill(escPid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    rmSync(pidFile, { force: true });
+    assert.deepEqual(workDirs(), before, "work dir must be removed after the bounded wait");
+  });
+
   it("survives a throwing update callback without orphaning the child", async () => {
     const before = workDirs();
     // Explore mode emits tool_execution_start events that trigger onUpdate.
