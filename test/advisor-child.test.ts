@@ -587,8 +587,18 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
  * (via opts.__test.spawnImpl) that never exits, a mocked group-kill (killImpl, so
  * a fabricated pid is never signalled), and a short teardown margin, to verify:
  * (1) the wait settles at first-interrupt + one shared margin (no stacking);
- * (2) a second interrupt does not restart the (immutable) budget;
- * (3) a late "exit" after settlement creates no new wait (no hang).
+ * (2) a second interrupt fired during teardown is tolerated (no hang/crash) and
+ *     does not delay settlement past the shared budget;
+ * (3) a late "exit" after settlement is a no-op: it leaves no owned close/exit
+ *     listeners behind and creates no new wait.
+ *
+ * Note: the immutable-budget guard in startHardBound (which refuses to restart
+ * the deadline once set) is defence-in-depth. It guards a synchronous window —
+ * an interrupt between close-wait settlement and the finally's
+ * interrupt-disable — that event-driven interrupts cannot actually reach
+ * (the finally disables the deadline timer and abort listener before it awaits
+ * teardown). It is therefore not independently observable in a timing test;
+ * test (2) covers the observable behaviour (a second interrupt is tolerated).
  */
 describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
   const MARGIN_MS = 400;
@@ -603,6 +613,7 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
       once: ee.once.bind(ee),
       removeListener: ee.removeListener.bind(ee),
       emit: ee.emit.bind(ee),
+      listenerCount: ee.listenerCount.bind(ee),
       pid: 999_999_999,
       exitCode: null,
       signalCode: null,
@@ -659,11 +670,12 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
     assert.ok(killSignals.includes("SIGTERM"));
   });
 
-  it("does not restart the budget on a second interrupt", async () => {
+  it("tolerates a second interrupt during teardown (no hang, no crash)", async () => {
     const { child } = makeFakeChild();
     const ac = new AbortController();
     const t0 = performance.now();
-    // The deadline is the first interrupt; the abort is the second.
+    // The deadline is the first interrupt (+120ms); the abort is a second
+    // interrupt fired while the first's hard bound is still pending (+200ms).
     setTimeout(() => ac.abort(), 200);
     const result = await consultWithChildProcess({
       ...baseOpts,
@@ -676,17 +688,16 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
       },
     });
     const elapsed = performance.now() - t0;
-    assert.equal(result.status, "timed_out"); // deadline (first interrupt) wins
-    // If the second interrupt had restarted the budget, settlement would be at
-    // ~200 (abort) + 400 (margin) = 600ms at the earliest, plus a fresh hard
-    // bound. The immutable budget settles at ~120 + 400 = 520ms.
+    assert.equal(result.status, "timed_out"); // the first interrupt (deadline) wins
+    // The second interrupt must not hang the call or push settlement past the
+    // shared budget (~120 + 400 = 520ms).
     assert.ok(
-      elapsed < 780,
-      `settled at ${Math.round(elapsed)}ms — a restarted budget would settle later`,
+      elapsed < 1_000,
+      `second interrupt delayed settlement to ${Math.round(elapsed)}ms (should be ~520ms)`,
     );
   });
 
-  it("a late exit after settlement creates no new wait (no hang)", async () => {
+  it("a late exit after settlement is a no-op (no listeners, no new wait)", async () => {
     const { child } = makeFakeChild();
     const t0 = performance.now();
     const consult = consultWithChildProcess({
@@ -707,11 +718,16 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
     }, 2_500);
     const result = await consult;
     clearTimeout(watchdog);
-    const elapsed = performance.now() - t0;
+    // Wait past the late "exit" (emitted at ~600ms) so its (absent) handling
+    // has run, then assert the transport left NO owned close/exit listeners on
+    // the abandoned child (the settled guard + the finally's listener removal).
+    await new Promise((r) => setTimeout(r, 150));
     assert.equal(result.status, "timed_out");
     assert.ok(
-      elapsed < 1_000,
-      `late exit delayed settlement to ${Math.round(elapsed)}ms (should settle at the hard bound ~520ms)`,
+      performance.now() - t0 < 1_000,
+      `late exit delayed settlement (should settle at the hard bound ~520ms)`,
     );
+    assert.equal(child.listenerCount("close"), 0, "a late exit left a 'close' listener behind");
+    assert.equal(child.listenerCount("exit"), 0, "a late exit left an 'exit' listener behind");
   });
 });
