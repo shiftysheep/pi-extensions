@@ -71,6 +71,9 @@ export function saveConfig(config: AdvisorConfig): void {
   if (config.activeModelFallback) out.activeModelFallback = config.activeModelFallback;
   if (config.timeoutMs !== undefined) out.timeoutMs = config.timeoutMs;
   if (config.piBinary) out.piBinary = config.piBinary;
+  if (config.awsProfile) out.awsProfile = config.awsProfile;
+  if (config.awsRegion) out.awsRegion = config.awsRegion;
+  if (config.env) out.env = config.env;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
   // write or a concurrent reader never sees a truncated/invalid config.
   const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
@@ -93,6 +96,16 @@ export function describeConfig(config: AdvisorConfig, activeModelLabel?: string)
         : "5 min review / 10 min explore (defaults)",
     ],
     ["pi binary", config.piBinary ?? '"pi" on PATH (or $PI_BINARY)'],
+    ["child AWS profile", config.awsProfile ?? "(host default)"],
+    ["child AWS region", config.awsRegion ? config.awsRegion : "(host default)"],
+    [
+      "child env",
+      config.env
+        ? Object.entries(config.env)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(" ")
+        : "(none)",
+    ],
   ];
   // Retry chain: configured slots in order; no implicit model. The active model is
   // shown only when activeModelFallback is enabled (see buildCandidates).

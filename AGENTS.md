@@ -86,11 +86,13 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   resolution is limited to the copied `models.json` / `models-store.json` / `auth.json`
   — a provider registered only by an extension is not visible to the child. It is a
   privilege boundary, **not** a filesystem sandbox — don't harden it into one, and
-  don't move model turns back into the host process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
-  env extensions for the child belong in issue #8's design, not ad-hoc `env` merges. Because of that allowlist, a model with
-  no `auth.json` entry whose credential is resolved from a *set env var* (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `AWS_PROFILE`/region, …) does not resolve in the child (the var is stripped); ambient *file* credentials found via the
-  inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. Known limitation addressed by #8. The child's
+  don't move model turns back into the host process. The child environment is a minimal allowlist (`childBaseEnv`); child-scoped
+  env extensions go through `buildChildEnv` (the `awsProfile`/`awsRegion`/`env` config keys), never ad-hoc `env` merges, and
+  must never mutate the host `process.env`. `buildChildEnv` is a pure helper in `lib/advisor-utils.ts` (tested). Because of
+  that allowlist, a model with no `auth.json` entry whose credential is resolved from a *set env var* (`OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`, `AWS_PROFILE`/region, …) does not resolve in the child (the var is stripped) unless the user opts the
+  child into it via the child-scoped `env`/`awsProfile`/`awsRegion` config; ambient *file* credentials found via the
+  inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. The child's
   `auth.json` copy has its OAuth refresh token STRIPPED (and is written read-only, transports.ts), so the child can never
   perform a refresh — that is what protects the host's refresh token from server-side rotation (a read-only file copy
   alone would NOT prevent it: a refresh rotates the token on the provider's side before any local write). The access
