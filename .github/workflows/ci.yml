@@ -62,26 +62,18 @@ jobs:
             echo "No non-merge commits since ${last_tag}; nothing to release."
             exit 0
           fi
-          # A previous failed release attempt may have left a stray remote tag
-          # for the version about to be computed; cz bump cannot recreate a tag
-          # that already exists locally. Real release tags are always ancestors
-          # of HEAD, so any non-ancestor tag is stray and safe to drop.
-          for t in $(git tag -l 'v*'); do
-            git merge-base --is-ancestor "$t" HEAD 2>/dev/null || git tag -d "$t" >/dev/null
-          done
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           uv run --with 'commitizen==4.18.*' cz bump --yes
-          # cz created the release commit + tag locally; ship them on a branch
-          # and merge through a PR (direct pushes to main are rejected).
+          # cz created the release commit + tag locally. Ship the COMMIT on a
+          # branch and merge it through a PR (direct pushes to main are
+          # rejected). The tag is published only after the merge: a pushed tag
+          # is installable and must never be moved.
           version=$(git tag --points-at HEAD)
+          head_sha=$(git rev-parse HEAD)
           # force-with-lease: a retried run may already have pushed a stale
           # release/vX.Y.Z branch from an earlier attempt.
           git push --force-with-lease origin "HEAD:refs/heads/release/${version}"
-          # The tag is written only by this job, so a plain force is safe; a
-          # lease would fail with "stale info" because checkout fetches tags
-          # without remote-tracking refs.
-          git push -f origin "refs/tags/${version}"
           # Reuse the release PR if a previous attempt left one open.
           pr_number=$(gh pr list --head "release/${version}" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr_number" ]; then
@@ -91,20 +83,29 @@ jobs:
             pr_number=${pr_url##*/}
           fi
           # The PR's pull_request CI run can take a few minutes to appear and,
-          # for a head pushed by the bot, starts in the "action required" state.
-          # Poll until a check is reported on the PR, approving the run as it
-          # appears (gh has no approve subcommand; use the API).
+          # for a head pushed by the bot, starts in the "action required" state
+          # (reported as status "completed", conclusion "action_required").
+          # Poll until a check is reported on the PR; approve the run for the
+          # exact head commit as it appears (gh has no approve subcommand;
+          # approval errors must fail the job, not be swallowed).
           for i in $(seq 1 20); do
-            run_id=$(gh run list --limit 1 --branch "release/${version}" \
-              --json databaseId,status --jq '.[0] | select(.status != "completed") | .databaseId // empty')
+            run_id=$(gh run list --branch "release/${version}" --limit 5 \
+              --json databaseId,headSha,conclusion --jq \
+              ".[] | select(.headSha == \"${head_sha}\" and .conclusion == \"action_required\") | .databaseId" | head -n 1)
             if [ -n "$run_id" ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" -X POST 2>/dev/null || true
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" -X POST
+              echo "Approved run ${run_id}"
             fi
             if [ "$(gh pr view "$pr_number" --json statusCheckRollup --jq '.statusCheckRollup | length')" != "0" ]; then
               break
             fi
             sleep 15
           done
-          # Wait for the required check, then merge (a PR merge is allowed by protection).
+          # Wait for the required check, then merge (a PR merge is allowed by
+          # protection). --match-head-commit refuses to merge a moved head.
           gh pr checks "$pr_number" --watch
-          gh pr merge "$pr_number" --merge --delete-branch
+          gh pr merge "$pr_number" --merge --delete-branch --match-head-commit "$head_sha"
+          # Publish the tag now that the release commit is merged into main.
+          # Plain push: fails loudly if the tag is published elsewhere, is a
+          # no-op if it already points at this commit (retried run).
+          git push origin "refs/tags/${version}"
