@@ -65,21 +65,23 @@ export function formatTarget(target: AdvisorTarget | undefined): string {
 /**
  * Best-effort pre-refresh of a near-expiry OAuth credential in the host's
  * canonical credential store, so a spawned child (which copies auth.json into a
- * throwaway agent dir) inherits an already-fresh token.
+ * throwaway agent dir) inherits an already-fresh access token.
  *
- * This works together with the child transport, which copies auth.json into the
- * child's agent dir and makes that copy READ-ONLY. The read-only copy is what
- * protects the host: the child can never rotate (and thereby invalidate) the
- * host's refresh token, because it cannot write its own copy. The pre-refresh's
- * job is to keep the copied token *fresh* so the child does not need to refresh
- * at all — pi only refreshes a token within its ~5-minute near-expiry window,
- * and a token that crosses into that window during the child's run would fail
- * its (read-only) refresh attempt and degrade to an auth error, handled by the
- * fallback chain, instead of corrupting the host credential.
+ * This is the freshness half of the child credential protection. The child
+ * transport strips the OAuth refresh token from its auth.json copy (see
+ * `stripRefreshTokens`), so the child can never perform a refresh — which is
+ * what actually protects the host, because a refresh would rotate the token on
+ * the provider's side (invalidating the host's refresh token) before any local
+ * write, which a read-only file copy does not prevent. The pre-refresh's job is
+ * to keep the copied access token *fresh* so the child uses it directly and
+ * never needs to refresh: pi only refreshes a token within its ~5-minute
+ * near-expiry window, and with the refresh token stripped, a token that expires
+ * mid-run just degrades to an auth error (handled by the fallback chain) instead
+ * of rotating the host credential.
  *
  * `ctx.modelRegistry.getProviderAuth` resolves the provider's auth through pi —
  * which refreshes a near-expiry token and persists the rotated credential into
- * the host's real auth.json — so the child copies the fresh token.
+ * the host's real auth.json — so the child copies the fresh access token.
  *
  * Best-effort: never throws. A refresh failure (or a hung refresh that the cap
  * times out) just means the child may report its own auth error and the fallback

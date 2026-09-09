@@ -91,9 +91,11 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   no `auth.json` entry whose credential is resolved from a *set env var* (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `AWS_PROFILE`/region, …) does not resolve in the child (the var is stripped); ambient *file* credentials found via the
   inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. Known limitation addressed by #8. The child's
-  `auth.json` copy is read-only (transports.ts), so it can never rotate (and invalidate) the host's refresh token; tokens
-  are also pre-refreshed in the host first (`preRefreshProviderAuth`) so the child inherits a fresh token it need not
-  refresh. A near-expiry token that a child tries to refresh fails its read-only write and degrades to an auth error.
+  `auth.json` copy has its OAuth refresh token STRIPPED (and is written read-only, transports.ts), so the child can never
+  perform a refresh — that is what protects the host's refresh token from server-side rotation (a read-only file copy
+  alone would NOT prevent it: a refresh rotates the token on the provider's side before any local write). The access
+  token is pre-refreshed in the host first (`preRefreshProviderAuth`) so the child inherits a fresh token it uses
+  directly; a token that expires mid-run degrades to an auth error handled by the fallback chain.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 
 ## Hook setup (fresh clone / CI)

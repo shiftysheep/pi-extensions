@@ -12,7 +12,15 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -30,6 +38,7 @@ import {
   parseNdjsonLine,
   remainingBudgetMs,
   resolvePiBinary,
+  stripRefreshTokens,
 } from "../lib/advisor-utils.js";
 import { ADVISOR_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT } from "./request.js";
 
@@ -162,21 +171,33 @@ export async function consultWithChildProcess(opts: {
     // custom provider/model definitions (models.json, models-store.json) are
     // copied over 0600. Extensions are still not loaded in the child.
     const hostAgentDir = getAgentDir();
-    for (const name of ["auth.json", "models.json", "models-store.json"]) {
+    // Read-only model catalogs (custom providers / overrides): copy 0600 as-is.
+    for (const name of ["models.json", "models-store.json"]) {
       const hostFile = join(hostAgentDir, name);
       if (existsSync(hostFile)) {
         copyFileSync(hostFile, join(workDir, name));
-        // auth.json is the credential store: make the child's copy READ-ONLY so
-        // the child can never rotate (and thereby invalidate) the host's refresh
-        // token. If the copied token turns out to be near-expiry and the child
-        // tries to refresh, the write fails and the model call degrades to an
-        // auth error (handled by the fallback chain) instead of corrupting the
-        // host's canonical credential. The pre-refresh in advisorExecute keeps
-        // the copied token fresh, so the normal case never needs to refresh.
-        // models.json / models-store.json are read-only catalogs anyway (0600).
-        const mode = name === "auth.json" ? 0o400 : 0o600;
-        chmodSync(join(workDir, name), mode);
+        chmodSync(join(workDir, name), 0o600);
       }
+    }
+    // auth.json: the credential store. The child's copy has its OAuth refresh
+    // tokens STRIPPED and is written 0400 (read-only). Stripping the refresh
+    // token is what actually protects the host: a refresh the child performs
+    // would rotate the token on the provider's side (invalidating the host's
+    // refresh token) before any local write, which a read-only file does not
+    // prevent. With no refresh token, the child uses its (pre-refreshed, fresh)
+    // access token directly; if it ever expires mid-run, the child's refresh
+    // fails cleanly and degrades to an auth error handled by the fallback
+    // chain, instead of corrupting the host's canonical credential. The
+    // read-only mode is defense-in-depth (the child can't persist anything).
+    const hostAuth = join(hostAgentDir, "auth.json");
+    if (existsSync(hostAuth)) {
+      writeFileSync(
+        join(workDir, "auth.json"),
+        stripRefreshTokens(readFileSync(hostAuth, "utf8")),
+        {
+          mode: 0o400,
+        },
+      );
     }
 
     const args = buildChildPiArgs({
@@ -260,10 +281,21 @@ export async function consultWithChildProcess(opts: {
     proc.once("error", (error) => (spawnError = error));
     const closePromise = new Promise<void>((resolve) => proc.once("close", () => resolve()));
     // The normal path resolves on "close" (the child exited and its pipe closed).
-    // The backstop resolves shortly after the child exits if "close" is held open
-    // by a descendant; the child's own output is already flushed by then.
+    // The grace backstop resolves shortly after the child exits if "close" is held
+    // open by a descendant; the child's own output is already flushed by then.
     const CLOSE_GRACE_MS = 1_000;
-    await Promise.race([closePromise, groupDead.then(() => delay(CLOSE_GRACE_MS))]);
+    // Independent hard backstop, measured against the absolute deadline: even if
+    // the immediate child is stuck in an uninterruptible (D) state and never
+    // reports "exit"/"close" (so neither the normal path nor the grace backstop
+    // can fire), we still proceed to the (itself bounded) teardown, releasing the
+    // concurrency slot and the credential dir. The normal kill path
+    // (SIGTERM -> SIGKILL -> exit -> grace, ~deadline + 6s) resolves well before
+    // this, so it only matters for an unkillable child.
+    const CLOSE_HARD_BOUND_MS = 10_000;
+    const hardBound = delay(
+      Math.max(0, remainingBudgetMs(opts.deadline + CLOSE_HARD_BOUND_MS, performance.now())),
+    );
+    await Promise.race([closePromise, groupDead.then(() => delay(CLOSE_GRACE_MS)), hardBound]);
     if (spawnError)
       throw new Error(
         `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${spawnError.message}`,

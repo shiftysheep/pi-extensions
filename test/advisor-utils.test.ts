@@ -41,6 +41,7 @@ import {
   resolvePiBinary,
   splitEffortSuffix,
   splitNdjsonLines,
+  stripRefreshTokens,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
   timeoutPrefix,
@@ -1036,6 +1037,45 @@ describe("resolvePiBinary", () => {
     assert.equal(resolvePiBinary(undefined, { PI_BINARY: "/env/pi" }), "/env/pi");
     assert.equal(resolvePiBinary({}, {}), "pi");
     assert.equal(resolvePiBinary({ piBinary: "  " }, {}), "pi");
+  });
+});
+
+describe("stripRefreshTokens", () => {
+  it("removes each provider's refresh token and preserves the other fields", () => {
+    const input = JSON.stringify({
+      "openai-codex": {
+        type: "oauth",
+        access: "at.123",
+        refresh: "rt.456",
+        expires: 1234567890,
+        accountId: "acc",
+      },
+      anthropic: { type: "oauth", access: "at.789", refresh: "rt.012" },
+    });
+    const out = JSON.parse(stripRefreshTokens(input)) as Record<string, Record<string, unknown>>;
+    assert.equal(out["openai-codex"].refresh, undefined);
+    assert.equal(out["openai-codex"].access, "at.123");
+    assert.equal(out["openai-codex"].expires, 1234567890);
+    assert.equal(out["openai-codex"].accountId, "acc");
+    assert.equal(out["openai-codex"].type, "oauth");
+    assert.equal(out.anthropic.refresh, undefined);
+    assert.equal(out.anthropic.access, "at.789");
+    // The input document is not mutated: it still carries the refresh token.
+    const inputAgain = JSON.parse(input) as Record<string, Record<string, unknown>>;
+    assert.equal(inputAgain["openai-codex"].refresh, "rt.456");
+  });
+
+  it("leaves credentials without a refresh field untouched", () => {
+    const input = JSON.stringify({ openai: { type: "api_key", key: "sk-abc" } });
+    const out = JSON.parse(stripRefreshTokens(input)) as Record<string, Record<string, unknown>>;
+    assert.equal(out.openai.key, "sk-abc");
+    assert.equal(out.openai.type, "api_key");
+  });
+
+  it("returns non-object / malformed input unchanged", () => {
+    assert.equal(stripRefreshTokens("not json"), "not json");
+    assert.equal(stripRefreshTokens("[1,2,3]"), "[1,2,3]");
+    assert.equal(stripRefreshTokens(`"just a string"`), `"just a string"`);
   });
 });
 

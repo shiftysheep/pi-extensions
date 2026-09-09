@@ -193,11 +193,10 @@ async function advisorExecute(
     const modelLabel = `${model.provider}/${model.id}`;
     // Best-effort pre-refresh of a near-expiry OAuth credential in the HOST's
     // canonical credential store before the child copies auth.json, so the child
-    // inherits a fresh token it does not need to refresh. The child's auth.json
-    // copy is READ-ONLY (see transports.ts), so the child can never rotate (and
-    // invalidate) the host's refresh token; if the copied token is near-expiry,
-    // the child's refresh attempt fails and degrades to an auth error handled
-    // by the fallback chain. A failure here just lets the child report its own
+    // inherits a fresh access token. The child's auth.json copy has its refresh
+    // token STRIPPED (see transports.ts), so the child can never perform a
+    // refresh — which is what protects the host's refresh token from being
+    // rotated server-side. A failure here just lets the child report its own
     // auth error and fall back.
     await preRefreshProviderAuth(ctx, model.provider);
     // Effort priority: tool-call override > per-model config > global default > medium.

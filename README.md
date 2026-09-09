@@ -108,10 +108,12 @@ are stripped; but ambient **file** credentials discovered through the standard
 `HOME`-relative locations (e.g. a GCP application-default-credentials file, or
 the default `~/.aws` profile) still work, because the child inherits `HOME`. For
 env-var-based models, use `/login` or a stored API key, or see issue #8 for the
-child-scoped environment. The child's `auth.json` copy is **read-only**, so it
-never rotates (and invalidates) the host's refresh token; the token is also
-pre-refreshed in the host first, so a near-expiry `/login` session still works
-and the child rarely needs to refresh. A failed or no-response child run is never reported as a
+child-scoped environment. The child's `auth.json` copy has its OAuth **refresh
+token stripped** (and is read-only), so the child can never perform a token
+refresh — which is what protects the host's refresh token from being rotated
+server-side. The access token is pre-refreshed in the host first, so a
+near-expiry `/login` session still works and the child uses a fresh token. A
+failed or no-response child run is never reported as a
 completed answer — it either degrades to the fallback model or the partial output
 is explicitly marked incomplete.
 

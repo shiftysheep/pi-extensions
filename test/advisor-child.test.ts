@@ -164,32 +164,43 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     assert.equal(result.text, "caf\u00e9 \u2615 ok");
   });
 
-  it("copies the host agent config files into the child work dir 0600, content intact", async () => {
-    const listing = join(process.cwd(), ".advisor-child-test-listing");
+  it("strips OAuth refresh tokens from the child auth.json and copies catalogs read-only", async () => {
     const modes = join(process.cwd(), ".advisor-child-test-modes");
-    const identical = join(process.cwd(), ".advisor-child-test-identical");
-    // The fake pi records the work-dir file list, each file's mode bits, and
-    // whether each copied config file is byte-identical to the host original
-    // (the work dir is removed before the test could read it back).
-    const bin = fakePi(
-      'const fs=require("node:fs");const p=require("node:path");const h=require("node:crypto");const dir=process.env.PI_CODING_AGENT_DIR;const names=fs.readdirSync(dir);' +
-        "fs.writeFileSync(" +
-        JSON.stringify(listing) +
-        ',names.join(" "));' +
-        "fs.writeFileSync(" +
-        JSON.stringify(modes) +
-        ',names.map(n=>n+":"+fs.statSync(p.join(dir,n)).mode.toString(8).slice(-3)).join(" "));' +
-        'const host=p.join(process.env.HOME,".pi","agent");const hash=(f)=>h.createHash("sha256").update(fs.readFileSync(f)).digest("hex");' +
-        'const cfg="auth.json models.json models-store.json".split(" ");' +
-        "fs.writeFileSync(" +
-        JSON.stringify(identical) +
-        ',cfg.filter((n)=>fs.existsSync(p.join(dir,n))&&fs.existsSync(p.join(host,n))).map((n)=>n+":"+(hash(p.join(dir,n))===hash(p.join(host,n))?"same":"diff")).join(" "));' +
-        msgEndScript("ok", { stopReason: "stop" }),
-    );
+    const authRefresh = join(process.cwd(), ".advisor-child-test-authrefresh");
+    // A crafted host agent dir with an OAuth credential that HAS a refresh token,
+    // plus a model catalog. Pointing PI_CODING_AGENT_DIR here lets us control the
+    // source the transport copies from (independent of the real host setup).
+    const hostDir = mkdtempSync(join(tmpdir(), "advisor-host-"));
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = hostDir;
     try {
+      writeFileSync(
+        join(hostDir, "auth.json"),
+        JSON.stringify({
+          "test-provider": {
+            type: "oauth",
+            access: "at.123",
+            refresh: "rt.456",
+            expires: 9999999999999,
+          },
+        }),
+      );
+      writeFileSync(join(hostDir, "models.json"), JSON.stringify({ custom: {} }));
+      // The fake pi records each work-dir file's mode bits and whether the child's
+      // auth.json still carries any provider's refresh token.
+      const bin = fakePi(
+        'const fs=require("node:fs");const p=require("node:path");const dir=process.env.PI_CODING_AGENT_DIR;' +
+          "fs.writeFileSync(" +
+          JSON.stringify(modes) +
+          ',fs.readdirSync(dir).map(n=>n+":"+fs.statSync(p.join(dir,n)).mode.toString(8).slice(-3)).join(" "));' +
+          'const hasRefresh=(f)=>{try{const j=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of Object.keys(j)){const c=j[k];if(c&&typeof c==="object"&&"refresh"in c)return "yes";}return "no";}catch{return "na";}};' +
+          "fs.writeFileSync(" +
+          JSON.stringify(authRefresh) +
+          ',"child:"+hasRefresh(p.join(dir,"auth.json")));' +
+          msgEndScript("ok", { stopReason: "stop" }),
+      );
       const result = await consult(bin);
       assert.equal(result.status, "completed");
-      const files = readFileSync(listing, "utf8").trim().split(/\s+/).filter(Boolean).sort();
       const modeMap = new Map(
         readFileSync(modes, "utf8")
           .trim()
@@ -200,34 +211,22 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
             return [pair.slice(0, i), pair.slice(i + 1)] as const;
           }),
       );
-      const identicalMap = new Map(
-        readFileSync(identical, "utf8")
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean)
-          .map((pair) => {
-            const i = pair.indexOf(":");
-            return [pair.slice(0, i), pair.slice(i + 1)] as const;
-          }),
-      );
-      assert.ok(files.includes("prompt.txt"), `work dir missing prompt.txt: ${files}`);
       assert.equal(modeMap.get("prompt.txt"), "600", "prompt.txt must be 0600");
-      // Each host config file that exists must be copied and byte-identical.
-      // auth.json is 0400 (read-only, so the child can never rotate the host's
-      // refresh token); models.json / models-store.json are 0600 read-only
-      // catalogs.
-      const hostAgentDir = join(process.env.HOME ?? "", ".pi", "agent");
-      for (const name of ["auth.json", "models.json", "models-store.json"]) {
-        if (!existsSync(join(hostAgentDir, name))) continue;
-        assert.ok(files.includes(name), `work dir missing ${name}: ${files}`);
-        const expectedMode = name === "auth.json" ? "400" : "600";
-        assert.equal(modeMap.get(name), expectedMode, `${name} must be 0${expectedMode}`);
-        assert.equal(identicalMap.get(name), "same", `${name} must be byte-identical to host`);
-      }
+      // auth.json: present, 0400 (read-only), and NO refresh token (stripped).
+      assert.equal(modeMap.get("auth.json"), "400", "auth.json must be 0400 (read-only)");
+      assert.equal(
+        readFileSync(authRefresh, "utf8").trim(),
+        "child:no",
+        "the child's auth.json must have no refresh token",
+      );
+      // models.json: present and 0600 (read-only catalog).
+      assert.equal(modeMap.get("models.json"), "600", "models.json must be 0600");
     } finally {
-      rmSync(listing, { force: true });
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(hostDir, { recursive: true, force: true });
       rmSync(modes, { force: true });
-      rmSync(identical, { force: true });
+      rmSync(authRefresh, { force: true });
     }
   });
 

@@ -627,6 +627,41 @@ export function resolvePiBinary(config: { piBinary?: string } | undefined, env: 
 }
 
 /**
+ * Remove OAuth refresh tokens from an auth.json document, so a spawned child
+ * can never perform a token refresh. This is what protects the host's canonical
+ * refresh token: a refresh the child performs would rotate it on the provider's
+ * side (invalidating the host's token) *before* any local persistence, which a
+ * read-only copy of the file does not prevent. With the refresh token stripped,
+ * the child uses its (pre-refreshed, fresh) access token directly; if that
+ * token ever expires mid-run, the child's refresh fails cleanly (no refresh
+ * token to send) and degrades to an auth error handled by the fallback chain,
+ * instead of corrupting the host credential.
+ *
+ * Pure and defensive: returns the input unchanged if it is not a JSON object of
+ * provider -> credential maps; otherwise returns a re-serialized copy with each
+ * credential's `refresh` field removed (all other fields preserved).
+ */
+export function stripRefreshTokens(authJsonText: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(authJsonText);
+  } catch {
+    return authJsonText;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return authJsonText;
+  }
+  const providers = parsed as { [providerId: string]: unknown };
+  for (const id of Object.keys(providers)) {
+    const credential = providers[id];
+    if (typeof credential === "object" && credential !== null && !Array.isArray(credential)) {
+      delete (credential as { [field: string]: unknown }).refresh;
+    }
+  }
+  return JSON.stringify(parsed);
+}
+
+/**
  * Observed state of a finished, not-interrupted child advisor process, for
  * decideChildOutcome. Timeout and abort are handled by the caller before this
  * is reached, so they are not part of the state here.
