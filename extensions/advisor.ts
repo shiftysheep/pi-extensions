@@ -28,8 +28,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  ADVISOR_MAX_MODEL_REQUESTS,
-  ADVISOR_MAX_TOOL_CALLS,
   type AdvisorConfig,
   type AdvisorReasoningEffort,
   type AdvisorTarget,
@@ -220,7 +218,6 @@ function saveConfig(config: AdvisorConfig): void {
   if (config.primary) out.primary = config.primary;
   if (config.fallback) out.fallback = config.fallback;
   if (config.reasoningEffort) out.reasoningEffort = config.reasoningEffort;
-  if (config.exploreBudget) out.exploreBudget = config.exploreBudget;
   if (config.activeModelFallback) out.activeModelFallback = config.activeModelFallback;
   if (config.timeoutMs !== undefined) out.timeoutMs = config.timeoutMs;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
@@ -295,12 +292,6 @@ function describeConfig(config: AdvisorConfig, activeModelLabel?: string): strin
         ? `${config.timeoutMs} ms per consultation, fallback chain included (clamped 30 s..30 min)`
         : "5 min review / 10 min explore (defaults)",
     ],
-    [
-      "explore budget",
-      config.exploreBudget
-        ? `${config.exploreBudget.toolCalls} tool calls / ${config.exploreBudget.modelRequests} model requests`
-        : `${ADVISOR_MAX_TOOL_CALLS} tool calls / ${ADVISOR_MAX_MODEL_REQUESTS} model requests (default)`,
-    ],
   ];
   // Retry chain: configured slots in order; no implicit model. The active model is
   // shown only when activeModelFallback is enabled (see buildCandidates).
@@ -362,7 +353,7 @@ function neutralReasoningEffort(
   return effort;
 }
 
-type AdvisorStatus = "completed" | "timed_out" | "aborted" | "budget_exhausted";
+type AdvisorStatus = "completed" | "timed_out" | "aborted";
 type AdvisorConsultResult = {
   text: string;
   usage?: Usage;
@@ -471,8 +462,8 @@ async function consultWithStreamSimple(opts: {
  * Explore mode: a nested read-only agent session. The advisor model sees the
  * question (plus the redacted transcript only when the caller opted in) and
  * verifies it against the workspace with read/grep/find/ls before answering.
- * Bounded by hard tool-call and model-request caps plus a timeout; exhausting
- * a budget yields an explicit incomplete result.
+ * Bounded by the consultation timeout only — tool-call and model-request
+ * counts are reported (cost visibility) but never abort a consultation.
  */
 async function consultWithAgentSession(opts: {
   model: Model<any>;
@@ -481,8 +472,6 @@ async function consultWithAgentSession(opts: {
   transcript: string;
   effort: AdvisorReasoningEffort;
   cwd: string;
-  maxToolCalls: number;
-  maxModelRequests: number;
   /** Absolute monotonic-clock deadline (performance.now() base) for the whole consultation. */
   deadline: number;
   signal?: AbortSignal;
@@ -514,7 +503,6 @@ async function consultWithAgentSession(opts: {
 
   let toolCalls = 0;
   let modelRequests = 0;
-  let budgetExhausted = false;
   let finalText = "";
   let combinedUsage: Usage | undefined;
   const unsubscribe = session.subscribe((event) => {
@@ -540,11 +528,6 @@ async function consultWithAgentSession(opts: {
         }
       }
       finalText = lastAssistant ? textFromContent(lastAssistant.content).trim() : "";
-    }
-    // Hard spend caps: exhaustion yields an explicit incomplete result, not a verdict.
-    if (toolCalls >= opts.maxToolCalls || modelRequests >= opts.maxModelRequests) {
-      budgetExhausted = true;
-      void session.abort();
     }
   });
 
@@ -582,14 +565,6 @@ async function consultWithAgentSession(opts: {
     return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "timed_out" };
   if (opts.signal?.aborted === true)
     return { text: finalText, usage: combinedUsage, toolCalls, modelRequests, status: "aborted" };
-  if (budgetExhausted)
-    return {
-      text: finalText,
-      usage: combinedUsage,
-      toolCalls,
-      modelRequests,
-      status: "budget_exhausted",
-    };
   return {
     text: finalText || "The advisor returned no text.",
     usage: combinedUsage,
@@ -646,10 +621,6 @@ async function advisorExecute(
       "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
     );
   }
-  const exploreBudget = config.exploreBudget ?? {
-    toolCalls: ADVISOR_MAX_TOOL_CALLS,
-    modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
-  };
   // Timeout priority: per-call > config > mode default (5 min review / 10 min explore),
   // clamped to 30 s..30 min. The budget covers the WHOLE consultation, fallback
   // chain included: every attempt (including its auth/session setup) runs against
@@ -714,8 +685,6 @@ async function advisorExecute(
               transcript,
               effort: selectedEffort,
               cwd: ctx.cwd,
-              maxToolCalls: exploreBudget.toolCalls,
-              maxModelRequests: exploreBudget.modelRequests,
               deadline,
               signal,
               onUpdate: (update) => onUpdate?.(update),
@@ -758,36 +727,19 @@ async function advisorExecute(
           usage: combinedUsage,
         };
       if (result.status === "timed_out") {
+        // A timed-out exploration keeps whatever it produced: a partial answer
+        // from a paid exploration is strictly better than an abort notice.
+        const partial =
+          mode === "explore" && result.text
+            ? `\nPartial output before the timeout (incomplete, not a verdict):\n${capAdviceText(result.text)}`
+            : "";
         const message =
           mode === "explore"
             ? `advisor timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`
             : `advisor request timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`;
-        if (explicit) throw new Error(`${modelLabel}: ${message}`);
-        failures.push(`${candidate.source} (${modelLabel}): ${message}`);
+        if (explicit) throw new Error(`${modelLabel}: ${message}${partial}`);
+        failures.push(`${candidate.source} (${modelLabel}): ${message}${partial}`);
         continue;
-      }
-      if (result.status === "budget_exhausted") {
-        const partial = result.text
-          ? `\nPartial output before the budget was exhausted (incomplete, not a verdict):\n${capAdviceText(result.text)}`
-          : "";
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted")}`,
-            },
-          ],
-          details: {
-            model: modelLabel,
-            source: candidate.source,
-            status: "budget_exhausted",
-            mode,
-            toolCalls: result.toolCalls,
-            modelRequests: result.modelRequests,
-            elapsedMs,
-          },
-          usage: combinedUsage,
-        };
       }
       return {
         content: [
@@ -833,7 +785,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const usageHints =
-    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level, a model slot, or exploreBudget) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, exploreBudget {toolCalls, modelRequests}, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself, hard spend caps; tunable via exploreBudget in advisor.json). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
+    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level or a model slot) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself; bounded by the consultation timeout only — tool-call and model-request counts are reported in the footer for cost visibility but never abort a consultation). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
 
   pi.registerCommand("advisor", {
     description:
@@ -963,7 +915,7 @@ export default function (pi: ExtensionAPI) {
     name: "advisor",
     label: "Advisor",
     description:
-      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor does NOT receive the session transcript by default: cite workspace paths for anything on disk in the question, and paste only evidence that exists nowhere on disk (command output, a test failure, observed runtime behavior). includeSession:true opt-in attaches the redacted transcript as optional, caller-curated context the advisor must verify against the workspace. Mode "review" (default) is a single model call answering from the question — cheap; use it for self-contained questions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) that verifies the question against the workspace itself — use it whenever the answer must come from the source, e.g. any code review or claim about what code does, since the advisor does not see your session. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, reasoning effort ("none".."max"), and a per-call timeoutMs (clamped 30000..1800000; covers the whole consultation, fallback chain included; overrides the config timeoutMs and the mode default of 5 min review / 10 min explore). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json, which is strictly validated (unknown keys are rejected with an error naming the field). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
+      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor does NOT receive the session transcript by default: cite workspace paths for anything on disk in the question, and paste only evidence that exists nowhere on disk (command output, a test failure, observed runtime behavior). includeSession:true opt-in attaches the redacted transcript as optional, caller-curated context the advisor must verify against the workspace. Mode "review" (default) is a single model call answering from the question — cheap; use it for self-contained questions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, bounded by the consultation timeout only; actual tool calls and elapsed time are reported in the footer) that verifies the question against the workspace itself — use it whenever the answer must come from the source, e.g. any code review or claim about what code does, since the advisor does not see your session. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, reasoning effort ("none".."max"), and a per-call timeoutMs (clamped 30000..1800000; covers the whole consultation, fallback chain included; overrides the config timeoutMs and the mode default of 5 min review / 10 min explore). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json, which is strictly validated (unknown keys are rejected with an error naming the field). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
     promptSnippet:
       "Consult a configured Pi model for an independent expert review or design second opinion",
     promptGuidelines: [
@@ -992,7 +944,7 @@ export default function (pi: ExtensionAPI) {
       mode: Type.Optional(
         Type.String({
           description:
-            'Consultation mode. "review" (default): a single model call that answers from the question; cheap, but it cannot read the workspace — use it for self-contained questions. "explore": the advisor runs a read-only agent (read/grep/find/ls) that verifies the question against the workspace itself — use it for code reviews and any answer that must come from the source; bounded by hard tool-call/model-request caps (configurable via exploreBudget in advisor.json) and costs more tokens and time.',
+            'Consultation mode. "review" (default): a single model call that answers from the question; cheap, but it cannot read the workspace — use it for self-contained questions. "explore": the advisor runs a read-only agent (read/grep/find/ls) that verifies the question against the workspace itself — use it for code reviews and any answer that must come from the source; bounded by the consultation timeout only (actual tool calls and elapsed time are reported in the footer) and costs more tokens and time.',
           enum: ["review", "explore"],
         }),
       ),

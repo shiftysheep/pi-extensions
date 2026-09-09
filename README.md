@@ -44,19 +44,16 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
   "primary": { "provider": "<provider-id>", "model": "<model-id>" },
   "fallback": { "provider": "<provider-id>", "model": "<model-id>" },
   "reasoningEffort": "high",
-  "exploreBudget": { "toolCalls": 32, "modelRequests": 16 },
   "activeModelFallback": true,
   "timeoutMs": 600000
 }
 ```
 
-`exploreBudget` (optional) tunes the explore-mode spend caps (positive integers, at most 100 tool calls / 40 model requests); defaults are 24 / 12 when unset.
-
 `activeModelFallback` (optional, default `false`) opts into retrying the session's *active* model as a last resort — a self-review, and the result says so.
 
 `timeoutMs` (optional) sets the consultation timeout in milliseconds, clamped to 30 s–30 min; it covers the whole consultation, fallback chain included (later attempts only get the time left). The per-call `timeoutMs` tool parameter overrides it, and the defaults are 5 min for `review` / 10 min for `explore`.
 
-The file is **strictly validated**: unknown keys (top level, in a model slot, or in `exploreBudget`) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
+The file is **strictly validated**: unknown keys (top level or in a model slot) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
@@ -74,16 +71,16 @@ Two modes:
 - **`review`** (default): a single model call answering from the question.
   Cheap and fast; it identifies missing evidence instead of inspecting the repo.
 - **`explore`**: the advisor runs as a nested *read-only* agent and verifies the
-  question against the workspace itself with `read`, `grep`, `find`, and `ls`. Bounded by hard spend caps
-  (≤24 tool calls, ≤12 model requests by default, tunable via `exploreBudget`, 10-minute
-  timeout); exhausting a budget returns an explicit **incomplete** result, never an
-  authoritative verdict. Use only when the question requires locating code or verifying
-  repository facts.
+  question against the workspace itself with `read`, `grep`, `find`, and `ls`.
+  Bounded by the consultation timeout only — there are no tool-call or model-request
+  caps; a timed-out exploration returns whatever partial output it had, explicitly
+  marked **incomplete**. Actual tool calls and elapsed time are always reported in
+  the status footer for cost visibility. Use when the question requires locating code
+  or verifying repository facts.
 
 Every result text ends with a model-visible status footer (`[advisor: mode=…, model=…,
 status=…, toolCalls=…, elapsed=…s]`); the same envelope plus `model`/`source` is also
-carried in the result `details` for logs and UI (`completed` / `timed_out` / `aborted` /
-`budget_exhausted`). When a later candidate answered after the primary was unavailable
+carried in the result `details` for logs and UI (`completed` / `timed_out` / `aborted`). When a later candidate answered after the primary was unavailable
 the footer adds `fallbackFrom=<first candidate>`; when the answering model is the
 session's active model it adds `independent=false` and a self-review warning.
 Usage is aggregated across all model requests, including every turn of an exploration.

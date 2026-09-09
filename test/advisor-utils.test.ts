@@ -8,8 +8,6 @@ import { describe, it } from "node:test";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
-  ADVISOR_MAX_MODEL_REQUESTS,
-  ADVISOR_MAX_TOOL_CALLS,
   assembleRequestText,
   buildCandidates,
   capAdviceText,
@@ -21,7 +19,6 @@ import {
   MAX_QUESTION_CHARS,
   MAX_TRANSCRIPT_ENTRY_CHARS,
   parseConfig,
-  parseExploreBudget,
   parseTarget,
   REASONING_EFFORTS,
   redactSensitiveText,
@@ -447,56 +444,6 @@ describe("parseTarget", () => {
   });
 });
 
-describe("parseExploreBudget", () => {
-  it("returns undefined when unset", () => {
-    assert.equal(parseExploreBudget(undefined, CONFIG_PATH), undefined);
-  });
-
-  it("fills the missing field with the default", () => {
-    assert.deepEqual(parseExploreBudget({ toolCalls: 10 }, CONFIG_PATH), {
-      toolCalls: 10,
-      modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
-    });
-    assert.deepEqual(parseExploreBudget({ modelRequests: 3 }, CONFIG_PATH), {
-      toolCalls: ADVISOR_MAX_TOOL_CALLS,
-      modelRequests: 3,
-    });
-  });
-
-  it("rejects non-object and empty budgets", () => {
-    assert.throws(
-      () => parseExploreBudget("x", CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget must be an object with toolCalls/modelRequests.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({}, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget requires at least one of toolCalls/modelRequests.`),
-    );
-  });
-
-  it("rejects values that are not positive integers", () => {
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 0 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be a positive integer.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 2.5 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be a positive integer.`),
-    );
-  });
-
-  it("rejects values above the hard ceilings", () => {
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 101 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be at most 100.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({ modelRequests: 41 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.modelRequests must be at most 40.`),
-    );
-  });
-});
-
 describe("parseConfig", () => {
   it("rejects non-object top levels", () => {
     assert.throws(
@@ -516,7 +463,6 @@ describe("parseConfig", () => {
           primary: { provider: "a", model: "m1", effort: "low" },
           fallback: { model: "m2" },
           reasoningEffort: "high",
-          exploreBudget: { toolCalls: 5 },
           activeModelFallback: true,
           timeoutMs: 120_000,
         },
@@ -527,7 +473,6 @@ describe("parseConfig", () => {
         // parseTarget returns explicit undefined keys for absent sub-fields.
         fallback: { provider: undefined, model: "m2", effort: undefined },
         reasoningEffort: "high",
-        exploreBudget: { toolCalls: 5, modelRequests: ADVISOR_MAX_MODEL_REQUESTS },
         activeModelFallback: true,
         timeoutMs: 120_000,
       },
@@ -539,7 +484,6 @@ describe("parseConfig", () => {
     assert.equal(config.primary, undefined);
     assert.equal(config.fallback, undefined);
     assert.equal(config.reasoningEffort, undefined);
-    assert.equal(config.exploreBudget, undefined);
     assert.equal(config.activeModelFallback, undefined);
   });
 
@@ -561,14 +505,17 @@ describe("parseConfig", () => {
     );
   });
 
-  it("rejects unknown keys inside a model slot and exploreBudget", () => {
+  it("rejects unknown keys inside a model slot", () => {
     assert.throws(
       () => parseConfig({ primary: { model: "m", providerd: "a" } }, CONFIG_PATH),
       /primary has unknown key "providerd" \(allowed: provider, model, effort\)/,
     );
+  });
+
+  it("rejects the removed exploreBudget key as an unknown key", () => {
     assert.throws(
-      () => parseConfig({ exploreBudget: { toolCall: 5 } }, CONFIG_PATH),
-      /exploreBudget has unknown key "toolCall" \(allowed: toolCalls, modelRequests\)/,
+      () => parseConfig({ exploreBudget: { toolCalls: 5 } }, CONFIG_PATH),
+      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs\)/,
     );
   });
 

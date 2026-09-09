@@ -17,21 +17,14 @@ export const REASONING_EFFORTS = [
 export type AdvisorReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export const MAX_QUESTION_CHARS = 20_000;
-// Defaults for explore-mode spend caps; tunable per install via advisor.json `exploreBudget`.
-export const ADVISOR_MAX_TOOL_CALLS = 24;
-export const ADVISOR_MAX_MODEL_REQUESTS = 12;
-// Hard ceilings for configured budgets, so a typo can't make an exploration unbounded.
-export const EXPLORE_BUDGET_LIMITS = { toolCalls: 100, modelRequests: 40 } as const;
 const APPROX_CHARS_PER_TOKEN = 3.5;
 const MIN_RESPONSE_RESERVE_TOKENS = 1_024;
 
 export type AdvisorTarget = { provider?: string; model: string; effort?: AdvisorReasoningEffort };
-export type AdvisorExploreBudget = { toolCalls: number; modelRequests: number };
 export type AdvisorConfig = {
   primary?: AdvisorTarget;
   fallback?: AdvisorTarget;
   reasoningEffort?: AdvisorReasoningEffort;
-  exploreBudget?: AdvisorExploreBudget;
   /** Opt in to retrying the caller's active model last (a self-review, disclosed in the result). */
   activeModelFallback?: boolean;
   /** Consultation timeout in milliseconds, clamped to [ADVISOR_MIN_TIMEOUT_MS, ADVISOR_MAX_TIMEOUT_MS]. */
@@ -43,7 +36,6 @@ export const ALLOWED_CONFIG_KEYS = [
   "primary",
   "fallback",
   "reasoningEffort",
-  "exploreBudget",
   "activeModelFallback",
   "timeoutMs",
 ] as const;
@@ -176,43 +168,6 @@ export function parseTarget(
   };
 }
 
-export function parseExploreBudget(
-  value: unknown,
-  configPath: string,
-): AdvisorExploreBudget | undefined {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object")
-    throw new Error(`${configPath}: exploreBudget must be an object with toolCalls/modelRequests.`);
-  const candidate = value as { toolCalls?: unknown; modelRequests?: unknown };
-  const unknownBudgetKeys = Object.keys(candidate).filter(
-    (k) => k !== "toolCalls" && k !== "modelRequests",
-  );
-  if (unknownBudgetKeys.length > 0) {
-    throw new Error(
-      `${configPath}: exploreBudget has unknown key${unknownBudgetKeys.length > 1 ? "s" : ""} ${unknownBudgetKeys.map((k) => `"${k}"`).join(", ")} (allowed: toolCalls, modelRequests).`,
-    );
-  }
-  if (candidate.toolCalls === undefined && candidate.modelRequests === undefined) {
-    throw new Error(
-      `${configPath}: exploreBudget requires at least one of toolCalls/modelRequests.`,
-    );
-  }
-  const parseField = (name: "toolCalls" | "modelRequests", v: unknown, fallback: number) => {
-    if (v === undefined) return fallback;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 1)
-      throw new Error(`${configPath}: exploreBudget.${name} must be a positive integer.`);
-    if (v > EXPLORE_BUDGET_LIMITS[name])
-      throw new Error(
-        `${configPath}: exploreBudget.${name} must be at most ${EXPLORE_BUDGET_LIMITS[name]}.`,
-      );
-    return v;
-  };
-  return {
-    toolCalls: parseField("toolCalls", candidate.toolCalls, ADVISOR_MAX_TOOL_CALLS),
-    modelRequests: parseField("modelRequests", candidate.modelRequests, ADVISOR_MAX_MODEL_REQUESTS),
-  };
-}
-
 /** Parse a fully deserialized advisor config object; throws with an actionable message on invalid fields. */
 export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig {
   if (!parsed || typeof parsed !== "object")
@@ -255,7 +210,6 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
     primary,
     fallback,
     reasoningEffort: config.reasoningEffort,
-    exploreBudget: parseExploreBudget(config.exploreBudget, configPath),
     activeModelFallback: config.activeModelFallback,
     timeoutMs: config.timeoutMs,
   };
