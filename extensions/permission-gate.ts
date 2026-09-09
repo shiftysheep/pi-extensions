@@ -215,32 +215,48 @@ class SandboxSelectPrompt {
 }
 
 /** Select prompt with a dim description on every option. Returns the chosen
- *  item's value (undefined when cancelled). Falls back to ctx.ui.select (plain
- *  labels, no descriptions) in UI modes without ui.custom. */
-function promptSelect(
+ *  item's value (undefined when cancelled). The custom SelectList path is
+ *  TUI-only: RPC mode exposes a callable ui.custom that never invokes the
+ *  factory, so gate on ctx.mode (pi's documented guard for terminal-only UI).
+ *  Other modes fall back to ctx.ui.select (plain labels, no descriptions),
+ *  mapping the returned label back to the item's value. */
+async function promptSelect(
   ctx: ExtensionCommandContext,
   title: string,
   items: SelectItem[],
 ): Promise<string | undefined> {
-  if (typeof ctx.ui.custom !== "function") {
-    return ctx.ui.select(
+  if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
+    const label = await ctx.ui.select(
       title,
       items.map((item) => item.label),
-      { signal: ctx.signal },
+      {
+        signal: ctx.signal,
+      },
     );
+    return items.find((item) => item.label === label)?.value;
   }
   return ctx.ui.custom<string | undefined>((_tui, theme, _keybindings, done) => {
     const prompt = new SandboxSelectPrompt(theme, title, items);
-    let unsubAbort: (() => void) | undefined;
-    if (ctx.signal) {
-      unsubAbort = () => done(undefined);
-      ctx.signal.addEventListener("abort", unsubAbort, { once: true });
-    }
-    prompt.onDone = (value) => {
-      unsubAbort?.();
+    let settled = false;
+    let onAbort: (() => void) | undefined;
+    const finish = (value: string | undefined) => {
+      if (settled) return;
+      settled = true;
+      if (ctx.signal && onAbort) ctx.signal.removeEventListener("abort", onAbort);
       done(value);
     };
-    prompt.dispose = () => unsubAbort?.();
+    if (ctx.signal) {
+      if (ctx.signal.aborted) {
+        finish(undefined);
+      } else {
+        onAbort = () => finish(undefined);
+        ctx.signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+    prompt.onDone = (value) => finish(value);
+    prompt.dispose = () => {
+      if (ctx.signal && onAbort) ctx.signal.removeEventListener("abort", onAbort);
+    };
     return prompt;
   });
 }
@@ -504,14 +520,14 @@ export default function (pi: ExtensionAPI) {
     option: string,
     draft: SandboxConfig,
   ): Promise<Partial<SandboxConfig> | undefined> {
-    if (option.startsWith("enabled")) {
+    if (option === "enabled") {
       const v = await promptSelect(ctx, "Sandbox enabled", [
         { value: "true", label: "true", description: "wrap bash commands in the OS sandbox" },
         { value: "false", label: "false", description: "gate-only — prompts, no OS isolation" },
       ]);
       return v === undefined ? undefined : { enabled: v === "true" };
     }
-    if (option.startsWith("runner")) {
+    if (option === "runner") {
       const v = await promptSelect(
         ctx,
         "Sandbox runner",
@@ -523,21 +539,21 @@ export default function (pi: ExtensionAPI) {
       );
       return v === undefined ? undefined : { runner: v as SandboxRunnerChoice };
     }
-    if (option.startsWith("network")) {
+    if (option === "network") {
       const v = await promptSelect(ctx, "Sandbox network policy", [
         { value: "allow", label: "allow", description: "sandboxed commands can reach the network" },
         { value: "deny", label: "deny", description: "block outbound network (no-op on landlock)" },
       ]);
       return v === undefined ? undefined : { network: v as "allow" | "deny" };
     }
-    if (option.startsWith("home")) {
+    if (option === "home") {
       const v = await promptSelect(ctx, "$HOME access in the sandbox", [
         { value: "ro", label: "ro", description: "$HOME is read-only (default)" },
         { value: "rw", label: "rw", description: "$HOME is writable" },
       ]);
       return v === undefined ? undefined : { home: v as "ro" | "rw" };
     }
-    if (option.startsWith("userCommands")) {
+    if (option === "userCommands") {
       const v = await promptSelect(ctx, "Sandbox user ! commands", [
         { value: "true", label: "true", description: "user ! commands also run sandboxed" },
         {
@@ -581,7 +597,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
       return;
     }
-    const scope: SandboxScope = scopeChoice.startsWith("project") ? "project" : "global";
+    const scope: SandboxScope = scopeChoice === "project" ? "project" : "global";
     if (scope === "project" && !trusted) {
       ctx.ui.notify(
         "Project is not trusted; refusing to write its sandbox config. Trust the project or pick the global scope.",
@@ -606,13 +622,12 @@ export default function (pi: ExtensionAPI) {
         `Sandbox config (${scopeLabel(scope)})`,
         sandboxOptionItems(draft),
       );
-      // The ui.custom path returns the item value ("save"); the plain-select
-      // fallback returns the label ("— save —").
-      if (choice === undefined || choice === "cancel" || choice === "— cancel —") {
+      // promptSelect resolves to the item's value in every UI mode.
+      if (choice === undefined || choice === "cancel") {
         ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
         return;
       }
-      if (choice === "save" || choice === "— save —") break;
+      if (choice === "save") break;
       const edited = await editSandboxOption(ctx, choice, draft);
       if (edited === undefined) {
         ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
