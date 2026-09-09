@@ -23,7 +23,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -94,6 +93,13 @@ export async function consultWithChildProcess(opts: {
   let interruptCause: "timed_out" | "aborted" | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  // Owned, cleared timers for the bounded waits. A bare delay() in a
+  // Promise.race leaves a pending timer that keeps the event loop alive long
+  // after the wait settles (a fast successful consultation would otherwise keep
+  // the host alive until the absolute deadline), so every wait owns its timer
+  // and clears it on settle.
+  let closeGraceTimer: ReturnType<typeof setTimeout> | undefined;
+  let hardBoundTimer: ReturnType<typeof setTimeout> | undefined;
   let stderrTail = "";
   let child: ChildProcess | undefined;
   // The child is spawned in its own process group (detached) so we can signal
@@ -111,6 +117,20 @@ export async function consultWithChildProcess(opts: {
   // that does not depend on pipe closure (a descendant can outlive the pipes).
   let groupDeadResolve: (() => void) | undefined;
   const groupDead = new Promise<void>((resolve) => (groupDeadResolve = resolve));
+  // Resolves when the interrupt-driven hard backstop fires (see startHardBound).
+  // It is a plain promise (not a timer), so it does not keep the event loop
+  // alive; only the timer that resolves it does, and that timer is owned/cleared.
+  let hardBoundResolve: (() => void) | undefined;
+  const hardBound = new Promise<void>((resolve) => (hardBoundResolve = resolve));
+  // Started by the first interrupt (deadline or abort): a fixed margin after the
+  // interrupt, independent of the absolute deadline, so an early abort does not
+  // wait until the original deadline + margin. The margin comfortably exceeds the
+  // SIGTERM->SIGKILL escalation (5s) + the close grace (1s).
+  const HARD_BOUND_AFTER_INTERRUPT_MS = 10_000;
+  const startHardBound = (): void => {
+    if (hardBoundTimer !== undefined) return;
+    hardBoundTimer = setTimeout(() => hardBoundResolve?.(), HARD_BOUND_AFTER_INTERRUPT_MS);
+  };
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (!child || child.pid === undefined) return;
     try {
@@ -138,10 +158,12 @@ export async function consultWithChildProcess(opts: {
   const onDeadline = () => {
     if (interruptCause === undefined) interruptCause = "timed_out";
     killChild();
+    startHardBound();
   };
   const onOuterAbort = () => {
     if (interruptCause === undefined) interruptCause = "aborted";
     killChild();
+    startHardBound();
   };
   // Finish tearing down the group before the consultation returns. On the
   // interrupt path the immediate child may have died to SIGTERM while a
@@ -155,7 +177,24 @@ export async function consultWithChildProcess(opts: {
       killTimer = undefined;
     }
     signalGroup("SIGKILL");
-    await Promise.race([groupDead, delay(10_000).then(() => "cap")]);
+    // Bounded wait on the child dying; the cap timer is owned and cleared on
+    // settle so it cannot keep the event loop alive after the wait finishes.
+    const TEARDOWN_CAP_MS = 10_000;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      let capTimer: ReturnType<typeof setTimeout> | undefined;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        if (capTimer !== undefined) {
+          clearTimeout(capTimer);
+          capTimer = undefined;
+        }
+        resolve();
+      };
+      groupDead.then(settle);
+      capTimer = setTimeout(settle, TEARDOWN_CAP_MS);
+    });
   };
   const acc = new AdvisorEventAccumulator();
   try {
@@ -279,23 +318,36 @@ export async function consultWithChildProcess(opts: {
     // out-of-group descendant would hang the slot and the credential dir.
     let spawnError: Error | undefined;
     proc.once("error", (error) => (spawnError = error));
-    const closePromise = new Promise<void>((resolve) => proc.once("close", () => resolve()));
+    const CLOSE_GRACE_MS = 1_000;
     // The normal path resolves on "close" (the child exited and its pipe closed).
     // The grace backstop resolves shortly after the child exits if "close" is held
     // open by a descendant; the child's own output is already flushed by then.
-    const CLOSE_GRACE_MS = 1_000;
-    // Independent hard backstop, measured against the absolute deadline: even if
-    // the immediate child is stuck in an uninterruptible (D) state and never
-    // reports "exit"/"close" (so neither the normal path nor the grace backstop
-    // can fire), we still proceed to the (itself bounded) teardown, releasing the
-    // concurrency slot and the credential dir. The normal kill path
-    // (SIGTERM -> SIGKILL -> exit -> grace, ~deadline + 6s) resolves well before
-    // this, so it only matters for an unkillable child.
-    const CLOSE_HARD_BOUND_MS = 10_000;
-    const hardBound = delay(
-      Math.max(0, remainingBudgetMs(opts.deadline + CLOSE_HARD_BOUND_MS, performance.now())),
-    );
-    await Promise.race([closePromise, groupDead.then(() => delay(CLOSE_GRACE_MS)), hardBound]);
+    // The hard backstop (started by the first interrupt, see startHardBound)
+    // resolves even if the child is stuck in an uninterruptible state and never
+    // reports exit/close, so the bounded teardown in finally still runs and
+    // releases the slot and the credential dir. All timers are owned and cleared
+    // on settle, so a settled wait cannot keep the event loop alive.
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        if (closeGraceTimer !== undefined) {
+          clearTimeout(closeGraceTimer);
+          closeGraceTimer = undefined;
+        }
+        if (hardBoundTimer !== undefined) {
+          clearTimeout(hardBoundTimer);
+          hardBoundTimer = undefined;
+        }
+        resolve();
+      };
+      proc.once("close", settle);
+      proc.once("exit", () => {
+        if (closeGraceTimer === undefined) closeGraceTimer = setTimeout(settle, CLOSE_GRACE_MS);
+      });
+      hardBound.then(settle);
+    });
     if (spawnError)
       throw new Error(
         `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${spawnError.message}`,
@@ -357,6 +409,15 @@ export async function consultWithChildProcess(opts: {
     }
     if (killTimer !== undefined) clearTimeout(killTimer);
     clearTimeout(timer);
+    // Give up on any still-live child handle: it would otherwise keep the host's
+    // event loop alive. In the normal path the child has already exited (a no-op);
+    // in the unkillable-child path this lets the host exit rather than holding the
+    // slot for a process we cannot signal.
+    try {
+      child?.unref();
+    } catch {
+      /* already gone */
+    }
     opts.signal?.removeEventListener("abort", onOuterAbort);
     rmSync(workDir, { recursive: true, force: true });
   }

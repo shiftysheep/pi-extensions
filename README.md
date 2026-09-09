@@ -112,8 +112,12 @@ child-scoped environment. The child's `auth.json` copy has its OAuth **refresh
 token stripped** (and is read-only), so the child can never perform a token
 refresh — which is what protects the host's refresh token from being rotated
 server-side. The access token is pre-refreshed in the host first, so a
-near-expiry `/login` session still works and the child uses a fresh token. A
-failed or no-response child run is never reported as a
+near-expiry `/login` session still works and the child uses a fresh token.
+Trade-off: if the pre-refresh could not complete and the copied token expires
+mid-run, the child's refresh fails cleanly (no refresh token to send) and the
+consultation degrades to an auth error handled by the fallback chain, rather than
+rotating (and invalidating) the host's refresh token. A failed or no-response
+child run is never reported as a
 completed answer — it either degrades to the fallback model or the partial output
 is explicitly marked incomplete.
 
