@@ -27,6 +27,7 @@ import {
   keepStart,
   MAX_QUESTION_CHARS,
   MAX_TRANSCRIPT_ENTRY_CHARS,
+  NdjsonLineBuffer,
   parseConfig,
   parseNdjsonLine,
   parseTarget,
@@ -1018,11 +1019,11 @@ describe("assembleChildPrompt", () => {
 });
 
 describe("decideChildOutcome", () => {
+  // The caller handles timeout and abort before this is reached, so they are
+  // not part of the state here.
   const base = {
     exitCode: 0,
     signalCode: null,
-    timedOut: false,
-    aborted: false,
     assistantResponse: true,
     stopReason: "stop",
     lastError: undefined,
@@ -1074,27 +1075,76 @@ describe("decideChildOutcome", () => {
     );
   });
 
-  it("marks nonzero-exit partial output as incomplete", () => {
-    const outcome = decideChildOutcome({ ...base, exitCode: 3 });
-    assert.equal(outcome.status, "timed_out");
-    assert.ok(outcome.text.includes("exited abnormally (exit 3)"));
-    assert.ok(outcome.text.includes("incomplete, not a verdict"));
-    assert.ok(outcome.text.includes("advice"));
+  it("throws on an error stop reason even when text was produced", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          stopReason: "error",
+          lastError: "rate limited",
+        }),
+      /rate limited/,
+    );
   });
 
-  it("keeps an error note attached to partial text on an error stop reason", () => {
-    const outcome = decideChildOutcome({
-      ...base,
-      stopReason: "error",
-      lastError: "rate limited",
-    });
-    assert.equal(outcome.status, "completed");
-    assert.ok(outcome.text.includes("reported an error after this output: rate limited"));
+  it("throws on an aborted stop reason", () => {
+    assert.throws(() => decideChildOutcome({ ...base, stopReason: "aborted" }), /aborted/);
   });
 
-  it("falls back to the no-text placeholder when the run produced nothing", () => {
-    const outcome = decideChildOutcome({ ...base, text: "" });
-    assert.equal(outcome.text, "The advisor returned no text.");
+  it("throws on a nonzero exit code, even after a successful-looking turn", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, exitCode: 3 }),
+      /exited abnormally \(exit 3\)/,
+    );
+  });
+
+  it("throws on a nonzero exit code with stderr detail", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, exitCode: 3, stderr: "segfault" }),
+      /segfault/,
+    );
+  });
+
+  it("throws when the run produced no text despite a successful stop", () => {
+    assert.throws(() => decideChildOutcome({ ...base, text: "" }), /returned no text/);
+  });
+});
+
+describe("NdjsonLineBuffer", () => {
+  it("emits each newline-terminated line as it completes", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from("a\nb"), (l) => seen.push(l));
+    buf.write(Buffer.from("\nc\n"), (l) => seen.push(l));
+    assert.deepEqual(seen, ["a", "b", "c"]);
+  });
+
+  it("flushes a final line that has no trailing newline", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from('{"type":"x"}'), (l) => seen.push(l)); // no newline
+    assert.equal(seen.length, 0);
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ['{"type":"x"}']);
+  });
+
+  it("does not emit an empty final fragment on end()", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    buf.write(Buffer.from("a\n"), (l) => seen.push(l));
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ["a"]);
+  });
+
+  it("keeps multibyte characters split across chunks intact", () => {
+    const buf = new NdjsonLineBuffer();
+    const seen: string[] = [];
+    const full = Buffer.from("x\u{1F4A9}\n");
+    // Split inside the 4-byte emoji.
+    buf.write(full.subarray(0, 3), (l) => seen.push(l));
+    buf.write(full.subarray(3), (l) => seen.push(l));
+    buf.end((l) => seen.push(l));
+    assert.deepEqual(seen, ["x\u{1F4A9}"]);
   });
 });
 

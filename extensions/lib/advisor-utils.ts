@@ -5,6 +5,7 @@
  * ExtensionContext) so they can be unit-tested without a live session.
  */
 
+import { StringDecoder } from "node:string_decoder";
 import type { Usage } from "@earendil-works/pi-ai";
 
 export const REASONING_EFFORTS = [
@@ -527,16 +528,29 @@ export class AdvisorEventAccumulator {
         }
       | undefined;
     if (message?.role !== "assistant") return;
+    // Compute every derived value before mutating state, so a malformed usage
+    // object (or content) cannot leave the accumulator half-updated: the
+    // completion signal, stop reason, and final text must stay consistent even
+    // if usage aggregation throws.
+    const stopReason = message.stopReason;
+    const isError = stopReason === "error";
+    const errorMessage = isError ? message.errorMessage || "the model request failed" : undefined;
+    const text = textFromContent(message.content).trim();
+    let usage: Usage | undefined;
+    if (message.usage) {
+      try {
+        usage = addUsage(this.combinedUsage, message.usage);
+      } catch {
+        // A malformed usage object must not corrupt completion tracking.
+      }
+    }
     this.sawAssistant = true;
-    if (message.usage) this.combinedUsage = addUsage(this.combinedUsage, message.usage);
-    if (message.stopReason !== undefined) this.lastStopReason = message.stopReason;
+    if (usage) this.combinedUsage = usage;
+    if (stopReason !== undefined) this.lastStopReason = stopReason;
     // A failed turn records its error; a successful terminal turn clears the
     // history, so a transient error followed by a retry is not mislabeled as
     // "an error after this output".
-    if (message.stopReason === "error")
-      this.lastErrorMessage = message.errorMessage || "the model request failed";
-    else this.lastErrorMessage = undefined;
-    const text = textFromContent(message.content).trim();
+    this.lastErrorMessage = errorMessage;
     this.lastText = text;
     if (text) {
       if (this.findings[this.findings.length - 1] !== text) this.findings.push(text);
@@ -612,14 +626,15 @@ export function resolvePiBinary(config: { piBinary?: string } | undefined, env: 
   return "pi";
 }
 
-/** Observed state of a finished child advisor process, for decideChildOutcome. */
+/**
+ * Observed state of a finished, not-interrupted child advisor process, for
+ * decideChildOutcome. Timeout and abort are handled by the caller before this
+ * is reached, so they are not part of the state here.
+ */
 export type ChildCompletionState = {
   exitCode: number;
   /** Termination signal, if the child died to one. */
   signalCode: string | null;
-  /** True if our own deadline fired (or the caller aborted). */
-  timedOut: boolean;
-  aborted: boolean;
   /** True once at least one assistant message_end event arrived. */
   assistantResponse: boolean;
   /** Stop reason of the last assistant message. */
@@ -632,16 +647,21 @@ export type ChildCompletionState = {
 };
 
 /**
- * Decide how a finished child consultation is reported. pi exits 0 even when
- * the model call failed (the error rides in the assistant message) and even
- * for some startup diagnostics, so exit code alone is not a success signal.
- * Throws for attempts the caller should route to the fallback chain.
+ * Decide how a finished, non-interrupted child consultation is reported.
+ *
+ * pi exits 0 even when the model call failed (the error rides in the assistant
+ * message) and even for some startup diagnostics, so the exit code alone is
+ * not a success signal. Only a run that produced nonempty assistant text and
+ * ended in a successful stop reason is "completed"; every failed, empty,
+ * aborted, or abnormal run throws so the caller routes it to the fallback
+ * model. Deadline timeouts and caller aborts are reported by the caller as
+ * "timed_out" / "aborted" and never reach this function.
  */
 export function decideChildOutcome(state: ChildCompletionState): {
   text: string;
-  status: "completed" | "timed_out";
+  status: "completed";
 } {
-  if (state.signalCode && !state.timedOut && !state.aborted)
+  if (state.signalCode)
     throw new Error(
       `the advisor child process was killed by signal ${state.signalCode} before completing`,
     );
@@ -651,20 +671,45 @@ export function decideChildOutcome(state: ChildCompletionState): {
         state.lastError ||
         `the advisor child process (exit ${state.exitCode}) returned no assistant response`,
     );
-  if (state.stopReason === "error" && !state.text) throw new Error(state.lastError ?? state.stderr);
+  if (state.stopReason === "error") throw new Error(state.lastError ?? state.stderr);
+  if (state.stopReason === "aborted") throw new Error("the advisor model call was aborted");
   if (state.exitCode !== 0)
-    return {
-      text: state.text
-        ? `the advisor child process exited abnormally (exit ${state.exitCode}); the partial output below is incomplete, not a verdict:\n\n${state.text}`
-        : `the advisor child process exited abnormally (exit ${state.exitCode}) without output`,
-      status: "timed_out",
-    };
-  if (state.stopReason === "error")
-    return {
-      text: `${state.text}\n\n(advisor child reported an error after this output: ${state.lastError ?? "unknown error"})`,
-      status: "completed",
-    };
-  return { text: state.text || "The advisor returned no text.", status: "completed" };
+    throw new Error(
+      `the advisor child process exited abnormally (exit ${state.exitCode})` +
+        (state.stderr.trim() ? `: ${state.stderr.trim()}` : ""),
+    );
+  if (!state.text) throw new Error("the advisor returned no text");
+  return { text: state.text, status: "completed" };
+}
+
+/**
+ * Decode a stream of child stdout bytes into NDJSON events. Multibyte
+ * characters can split across chunk boundaries (StringDecoder keeps decoding
+ * consistent), and the final event may not be terminated by a newline —
+ * `end()` flushes the decoder and surfaces any remaining partial line. Pass
+ * an `onLine` callback that never throws; malformed lines are dropped by
+ * `parseNdjsonLine`, never by this buffer.
+ */
+export class NdjsonLineBuffer {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending = "";
+
+  write(chunk: Buffer, onLine: (line: string) => void): void {
+    this.pending += this.decoder.write(chunk);
+    let idx = this.pending.indexOf("\n");
+    while (idx >= 0) {
+      const line = this.pending.slice(0, idx);
+      this.pending = this.pending.slice(idx + 1);
+      onLine(line);
+      idx = this.pending.indexOf("\n");
+    }
+  }
+
+  end(onLine: (line: string) => void): void {
+    this.pending += this.decoder.end();
+    if (this.pending.trim()) onLine(this.pending);
+    this.pending = "";
+  }
 }
 
 /**

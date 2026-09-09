@@ -86,12 +86,17 @@ Any configured Pi model (including custom providers) can be chosen per consultat
 **How a consultation works (ground-truth style):** every consultation runs in an
 *isolated child `pi` process*, never in your session's process. The child gets a
 throwaway agent dir (`mkdtemp`) holding only copies of `auth.json` plus the host's
-model catalog (`models.json`, `models-store.json`, all mode `0600`, so custom
-providers and model overrides resolve identically), receives the prompt as an
+model catalog (`models.json`, `models-store.json`, all mode `0600`, so file-backed
+custom providers and model overrides resolve identically), receives the prompt as an
 `@path` file reference, streams NDJSON events back, and its temp dir is removed on
-every exit path (success, failure, timeout, abort). This is a **privilege boundary,
-not a filesystem sandbox**: the child's read tools still reach anything the OS user
-can read, and the child inherits the user's own credential store so the advisor
+every exit path (success, failure, timeout, abort). The child runs with
+`--no-extensions`, so the child's model resolution is limited to those config
+files: a provider or model that is *only* registered at runtime by an extension
+(not written to `models.json` / `models-store.json`) is not visible to the child
+and its consultation will not resolve it. This is a
+**privilege boundary, not a filesystem sandbox**: the child's read tools still
+reach anything the OS user can read, and the child inherits the user's own
+credential store so the advisor
 model can authenticate. A failed or no-response child run is never reported as a
 completed answer — it either degrades to the fallback model or the partial output
 is explicitly marked incomplete.

@@ -82,9 +82,11 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
 - Advisor consultations run in an **isolated child `pi` process**
   (`extensions/advisor/transports.ts`): throwaway agent dir with a 0600 copy of
   `auth.json`, prompt delivered as an `@path` file, NDJSON events parsed by the
-  shared `AdvisorEventAccumulator`. It is a privilege boundary, **not** a filesystem
-  sandbox — don't harden it into one, and don't move model turns back into the host
-  process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
+  shared `AdvisorEventAccumulator`. The child runs `--no-extensions`, so its model
+  resolution is limited to the copied `models.json` / `models-store.json` / `auth.json`
+  — a provider registered only by an extension is not visible to the child. It is a
+  privilege boundary, **not** a filesystem sandbox — don't harden it into one, and
+  don't move model turns back into the host process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
   env extensions for the child belong in issue #8's design, not ad-hoc `env` merges.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 

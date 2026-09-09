@@ -32,7 +32,6 @@ import {
 } from "./advisor/transports.js";
 import {
   type AdvisorReasoningEffort,
-  type AdvisorTarget,
   addUsage,
   buildCandidates,
   capDiagnosticText,

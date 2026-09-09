@@ -15,7 +15,6 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -26,10 +25,10 @@ import {
   buildChildPiArgs,
   childBaseEnv,
   decideChildOutcome,
+  NdjsonLineBuffer,
   parseNdjsonLine,
   remainingBudgetMs,
   resolvePiBinary,
-  splitNdjsonLines,
 } from "../lib/advisor-utils.js";
 import { ADVISOR_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT } from "./request.js";
 
@@ -79,20 +78,53 @@ export async function consultWithChildProcess(opts: {
   const tools = opts.mode === "explore" ? ADVISOR_TOOLS : [];
   const workDir = mkdtempSync(join(tmpdir(), "pi-advisor-"));
   const promptPath = join(workDir, "prompt.txt");
-  let timedOut = false;
+  // The first interruption cause wins: an abort that is followed by the
+  // deadline firing during the SIGTERM grace period is still reported as an
+  // abort, and vice versa.
+  let interruptCause: "timed_out" | "aborted" | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let stderrTail = "";
   let child: ChildProcess | undefined;
+  // The child is spawned in its own process group (detached) so we can signal
+  // the whole group, not just the immediate PID. A piBinary wrapper (or any
+  // descendant) that inherits the stdio pipes and outlives the immediate
+  // process would otherwise keep the pipes open, delaying "close" and hanging
+  // the consultation, the concurrency slot, and the credential dir.
+  // We gate on "have we signalled yet", NOT on the immediate child being
+  // alive: the child may already have exited (cleanly) while a descendant
+  // still holds the pipes, and the group signal is still required to drain.
+  let groupSignalled = false;
+  const signalGroup = (signal: NodeJS.Signals): void => {
+    if (!child || child.pid === undefined) return;
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        // Already gone.
+      }
+    }
+  };
   const killChild = (): void => {
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
+    if (groupSignalled) return;
+    groupSignalled = true;
+    signalGroup("SIGTERM");
     if (killTimer === undefined)
       killTimer = setTimeout(() => {
-        if (child && (child.exitCode === null || child.signalCode === null)) child.kill("SIGKILL");
+        if (!groupSignalled) return;
+        signalGroup("SIGKILL");
       }, 5_000);
   };
-  const onOuterAbort = () => killChild();
+  const onDeadline = () => {
+    if (interruptCause === undefined) interruptCause = "timed_out";
+    killChild();
+  };
+  const onOuterAbort = () => {
+    if (interruptCause === undefined) interruptCause = "aborted";
+    killChild();
+  };
   const acc = new AdvisorEventAccumulator();
   try {
     writeFileSync(
@@ -133,6 +165,9 @@ export async function consultWithChildProcess(opts: {
       cwd: opts.cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
+      // Own process group, so timeout/abort can signal the whole subtree.
+      // detached does not unref the child; we still await it explicitly.
+      detached: true,
     });
     // stdio: ["ignore","pipe","pipe"] makes both streams non-null pipes.
     child = proc;
@@ -140,18 +175,15 @@ export async function consultWithChildProcess(opts: {
     const stderr = proc.stderr;
     if (!stdout || !stderr) throw new Error("child process streams were not pipes");
 
-    const onDeadline = () => {
-      timedOut = true;
-      killChild();
-    };
     timer = setTimeout(onDeadline, remainingBudgetMs(opts.deadline, performance.now()));
     opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
-    // NDJSON line buffer: events arrive split arbitrarily across chunks, and
-    // multibyte characters can split across chunk boundaries (StringDecoder
-    // keeps decoding consistent). Malformed lines are skipped, never thrown.
-    let buffer = "";
-    const decoder = new StringDecoder("utf8");
+    // Events arrive split arbitrarily across chunks, and multibyte characters
+    // can split across chunk boundaries; the buffer's decoder stays consistent.
+    // The final event may not be newline-terminated, so end() must flush it.
+    // A malformed line or a throwing update callback is skipped, never thrown,
+    // so the host never crashes and the child is never orphaned.
+    const ndjson = new NdjsonLineBuffer();
     const handleLine = (line: string): void => {
       try {
         const parsed = parseNdjsonLine(line);
@@ -176,12 +208,7 @@ export async function consultWithChildProcess(opts: {
         // the host or orphan the child: skip it and keep draining the stream.
       }
     };
-    const handleChunk = (chunk: Buffer): void => {
-      const { lines, rest } = splitNdjsonLines(buffer + decoder.write(chunk));
-      buffer = rest;
-      for (const line of lines) handleLine(line);
-    };
-    stdout.on("data", handleChunk);
+    stdout.on("data", (chunk: Buffer) => ndjson.write(chunk, handleLine));
     stderr.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4_000);
     });
@@ -195,38 +222,32 @@ export async function consultWithChildProcess(opts: {
       throw new Error(
         `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${spawnError.message}`,
       );
-    handleChunk(Buffer.alloc(0)); // flush the decoder tail + the last un-newlined line
+    // stdout has ended by now; flush the decoder tail and the last
+    // (possibly unterminated) line so a final event without a trailing
+    // newline is not silently dropped.
+    ndjson.end(handleLine);
     const exitCode = proc.exitCode ?? -1;
 
-    const interrupted = timedOut || opts.signal?.aborted === true;
-    const text = acc.finalText(interrupted);
-    if (timedOut)
+    if (interruptCause !== undefined) {
+      const interruptedText = acc.finalText(true);
       return {
-        text,
+        text: interruptedText,
         usage: acc.usage,
         toolCalls: acc.toolCalls,
         modelRequests: acc.modelRequests,
-        status: "timed_out",
+        status: interruptCause,
       };
-    if (opts.signal?.aborted === true)
-      return {
-        text,
-        usage: acc.usage,
-        toolCalls: acc.toolCalls,
-        modelRequests: acc.modelRequests,
-        status: "aborted",
-      };
+    }
     // pi exits 0 even for failed or no-response consultations, so the outcome
     // is decided from the observed events, not the exit code.
     const outcome = decideChildOutcome({
       exitCode,
       signalCode: proc.signalCode,
-      timedOut: false,
-      aborted: false,
       assistantResponse: acc.assistantResponse,
       stopReason: acc.stopReason,
       lastError: acc.lastError,
-      text,
+      // Not interrupted on this path, so the final answer is the last text.
+      text: acc.finalText(false),
       stderr: stderrTail,
     });
     return {
