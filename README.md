@@ -10,7 +10,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 |---|---|
 | `advisor.ts` (+ `advisor/` modules) | Consults a separate configured model as an independent second opinion (review, debugging, design). Model choices read from `~/.pi/agent/advisor.json`, manageable via the `/advisor` command. |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps (`+30m` or ISO) and repeating intervals. State is snapshotted into the session, so schedules survive `/reload` (not process exit). No OS-level cron jobs created. |
-| `permission-gate.ts` | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`). Not a security boundary — see the file header. |
+| `permission-gate.ts` (+ `permission-gate/` modules) | Heuristic guard: prompts for confirmation before potentially dangerous bash commands (recursive `rm`, `sudo`/`doas`/`pkexec`, world-writable `chmod`, raw-device `dd`, `mkfs`, power actions). Optionally adds an **OS filesystem sandbox** (bubblewrap / Landlock on Linux, `sandbox-exec` on macOS) that makes the agent's bash commands read-only outside writable roots — opt-in via `~/.pi/agent/sandbox.json`. The gate alone is not a security boundary; the sandbox is an OS-level boundary. See [Configuration](#configuration). |
 | `status-line.ts` | Custom footer with a tok/s estimate while streaming. Pass `undefined` to pi's `setFooter()` to restore the original footer. |
 
 ### Bundled recommended installs (declared as dependencies, resolved by npm at install time)
@@ -191,6 +191,31 @@ Behavior notes:
   them enter the session at all.
 - The config file is written atomically (temp + rename) and validated on read; a broken
   file never blocks explicit `provider`/`model` tool calls, and `/advisor reset` recovers it.
+
+### permission-gate / sandbox
+
+The heuristic gate is always on. The **filesystem sandbox** is opt-in: create `~/.pi/agent/sandbox.json` with `"enabled": true` (absent file = disabled, behavior identical to the gate alone).
+
+```json
+{
+  "enabled": true,
+  "runner": "auto",
+  "writable": ["~/scratch"],
+  "home": "ro",
+  "network": "allow",
+  "userCommands": false
+}
+```
+
+- `runner` — `auto` (default), `bwrap`, `landlock`, `sandbox-exec`, or `none`. On Linux, `auto` prefers **bubblewrap** (user/pid namespaces, can also deny the network) and falls back to the **Landlock** helper — a tiny C program (`extensions/permission-gate/landlock-helper.c`) compiled on first use with `cc` to `~/.cache/pi-extensions/pi-sandbox-landlock`. On macOS only `sandbox-exec` (Seatbelt) is available; that profile is untested on this machine — validate it on a real Mac before relying on it.
+- `writable` — extra writable paths (leading `~` expands; relative = cwd-relative; non-existent paths fall back to their deepest existing ancestor). The workspace (cwd), `/tmp`, `/dev`, and `/proc` are always writable; everything else — **including `$HOME`** — is read-only unless listed.
+- `home` — `"ro"` (default) or `"rw"` for `$HOME`.
+- `network` — `"allow"` (default) or `"deny"`. Enforced by bwrap (`--unshare-net`) and seatbelt; a **no-op with a warning on landlock** (Landlock cannot restrict networks).
+- `userCommands` — `true` also sandboxes user `!` commands (they normally bypass the agent's tool pipeline entirely).
+
+While the sandbox is active, the gate's *filesystem* rules (recursive `rm`, world-writable `chmod`) are suppressed — the kernel enforces them instead — while *system* rules (privilege escalation, `dd of=/dev/…` to raw devices, `mkfs`, `shutdown`/`reboot`/`poweroff`/`halt`) stay armed. `write`/`edit` tool calls target a path directly (no shell), so they get a separate guard: paths outside the writable roots prompt for confirmation. If no runner is available at session start (no bwrap + no Landlock kernel/compiler, or a broken bwrap — e.g. AppArmor `restrict_unprivileged_userns` on some Ubuntu setups), the extension warns, runs commands **unsandboxed**, and re-arms all gate rules.
+
+The sandbox is a mistake/runaway-command boundary, not a security boundary against malicious code: it isolates the filesystem only, landlock cannot block the network, and the landlock helper's `PR_SET_NO_PRIVS` only stops setuid escalation. `/sandbox` prints the live status (runner, writable roots, network policy, fallback reason).
 
 ## Develop
 
