@@ -58,11 +58,16 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
 Releases are git tags; installs pin the tag:
 `pi install git:github.com/shiftysheep/pi-extensions@vX.Y.Z`
 
-To cut a release, run **`cz bump --increment PATCH|MINOR|MAJOR`** (Python
-commitizen, config in `.cz.toml`). It bumps the version in `package.json`,
-`package-lock.json`, the README install line, and `.cz.toml` itself, makes a
-`chore(release): vX.Y.Z` commit, and creates the `vX.Y.Z` tag. Then
-`git push --follow-tags`. Use `cz bump --dry-run` to preview.
+Releases are **automatic**: the `release` job in `.github/workflows/ci.yml`
+runs after `check` on merge to `main`, runs `cz bump --yes` (Python
+commitizen, config in `.cz.toml`), and pushes the `chore(release): vX.Y.Z`
+commit + `vX.Y.Z` tag. The increment is inferred from the conventional
+commits since the last tag: `feat` → minor, `fix`/`chore` → patch,
+`BREAKING CHANGE` → major. It bumps the version in `package.json`,
+`package-lock.json`, the README install line, and `.cz.toml` itself. Do NOT
+run `cz bump` manually in a PR — CI bumps on merge, and a manual bump inside
+the PR would trigger a second bump on top. Use `cz bump --dry-run` to
+preview what the next merge will release.
 
 Note: npm's `cz` (`npm run commit`) is only the interactive commit-message
 wizard; release bumps always go through Python commitizen's `cz bump`.
