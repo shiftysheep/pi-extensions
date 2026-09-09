@@ -16,6 +16,7 @@ import {
   capAdviceText,
   capDiagnosticText,
   capTranscriptEntries,
+  composeAdviceText,
   createConcurrencyLimiter,
   keepEnd,
   keepStart,
@@ -858,6 +859,28 @@ describe("AdvisorEventAccumulator", () => {
     acc.record({ type: "message_end", message: assistantMsg("answer") });
     assert.equal(acc.finalText(false), "answer");
     assert.equal(acc.finalText(true), "answer");
+  });
+
+  it("interrupted output includes every finding, completed only the last", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "message_end", message: assistantMsg("finding A") });
+    acc.record({ type: "message_end", message: assistantMsg("finding B") });
+    assert.equal(acc.finalText(true), "finding A\n\nfinding B");
+    assert.equal(acc.finalText(false), "finding B");
+  });
+});
+
+describe("composeAdviceText", () => {
+  it("keeps long partial output through the advice cap with the truncation marker", () => {
+    const long = `partial output\n${"x".repeat(ADVISOR_MAX_ADVICE_CHARS + 1_000)}`;
+    const text = composeAdviceText(timeoutPrefix("explore", 60_000, long), long, "FOOTER");
+    assert.ok(text.includes("advisor timed out after 60 seconds (incomplete)"));
+    assert.ok(text.includes("[truncated: "));
+    assert.ok(text.endsWith("FOOTER"));
+  });
+
+  it("renders completed results without a prefix", () => {
+    assert.equal(composeAdviceText("", "advice", "FOOTER"), "adviceFOOTER");
   });
 });
 

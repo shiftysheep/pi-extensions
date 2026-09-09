@@ -526,6 +526,11 @@ export class AdvisorEventAccumulator {
   }
 }
 
+/** Render a terminal result's text: optional prefix + advice-capped body + status footer. */
+export function composeAdviceText(prefix: string, text: string, footer: string): string {
+  return `${prefix}${capAdviceText(text)}${footer}`;
+}
+
 /**
  * Prefix for a timed-out consultation's terminal result: the incomplete marker
  * plus the partial output the caller still produced (advice-cap applied by the

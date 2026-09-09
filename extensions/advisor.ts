@@ -35,9 +35,9 @@ import {
   addUsage,
   assembleRequestText,
   buildCandidates,
-  capAdviceText,
   capDiagnosticText,
   capTranscriptEntries,
+  composeAdviceText,
   createConcurrencyLimiter,
   isReasoningEffort,
   keepEnd,
@@ -571,12 +571,7 @@ function buildResult(
   usage: Usage | undefined,
 ): AgentToolResult<Record<string, unknown>> {
   return {
-    content: [
-      {
-        type: "text",
-        text: `${prefix}${capAdviceText(result.text)}${statusFooter(status)}`,
-      },
-    ],
+    content: [{ type: "text", text: composeAdviceText(prefix, result.text, statusFooter(status)) }],
     details: {
       model: modelLabel,
       source,
