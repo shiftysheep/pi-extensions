@@ -110,7 +110,9 @@ pre-commit install && pre-commit install -t commit-msg   # or: npm run precommit
 
 - `main` is branch-protected on GitHub (PRs required, CI status check `check`
   required, enforced for admins) — direct pushes are rejected server-side.
-- The `block-main` pre-commit hook enforces the same rule locally:
-  commits on `main` fail with a hint to run `git switch -c <type>/<short-desc>`.
+- The `no-commit-to-branch` pre-commit hook (from
+  [pre-commit-hooks](https://github.com/pre-commit/pre-commit-hooks), configured
+  for `main`) enforces the same rule locally: commits on `main` fail — run
+  `git switch -c <type>/<short-desc>` and commit there instead.
 - CI runs `npm run check` (biome + tsc) on every PR and push to `main` via
   `.github/workflows/ci.yml`.
