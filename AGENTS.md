@@ -87,7 +87,10 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   — a provider registered only by an extension is not visible to the child. It is a
   privilege boundary, **not** a filesystem sandbox — don't harden it into one, and
   don't move model turns back into the host process. The child environment is a minimal allowlist (`childBaseEnv`); per-call
-  env extensions for the child belong in issue #8's design, not ad-hoc `env` merges.
+  env extensions for the child belong in issue #8's design, not ad-hoc `env` merges. Because of that allowlist, a model
+  authenticated *purely via ambient env vars* (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_PROFILE`/region) that has
+  no `auth.json` entry will not resolve in the child — a known limitation addressed by #8; OAuth tokens are pre-refreshed
+  into the host `auth.json` before the child copies it (`preRefreshProviderAuth`), so `/login` sessions still work.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 
 ## Hook setup (fresh clone / CI)

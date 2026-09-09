@@ -3,6 +3,7 @@
  * the interactive picker, and target formatting.
  */
 
+import { setTimeout as delay } from "node:timers/promises";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -60,6 +61,41 @@ export function formatTarget(target: AdvisorTarget | undefined): string {
   if (!target) return "(unset)";
   const suffix = target.effort ? `@${target.effort}` : "";
   return `${target.provider ?? "*"}/${target.model}${suffix}`;
+}
+/**
+ * Refresh a near-expiry OAuth credential in the host's canonical credential
+ * store so a spawned child (which copies auth.json into a throwaway agent dir)
+ * inherits an already-fresh token and never refreshes on its own copy. The
+ * child's copy is deleted when it exits, so a refresh it performs on its own
+ * would rotate the token in a store that is then discarded, leaving the host
+ * with an invalidated refresh token (for rotating/single-use refresh tokens).
+ *
+ * `ctx.modelRegistry.getProviderAuth` resolves the provider's auth through pi
+ * — which refreshes a near-expiry token and persists the rotated credential
+ * into the host's real auth.json — so the child copies the fresh token.
+ *
+ * Best-effort: never throws. A refresh failure just means the child reports
+ * its own auth error and the fallback chain handles it; we must not block a
+ * consultation because a proactive refresh could not complete. API-key
+ * providers (no OAuth) are a fast no-op.
+ */
+export async function preRefreshProviderAuth(
+  ctx: ExtensionContext,
+  providerId: string,
+): Promise<void> {
+  try {
+    const provider = ctx.modelRegistry.getProvider(providerId);
+    if (!provider?.auth?.oauth) return; // API-key / env provider: nothing to refresh.
+    // Cap the wait: a refresh is a short network call, but a hung refresh must
+    // not stall the consultation past its own deadline budget.
+    await Promise.race([
+      ctx.modelRegistry.getProviderAuth(providerId),
+      new Promise((resolve) => delay(15_000).then(() => resolve("timeout"))),
+    ]);
+  } catch {
+    // Intentionally swallowed: the child will surface a real auth error if the
+    // token is actually unusable, and the fallback chain already handles that.
+  }
 }
 export async function pickModel(
   ctx: ExtensionContext,

@@ -15,6 +15,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -95,6 +96,12 @@ export async function consultWithChildProcess(opts: {
   // alive: the child may already have exited (cleanly) while a descendant
   // still holds the pipes, and the group signal is still required to drain.
   let groupSignalled = false;
+  let groupKillScheduled = false;
+  // Resolves when the immediate child process dies. A SIGKILL to the process
+  // group kills the child, so this is a reliable "group teardown issued" hook
+  // that does not depend on pipe closure (a descendant can outlive the pipes).
+  let groupDeadResolve: (() => void) | undefined;
+  const groupDead = new Promise<void>((resolve) => (groupDeadResolve = resolve));
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (!child || child.pid === undefined) return;
     try {
@@ -111,6 +118,8 @@ export async function consultWithChildProcess(opts: {
     if (groupSignalled) return;
     groupSignalled = true;
     signalGroup("SIGTERM");
+    if (groupKillScheduled) return;
+    groupKillScheduled = true;
     if (killTimer === undefined)
       killTimer = setTimeout(() => {
         if (!groupSignalled) return;
@@ -124,6 +133,20 @@ export async function consultWithChildProcess(opts: {
   const onOuterAbort = () => {
     if (interruptCause === undefined) interruptCause = "aborted";
     killChild();
+  };
+  // Finish tearing down the group before the consultation returns. On the
+  // interrupt path the immediate child may have died to SIGTERM while a
+  // descendant still lives (e.g. a piBinary wrapper that spawned a
+  // SIGTERM-ignoring child and detached the pipes): "close" then fires even
+  // though the group is not gone. Escalate to SIGKILL and await the child
+  // dying, bounded by a hard cap so a wedged process can never hang the slot.
+  const awaitGroupTearDown = async (): Promise<void> => {
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+    signalGroup("SIGKILL");
+    await Promise.race([groupDead, delay(10_000).then(() => "cap")]);
   };
   const acc = new AdvisorEventAccumulator();
   try {
@@ -171,6 +194,9 @@ export async function consultWithChildProcess(opts: {
     });
     // stdio: ["ignore","pipe","pipe"] makes both streams non-null pipes.
     child = proc;
+    // "exit" (not "close") fires when the immediate child dies, which is what
+    // the group-teardown await keys on — a SIGKILL to the group always kills it.
+    proc.once("exit", () => groupDeadResolve?.());
     const stdout = proc.stdout;
     const stderr = proc.stderr;
     if (!stdout || !stderr) throw new Error("child process streams were not pipes");
@@ -229,6 +255,9 @@ export async function consultWithChildProcess(opts: {
     const exitCode = proc.exitCode ?? -1;
 
     if (interruptCause !== undefined) {
+      // Guarantee the group is actually dead before returning, so a
+      // SIGTERM-ignoring descendant does not survive the timeout/abort.
+      await awaitGroupTearDown();
       const interruptedText = acc.finalText(true);
       return {
         text: interruptedText,

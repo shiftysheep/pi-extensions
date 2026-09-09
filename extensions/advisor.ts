@@ -23,7 +23,13 @@ import {
   saveConfig,
   saveConfigValidated,
 } from "./advisor/config.js";
-import { type AdvisorSlot, findModel, pickModel, resolveSpec } from "./advisor/models.js";
+import {
+  type AdvisorSlot,
+  findModel,
+  pickModel,
+  preRefreshProviderAuth,
+  resolveSpec,
+} from "./advisor/models.js";
 import { sessionTranscript } from "./advisor/request.js";
 import {
   type AdvisorConsultResult,
@@ -185,6 +191,16 @@ async function advisorExecute(
     }
 
     const modelLabel = `${model.provider}/${model.id}`;
+    // Pre-refresh a near-expiry OAuth credential in the HOST's canonical
+    // credential store before the child copies auth.json. The child runs in an
+    // isolated agent dir, so a refresh it performs on its own copy is deleted
+    // with the temp dir and the host is left with the pre-rotation refresh
+    // token — which, for rotating/single-use refresh tokens, is now invalid.
+    // Refreshing here (into the real auth.json) means the child copies an
+    // already-fresh token and never refreshes on its own, so the host and the
+    // child never race on the same refresh token. Best-effort: a failure here
+    // just lets the child report its own auth error and the chain falls back.
+    await preRefreshProviderAuth(ctx, model.provider);
     // Effort priority: tool-call override > per-model config > global default > medium.
     const selectedEffort =
       (params.effort as AdvisorReasoningEffort | undefined) ??

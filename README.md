@@ -97,7 +97,16 @@ and its consultation will not resolve it. This is a
 **privilege boundary, not a filesystem sandbox**: the child's read tools still
 reach anything the OS user can read, and the child inherits the user's own
 credential store so the advisor
-model can authenticate. A failed or no-response child run is never reported as a
+model can authenticate. The child runs with a **minimal environment allowlist**
+(`childBaseEnv`: `PATH`, `HOME`, `TMPDIR`, `USER`, `SHELL`, locale and `XDG_*`)
+— it gets the file-backed credential store (`auth.json`) but *not* ambient shell
+credentials. So a model authenticated purely via environment variables
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_PROFILE`/`AWS_REGION`, a GCP ADC
+file, …) that has **no entry in `auth.json`** will not resolve in the child:
+use `/login` or a stored API key for such models, or see issue #8 for the
+child-scoped environment. OAuth tokens are pre-refreshed into the host's
+`auth.json` before the child copies it, so a near-expiry `/login` session still
+works. A failed or no-response child run is never reported as a
 completed answer — it either degrades to the fallback model or the partial output
 is explicitly marked incomplete.
 

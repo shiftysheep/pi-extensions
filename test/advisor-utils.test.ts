@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { preRefreshProviderAuth } from "../extensions/advisor/models.js";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
@@ -696,6 +698,56 @@ describe("remainingBudgetMs", () => {
   });
 });
 
+describe("preRefreshProviderAuth", () => {
+  // Minimal fake: only the modelRegistry surface the helper touches.
+  function fakeCtx(provider: { auth?: { oauth?: unknown; apiKey?: unknown } } | undefined): {
+    ctx: ExtensionContext;
+    count: () => number;
+  } {
+    let n = 0;
+    const ctx = {
+      modelRegistry: {
+        getProvider: () => provider,
+        getProviderAuth: async () => {
+          n += 1;
+          return { auth: { headers: {} }, source: "OAuth" };
+        },
+      },
+    } as unknown as ExtensionContext;
+    return { ctx, count: () => n };
+  }
+
+  it("is a no-op for providers without OAuth (api-key / env)", async () => {
+    const { ctx, count } = fakeCtx({ auth: { apiKey: { resolve: async () => "" } } });
+    await preRefreshProviderAuth(ctx, "anthropic");
+    assert.equal(count(), 0);
+  });
+
+  it("is a no-op when the provider is unknown", async () => {
+    const { ctx, count } = fakeCtx(undefined);
+    await preRefreshProviderAuth(ctx, "nope");
+    assert.equal(count(), 0);
+  });
+
+  it("refreshes through the canonical store for OAuth providers", async () => {
+    const { ctx, count } = fakeCtx({ auth: { oauth: { refresh: async () => ({}) } } });
+    await preRefreshProviderAuth(ctx, "openai-codex");
+    assert.equal(count(), 1);
+  });
+
+  it("swallows a refresh failure (the child reports its own auth error)", async () => {
+    const ctx = {
+      modelRegistry: {
+        getProvider: () => ({ auth: { oauth: { refresh: async () => ({}) } } }),
+        getProviderAuth: async () => {
+          throw new Error("refresh exploded");
+        },
+      },
+    } as unknown as ExtensionContext;
+    await preRefreshProviderAuth(ctx, "openai-codex"); // must not throw
+    assert.equal(true, true);
+  });
+});
 function abortedSignal(): AbortSignal {
   const controller = new AbortController();
   controller.abort();
@@ -1089,6 +1141,32 @@ describe("decideChildOutcome", () => {
 
   it("throws on an aborted stop reason", () => {
     assert.throws(() => decideChildOutcome({ ...base, stopReason: "aborted" }), /aborted/);
+  });
+
+  it("throws on a token-truncated (length) stop reason, even with nonempty text", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "length", text: "partial advi" }),
+      /stopReason "length"/,
+    );
+  });
+
+  it("throws on a deferred stop reason (unresolved answer)", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "deferred" }),
+      /stopReason "deferred"/,
+    );
+  });
+
+  it("throws when no stop reason is recorded (a real finished turn always has one)", () => {
+    const { stopReason: _omitted, ...noStop } = base;
+    assert.throws(() => decideChildOutcome(noStop), /ended without a stop reason/);
+  });
+
+  it("throws on a toolUse stop reason (cut off for a tool call, not a final answer)", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, stopReason: "toolUse" }),
+      /stopReason "toolUse"/,
+    );
   });
 
   it("throws on a nonzero exit code, even after a successful-looking turn", () => {

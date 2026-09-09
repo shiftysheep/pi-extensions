@@ -673,6 +673,19 @@ export function decideChildOutcome(state: ChildCompletionState): {
     );
   if (state.stopReason === "error") throw new Error(state.lastError ?? state.stderr);
   if (state.stopReason === "aborted") throw new Error("the advisor model call was aborted");
+  // Only a clean "stop" is a completed answer. A response truncated at the
+  // token limit ("length"), cut off for a tool call ("toolUse"), a still
+  // unresolved deferred call ("deferred"), a pending turn, or a missing stop
+  // reason is an incomplete/abnormal run — route it to the fallback model
+  // rather than reporting partial advice as a completed answer. (pi's
+  // AssistantMessage.stopReason is required, so a real finished turn always
+  // carries "stop"; anything else means the run did not actually complete.)
+  if (state.stopReason !== "stop")
+    throw new Error(
+      state.stopReason === undefined
+        ? "the advisor model call ended without a stop reason"
+        : `the advisor model call ended with stopReason "${state.stopReason}" (incomplete answer)`,
+    );
   if (state.exitCode !== 0)
     throw new Error(
       `the advisor child process exited abnormally (exit ${state.exitCode})` +

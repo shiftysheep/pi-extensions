@@ -325,6 +325,57 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     assert.deepEqual(workDirs(), before, "work dir must be removed after group teardown");
   });
 
+  it("kills a SIGTERM-ignoring descendant with detached stdio on timeout", async () => {
+    const before = workDirs();
+    const dir = mkdtempSync(join(tmpdir(), "pi-advisor-fake-"));
+    fakeDirs.push(dir);
+    const marker = join(dir, "survived");
+    // The descendant detaches stdio ("ignore") so it does NOT hold the pipes, and
+    // ignores SIGTERM; if it is still alive ~1s after spawn it writes a marker.
+    // The immediate pi forks it and then stays alive, so the (400ms) deadline
+    // fires while the immediate child is running. When the immediate child dies
+    // and "close" fires, the descendant still lives — the transport must not rely
+    // on pipe closure but escalate the group to SIGKILL (the only thing that kills
+    // a SIGTERM-ignoring process).
+    writeFileSync(
+      join(dir, "desc.js"),
+      "process.on('SIGTERM',()=>{});\n" +
+        `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),1000);\n` +
+        "setInterval(()=>{},50);\n",
+    );
+    const bin = join(dir, "pi");
+    writeFileSync(
+      bin,
+      "#!/usr/bin/env node\n" +
+        "require('node:child_process').spawn(process.execPath,[" +
+        JSON.stringify(join(dir, "desc.js")) +
+        "],{stdio:'ignore'});\n" +
+        "setTimeout(()=>{},120000);\n",
+    );
+    chmodSync(bin, 0o755);
+    const result = await consultWithChildProcess({
+      model: MODEL,
+      modelLabel: "fake/fake-model",
+      question: "q",
+      transcript: "",
+      effort: "low",
+      cwd: process.cwd(),
+      mode: "review",
+      deadline: performance.now() + 400,
+      config: { piBinary: bin },
+    });
+    assert.equal(result.status, "timed_out");
+    // Wait past the descendant's 1s "still alive" window; if group teardown
+    // failed to SIGKILL it, it would have written the marker.
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    assert.equal(
+      existsSync(marker),
+      false,
+      "the SIGTERM-ignoring descendant must be killed by group teardown",
+    );
+    assert.deepEqual(workDirs(), before, "work dir must be removed after group teardown");
+  });
+
   it("survives a throwing update callback without orphaning the child", async () => {
     const before = workDirs();
     // Explore mode emits tool_execution_start events that trigger onUpdate.
