@@ -43,6 +43,7 @@ import {
   parseConfig,
   REASONING_EFFORTS,
   redactSensitiveText,
+  resolveConsultTimeoutMs,
   splitEffortSuffix,
   textFromContent,
 } from "./lib/advisor-utils.js";
@@ -50,8 +51,6 @@ import {
 const CONFIG_PATH = join(getAgentDir(), "advisor.json");
 const MAX_SESSION_CONTEXT_CHARS = 120_000;
 const ADVISOR_TOOLS = ["read", "grep", "find", "ls"];
-const ADVISOR_REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
-const ADVISOR_EXPLORE_TIMEOUT_MS = 10 * 60 * 1000;
 /** Cap on concurrent advisor consultations (each is a whole agent session); excess calls queue. */
 const ADVISOR_MAX_CONCURRENT = 2;
 
@@ -186,6 +185,7 @@ function saveConfig(config: AdvisorConfig): void {
   if (config.reasoningEffort) out.reasoningEffort = config.reasoningEffort;
   if (config.exploreBudget) out.exploreBudget = config.exploreBudget;
   if (config.activeModelFallback) out.activeModelFallback = config.activeModelFallback;
+  if (config.timeoutMs !== undefined) out.timeoutMs = config.timeoutMs;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
   // write or a concurrent reader never sees a truncated/invalid config.
   const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
@@ -251,6 +251,12 @@ function describeConfig(config: AdvisorConfig, activeModelLabel?: string): strin
     [
       "active model fallback",
       config.activeModelFallback ? "enabled (self-review, last resort)" : "disabled",
+    ],
+    [
+      "timeout",
+      config.timeoutMs !== undefined
+        ? `${config.timeoutMs} ms per call (clamped 30 s..30 min)`
+        : "5 min review / 10 min explore (defaults)",
     ],
     [
       "explore budget",
@@ -339,6 +345,7 @@ async function consultWithStreamSimple(opts: {
   transcript: string;
   effort: AdvisorReasoningEffort;
   ctx: ExtensionContext;
+  timeoutMs: number;
   signal?: AbortSignal;
 }): Promise<AdvisorConsultResult> {
   const { model, ctx } = opts;
@@ -368,7 +375,7 @@ async function consultWithStreamSimple(opts: {
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, ADVISOR_REVIEW_TIMEOUT_MS);
+  }, opts.timeoutMs);
   const onOuterAbort = () => controller.abort();
   opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
   try {
@@ -431,6 +438,7 @@ async function consultWithAgentSession(opts: {
   cwd: string;
   maxToolCalls: number;
   maxModelRequests: number;
+  timeoutMs: number;
   signal?: AbortSignal;
   onUpdate?: (update: {
     content: Array<{ type: "text"; text: string }>;
@@ -498,7 +506,7 @@ async function consultWithAgentSession(opts: {
   const timer = setTimeout(() => {
     timedOut = true;
     void session.abort();
-  }, ADVISOR_EXPLORE_TIMEOUT_MS);
+  }, opts.timeoutMs);
   const onOuterAbort = () => {
     void session.abort();
   };
@@ -546,6 +554,7 @@ async function advisorExecute(
     mode?: string;
     effort?: string;
     includeSession?: boolean;
+    timeoutMs?: number;
   },
   signal: AbortSignal | undefined,
   onUpdate: AgentToolUpdateCallback | undefined,
@@ -559,6 +568,16 @@ async function advisorExecute(
   const mode = params.mode ?? "review";
   if (mode !== "review" && mode !== "explore") {
     throw new Error(`Invalid advisor mode "${mode}". Expected "review" or "explore".`);
+  }
+  if (
+    params.timeoutMs !== undefined &&
+    (typeof params.timeoutMs !== "number" ||
+      !Number.isFinite(params.timeoutMs) ||
+      params.timeoutMs <= 0)
+  ) {
+    throw new Error(
+      `Invalid advisor timeoutMs "${params.timeoutMs}". Expected a positive number of milliseconds (clamped to 30000..1800000).`,
+    );
   }
 
   // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
@@ -578,6 +597,12 @@ async function advisorExecute(
     toolCalls: ADVISOR_MAX_TOOL_CALLS,
     modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
   };
+  // Timeout priority: per-call > config > mode default (5 min review / 10 min explore), clamped to 30 s..30 min.
+  const timeoutMs = resolveConsultTimeoutMs({
+    perCall: params.timeoutMs,
+    config: config.timeoutMs,
+    mode,
+  });
   // Claude-Code style: the advisor sees the transcript automatically; opt out with includeSession:false.
   const transcript = params.includeSession === false ? "(not included)" : sessionTranscript(ctx);
   const failures: string[] = [];
@@ -623,6 +648,7 @@ async function advisorExecute(
               cwd: ctx.cwd,
               maxToolCalls: exploreBudget.toolCalls,
               maxModelRequests: exploreBudget.modelRequests,
+              timeoutMs,
               signal,
               onUpdate: (update) => onUpdate?.(update),
             })
@@ -633,6 +659,7 @@ async function advisorExecute(
               transcript,
               effort: selectedEffort,
               ctx,
+              timeoutMs,
               signal,
             });
       const elapsedMs = Date.now() - startedAt;
@@ -665,8 +692,8 @@ async function advisorExecute(
       if (result.status === "timed_out") {
         const message =
           mode === "explore"
-            ? `advisor timed out after ${Math.round(ADVISOR_EXPLORE_TIMEOUT_MS / 60_000)} minutes (incomplete)`
-            : `advisor request timed out after ${Math.round(ADVISOR_REVIEW_TIMEOUT_MS / 60_000)} minutes (incomplete)`;
+            ? `advisor timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`
+            : `advisor request timed out after ${Math.round(timeoutMs / 1000)} seconds (incomplete)`;
         if (explicit) throw new Error(`${modelLabel}: ${message}`);
         failures.push(`${candidate.source} (${modelLabel}): ${message}`);
         continue;
@@ -738,7 +765,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const usageHints =
-    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
+    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level, a model slot, or exploreBudget) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, exploreBudget {toolCalls, modelRequests}, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min; per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
 
   pi.registerCommand("advisor", {
     description:
@@ -862,7 +889,7 @@ export default function (pi: ExtensionAPI) {
     name: "advisor",
     label: "Advisor",
     description:
-      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor automatically receives the redacted session transcript, so pass the precise question rather than pasted code. Mode "review" (default) is a single model call answering from the transcript — use it for consequential decisions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) — use it only when the question requires locating code or verifying repository facts. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, and reasoning effort ("none".."max"). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json (manage these with the /advisor command). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
+      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor automatically receives the redacted session transcript, so pass the precise question rather than pasted code. Mode "review" (default) is a single model call answering from the transcript — use it for consequential decisions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) — use it only when the question requires locating code or verifying repository facts. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, reasoning effort ("none".."max"), and a per-call timeoutMs (clamped 30000..1800000; overrides the config timeoutMs and the mode default of 5 min review / 10 min explore). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json, which is strictly validated (unknown keys are rejected with an error naming the field). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
     promptSnippet:
       "Consult a configured Pi model for an independent expert review or design second opinion",
     promptGuidelines: [
@@ -906,6 +933,12 @@ export default function (pi: ExtensionAPI) {
         Type.Boolean({
           description:
             "Include the redacted session transcript in the advisor's request. Default: true; set false to omit it.",
+        }),
+      ),
+      timeoutMs: Type.Optional(
+        Type.Number({
+          description:
+            'Consultation timeout in milliseconds for this call (clamped to 30000..1800000). Overrides the "timeoutMs" key in advisor.json, which overrides the mode default (5 min review / 10 min explore).',
         }),
       ),
     }),

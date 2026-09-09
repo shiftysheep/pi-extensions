@@ -45,13 +45,18 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
   "fallback": { "provider": "<provider-id>", "model": "<model-id>" },
   "reasoningEffort": "high",
   "exploreBudget": { "toolCalls": 32, "modelRequests": 16 },
-  "activeModelFallback": true
+  "activeModelFallback": true,
+  "timeoutMs": 600000
 }
 ```
 
 `exploreBudget` (optional) tunes the explore-mode spend caps (positive integers, at most 100 tool calls / 40 model requests); defaults are 24 / 12 when unset.
 
 `activeModelFallback` (optional, default `false`) opts into retrying the session's *active* model as a last resort — a self-review, and the result says so.
+
+`timeoutMs` (optional) sets the consultation timeout in milliseconds, clamped to 30 s–30 min; the per-call `timeoutMs` tool parameter overrides it, and the defaults are 5 min for `review` / 10 min for `explore`.
+
+The file is **strictly validated**: unknown keys (top level, in a model slot, or in `exploreBudget`) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
 Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
