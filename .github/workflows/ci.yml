@@ -40,7 +40,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: astral-sh/setup-uv@v10
+      # Exact tag: setup-uv publishes no rolling major tag (v10 does not exist).
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Bump version and tag
         run: |
           # A concurrent release may have landed first (see concurrency group);
