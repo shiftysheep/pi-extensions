@@ -7,6 +7,8 @@
  */
 
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   chmodSync,
   existsSync,
@@ -572,5 +574,144 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     assert.equal(result.text, "done");
     assert.equal(result.toolCalls, 1);
     assert.deepEqual(workDirs(), before, "work dir must be removed despite the throwing callback");
+  });
+});
+
+/**
+ * Mock-child regression tests for the interrupt-driven hard-bound teardown path.
+ *
+ * A real spawned child is ALWAYS killed by the group SIGKILL (at interrupt+5s),
+ * before the 15s hard bound, so the "child never exits or closes" case cannot be
+ * reproduced with a real process (only a kernel-stuck/D-state task escapes
+ * SIGKILL, which no test can create). Instead we inject a fake child emitter
+ * (via opts.__test.spawnImpl) that never exits, a mocked group-kill (killImpl, so
+ * a fabricated pid is never signalled), and a short teardown margin, to verify:
+ * (1) the wait settles at first-interrupt + one shared margin (no stacking);
+ * (2) a second interrupt does not restart the (immutable) budget;
+ * (3) a late "exit" after settlement creates no new wait (no hang).
+ */
+describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
+  const MARGIN_MS = 400;
+
+  /** A fake child that never emits "exit" or "close" (an unkillable child). */
+  function makeFakeChild(): { child: ChildProcess; signals: string[] } {
+    const ee = new EventEmitter();
+    const stream = { on: () => undefined, destroy: () => undefined };
+    const signals: string[] = [];
+    const child = {
+      on: ee.on.bind(ee),
+      once: ee.once.bind(ee),
+      removeListener: ee.removeListener.bind(ee),
+      emit: ee.emit.bind(ee),
+      pid: 999_999_999,
+      exitCode: null,
+      signalCode: null,
+      unref: () => undefined,
+      kill: (sig?: NodeJS.Signals) => {
+        signals.push(sig ?? "SIGTERM");
+        return true;
+      },
+      stdout: stream,
+      stderr: stream,
+    } as unknown as ChildProcess;
+    return { child, signals };
+  }
+
+  const baseOpts = {
+    model: MODEL,
+    modelLabel: "fake/fake-model",
+    question: "q",
+    transcript: "",
+    effort: "low" as const,
+    cwd: process.cwd(),
+    mode: "review" as const,
+  };
+
+  it("settles at first-interrupt + one shared margin (no stacked budget)", async () => {
+    const { child } = makeFakeChild();
+    const killSignals: string[] = [];
+    const t0 = performance.now();
+    const result = await consultWithChildProcess({
+      ...baseOpts,
+      deadline: performance.now() + 120, // fires soon -> the first interrupt
+      __test: {
+        spawnImpl: () => child,
+        killImpl: (_pid, signal) => {
+          killSignals.push(signal);
+        },
+        teardownMarginMs: MARGIN_MS,
+      },
+    });
+    const elapsed = performance.now() - t0;
+    assert.equal(result.status, "timed_out");
+    // A stacked budget (margin + margin) would settle at ~120 + 800 = 920ms.
+    // The shared budget settles at ~120 + 400 = 520ms. Keep the bound well
+    // between them.
+    assert.ok(
+      elapsed < 780,
+      `settled at ${Math.round(elapsed)}ms — a stacked budget would settle near 920ms`,
+    );
+    assert.ok(
+      elapsed >= 380,
+      `settled too early (${Math.round(elapsed)}ms) to have hit the hard bound`,
+    );
+    // Group escalation did signal (mocked, so the fabricated pid was not touched).
+    assert.ok(killSignals.includes("SIGTERM"));
+  });
+
+  it("does not restart the budget on a second interrupt", async () => {
+    const { child } = makeFakeChild();
+    const ac = new AbortController();
+    const t0 = performance.now();
+    // The deadline is the first interrupt; the abort is the second.
+    setTimeout(() => ac.abort(), 200);
+    const result = await consultWithChildProcess({
+      ...baseOpts,
+      deadline: performance.now() + 120,
+      signal: ac.signal,
+      __test: {
+        spawnImpl: () => child,
+        killImpl: () => undefined,
+        teardownMarginMs: MARGIN_MS,
+      },
+    });
+    const elapsed = performance.now() - t0;
+    assert.equal(result.status, "timed_out"); // deadline (first interrupt) wins
+    // If the second interrupt had restarted the budget, settlement would be at
+    // ~200 (abort) + 400 (margin) = 600ms at the earliest, plus a fresh hard
+    // bound. The immutable budget settles at ~120 + 400 = 520ms.
+    assert.ok(
+      elapsed < 780,
+      `settled at ${Math.round(elapsed)}ms — a restarted budget would settle later`,
+    );
+  });
+
+  it("a late exit after settlement creates no new wait (no hang)", async () => {
+    const { child } = makeFakeChild();
+    const t0 = performance.now();
+    const consult = consultWithChildProcess({
+      ...baseOpts,
+      deadline: performance.now() + 120,
+      __test: {
+        spawnImpl: () => child,
+        killImpl: () => undefined,
+        teardownMarginMs: MARGIN_MS,
+      },
+    });
+    // After the hard bound settles the close-wait (~120 + 400ms), emit a LATE
+    // "exit" on the abandoned child. The settled guard must make it a no-op
+    // (no new grace timer, no hang).
+    setTimeout(() => child.emit("exit", null, null), 600);
+    const watchdog = setTimeout(() => {
+      throw new Error("late exit after settlement caused a hang");
+    }, 2_500);
+    const result = await consult;
+    clearTimeout(watchdog);
+    const elapsed = performance.now() - t0;
+    assert.equal(result.status, "timed_out");
+    assert.ok(
+      elapsed < 1_000,
+      `late exit delayed settlement to ${Math.round(elapsed)}ms (should settle at the hard bound ~520ms)`,
+    );
   });
 });

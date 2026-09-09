@@ -11,7 +11,7 @@
  * tools still reach anything the OS user can read.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -72,6 +72,17 @@ export async function consultWithChildProcess(opts: {
   deadline: number;
   signal?: AbortSignal;
   config?: { piBinary?: string };
+  /**
+   * Internal test seam (used only by test/advisor-child.test.ts). Lets a test
+   * inject a fake child spawn, a mocked group-kill (so a fabricated pid is never
+   * signalled), and a short teardown margin. All default to the real
+   * implementations, so production behaviour is unchanged. Never set elsewhere.
+   */
+  __test?: {
+    spawnImpl?: (command: string, args: string[], options: SpawnOptions) => ChildProcess;
+    killImpl?: (pid: number, signal: NodeJS.Signals) => void;
+    teardownMarginMs?: number;
+  };
   onUpdate?: (update: {
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
@@ -87,6 +98,17 @@ export async function consultWithChildProcess(opts: {
   const tools = opts.mode === "explore" ? ADVISOR_TOOLS : [];
   const workDir = mkdtempSync(join(tmpdir(), "pi-advisor-"));
   const promptPath = join(workDir, "prompt.txt");
+  // Test seam (see the opts.__test doc): fake spawn / mocked group-kill / short
+  // margin, all defaulting to the real implementations (no production change).
+  const spawnImpl =
+    opts.__test?.spawnImpl ??
+    ((command: string, args: string[], options: SpawnOptions): ChildProcess =>
+      spawn(command, args, options) as ChildProcess);
+  const killImpl =
+    opts.__test?.killImpl ??
+    ((pid: number, signal: NodeJS.Signals): void => {
+      process.kill(pid, signal);
+    });
   // The first interruption cause wins: an abort that is followed by the
   // deadline firing during the SIGTERM grace period is still reported as an
   // abort, and vice versa.
@@ -122,6 +144,10 @@ export async function consultWithChildProcess(opts: {
   // alive; only the timer that resolves it does, and that timer is owned/cleared.
   let hardBoundResolve: (() => void) | undefined;
   const hardBound = new Promise<void>((resolve) => (hardBoundResolve = resolve));
+  // The immediate child's "exit" is the reliable "group teardown issued" hook a
+  // SIGKILL to the group always kills it. Named so the finally can remove it
+  // (an abandoned, never-exiting child must not leave the listener attached).
+  const onChildExit = (): void => groupDeadResolve?.();
   // Shared teardown budget: on the first interrupt (deadline or abort) record an
   // absolute deadline, comfortably beyond the SIGTERM->SIGKILL escalation (5s) +
   // the close grace (1s). BOTH the close-wait hard backstop and the final
@@ -129,16 +155,19 @@ export async function consultWithChildProcess(opts: {
   // so they do not stack — an early abort with an unkillable child waits at most
   // this margin after the abort, not margin + margin.
   let teardownDeadline: number | undefined;
-  const TEARDOWN_MARGIN_MS = 15_000;
+  const TEARDOWN_MARGIN_MS = opts.__test?.teardownMarginMs ?? 15_000;
   const startHardBound = (): void => {
-    if (hardBoundTimer !== undefined) return;
+    // The budget is IMMUTABLE: set once on the first interrupt. A later interrupt
+    // (e.g. an abort after the deadline already fired and the hard bound settled)
+    // must not restart the timer or overwrite the deadline.
+    if (teardownDeadline !== undefined) return;
     teardownDeadline = performance.now() + TEARDOWN_MARGIN_MS;
     hardBoundTimer = setTimeout(() => hardBoundResolve?.(), TEARDOWN_MARGIN_MS);
   };
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (!child || child.pid === undefined) return;
     try {
-      process.kill(-child.pid, signal);
+      killImpl(-child.pid, signal);
     } catch {
       try {
         child.kill(signal);
@@ -263,7 +292,7 @@ export async function consultWithChildProcess(opts: {
     if (remainingBudgetMs(opts.deadline, performance.now()) <= 0)
       throw new Error("consultation timed out during setup");
     const env = { ...childBaseEnv(), PI_CODING_AGENT_DIR: workDir };
-    const proc = spawn(resolvePiBinary(opts.config, process.env), args, {
+    const proc = spawnImpl(resolvePiBinary(opts.config, process.env), args, {
       cwd: opts.cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -275,7 +304,7 @@ export async function consultWithChildProcess(opts: {
     child = proc;
     // "exit" (not "close") fires when the immediate child dies, which is what
     // the group-teardown await keys on — a SIGKILL to the group always kills it.
-    proc.once("exit", () => groupDeadResolve?.());
+    proc.once("exit", onChildExit);
     const stdout = proc.stdout;
     const stderr = proc.stderr;
     if (!stdout || !stderr) throw new Error("child process streams were not pipes");
@@ -404,6 +433,10 @@ export async function consultWithChildProcess(opts: {
       status: outcome.status,
     };
   } finally {
+    // Disable every interrupt source up front so none can fire during teardown
+    // and re-create a timer or restart the (immutable) budget.
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onOuterAbort);
     // Finish group teardown UNCONDITIONALLY, on every exit path (not just the
     // interrupt path): an in-group descendant can outlive the immediate child
     // after a clean exit too, and must not be left running. Escalate to
@@ -423,8 +456,24 @@ export async function consultWithChildProcess(opts: {
     } catch {
       /* already destroyed */
     }
-    if (killTimer !== undefined) clearTimeout(killTimer);
-    clearTimeout(timer);
+    child?.removeListener("exit", onChildExit);
+    // Clear every owned timer so none can keep the event loop alive after this
+    // returns. killTimer/capTimer are cleared in awaitGroupTearDown and the hard
+    // bound / close grace are cleared by the close-wait settle; this is
+    // belt-and-suspenders for a timer created by an interrupt no settle reached
+    // (e.g. an abort after the hard bound already fired).
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+    if (hardBoundTimer !== undefined) {
+      clearTimeout(hardBoundTimer);
+      hardBoundTimer = undefined;
+    }
+    if (closeGraceTimer !== undefined) {
+      clearTimeout(closeGraceTimer);
+      closeGraceTimer = undefined;
+    }
     // Give up on any still-live child handle: it would otherwise keep the host's
     // event loop alive. In the normal path the child has already exited (a no-op);
     // in the unkillable-child path this lets the host exit rather than holding the
@@ -434,7 +483,6 @@ export async function consultWithChildProcess(opts: {
     } catch {
       /* already gone */
     }
-    opts.signal?.removeEventListener("abort", onOuterAbort);
     rmSync(workDir, { recursive: true, force: true });
   }
 }
