@@ -6,10 +6,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  ADVISOR_MAX_ADVICE_CHARS,
+  ADVISOR_MAX_DIAGNOSTIC_CHARS,
   ADVISOR_MAX_MODEL_REQUESTS,
   ADVISOR_MAX_TOOL_CALLS,
   assembleRequestText,
   buildCandidates,
+  capAdviceText,
+  capDiagnosticText,
+  createConcurrencyLimiter,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
@@ -474,5 +479,101 @@ describe("parseConfig", () => {
       () => parseConfig({ fallback: { model: "m", effort: "ultra" } }, CONFIG_PATH),
       new RegExp(`${CONFIG_PATH}: fallback.effort must be one of:`),
     );
+  });
+});
+
+describe("capAdviceText / capDiagnosticText", () => {
+  it("passes through text at or under the ceiling unchanged", () => {
+    assert.equal(capAdviceText("short"), "short");
+    assert.equal(
+      capAdviceText("x".repeat(ADVISOR_MAX_ADVICE_CHARS)),
+      "x".repeat(ADVISOR_MAX_ADVICE_CHARS),
+    );
+    assert.equal(capDiagnosticText("err"), "err");
+    assert.equal(
+      capDiagnosticText("e".repeat(ADVISOR_MAX_DIAGNOSTIC_CHARS)),
+      "e".repeat(ADVISOR_MAX_DIAGNOSTIC_CHARS),
+    );
+  });
+
+  it("truncates advice with a visible marker naming the omitted amount", () => {
+    const text = "a".repeat(ADVISOR_MAX_ADVICE_CHARS + 1_500);
+    const capped = capAdviceText(text);
+    assert.ok(capped.startsWith("a".repeat(ADVISOR_MAX_ADVICE_CHARS)));
+    assert.ok(capped.includes("[truncated: 1500 more characters omitted]"));
+    assert.equal(
+      capped.length,
+      ADVISOR_MAX_ADVICE_CHARS + "\n\n[truncated: 1500 more characters omitted]".length,
+    );
+  });
+
+  it("truncates diagnostics at the much tighter 4k ceiling", () => {
+    const text = "e".repeat(ADVISOR_MAX_DIAGNOSTIC_CHARS + 10);
+    const capped = capDiagnosticText(text);
+    assert.ok(capped.includes("[truncated: 10 more characters omitted]"));
+    assert.ok(capped.length < ADVISOR_MAX_ADVICE_CHARS);
+  });
+});
+
+describe("createConcurrencyLimiter", () => {
+  it("allows up to max concurrent acquisitions", async () => {
+    const limiter = createConcurrencyLimiter(2);
+    await limiter.acquire();
+    await limiter.acquire();
+    // The third must wait; it resolves only after a release.
+    let thirdResolved = false;
+    const third = limiter.acquire().then(() => {
+      thirdResolved = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(thirdResolved, false);
+    limiter.release();
+    await third;
+    assert.equal(thirdResolved, true);
+    limiter.release();
+    limiter.release();
+  });
+
+  it("queues waiters in FIFO order and never rejects", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    const order: string[] = [];
+    await limiter.acquire();
+    const a = limiter.acquire().then(() => {
+      order.push("a");
+    });
+    const b = limiter.acquire().then(() => {
+      order.push("b");
+    });
+    const c = limiter.acquire().then(() => {
+      order.push("c");
+    });
+    limiter.release(); // hands the slot to a
+    await a;
+    limiter.release(); // hands the slot to b
+    await b;
+    limiter.release(); // hands the slot to c
+    await c;
+    assert.deepEqual(order, ["a", "b", "c"]);
+  });
+
+  it("a released slot is reusable even when the work threw (the withAdvisorSlot contract)", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    const withSlot = async (work: () => Promise<void>) => {
+      await limiter.acquire();
+      try {
+        await work();
+      } finally {
+        limiter.release();
+      }
+    };
+    await withSlot(async () => {});
+    await assert.rejects(
+      withSlot(async () => {
+        throw new Error("boom");
+      }),
+      /boom/,
+    );
+    // The failed work's finally still released the slot, so this completes.
+    await withSlot(async () => {});
   });
 });

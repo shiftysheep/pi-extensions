@@ -288,3 +288,57 @@ export function assembleRequestText(
   if (overflow > 0) question = keepStart(question, Math.max(0, question.length - overflow), marker);
   return render();
 }
+
+/** Ceiling for advice returned to the caller (the advisor's job is to save caller context, not spend it twice). */
+export const ADVISOR_MAX_ADVICE_CHARS = 100_000;
+/** Tighter ceiling for diagnostic/error text, which is not advice. */
+export const ADVISOR_MAX_DIAGNOSTIC_CHARS = 4_000;
+
+/**
+ * Truncate text at a ceiling with a visible `[truncated]` marker. Text at or
+ * under the limit passes through unchanged.
+ */
+function capText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const omitted = text.length - limit;
+  return `${text.slice(0, limit)}\n\n[truncated: ${omitted} more characters omitted]`;
+}
+
+/** Cap advice text at ADVISOR_MAX_ADVICE_CHARS with a visible truncation marker. */
+export function capAdviceText(text: string): string {
+  return capText(text, ADVISOR_MAX_ADVICE_CHARS);
+}
+
+/** Cap diagnostic/error text at ADVISOR_MAX_DIAGNOSTIC_CHARS with a visible truncation marker. */
+export function capDiagnosticText(text: string): string {
+  return capText(text, ADVISOR_MAX_DIAGNOSTIC_CHARS);
+}
+
+/**
+ * A simple FIFO concurrency limiter: at most `max` units of work run at once;
+ * further callers queue and complete in order rather than being rejected.
+ */
+export function createConcurrencyLimiter(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  return {
+    acquire(): Promise<void> {
+      return new Promise<void>((resolve) => {
+        if (active < max) {
+          active += 1;
+          resolve();
+        } else {
+          queue.push(() => {
+            active += 1;
+            resolve();
+          });
+        }
+      });
+    },
+    release(): void {
+      active -= 1;
+      const next = queue.shift();
+      if (next) next();
+    },
+  };
+}

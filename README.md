@@ -44,13 +44,16 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
   "primary": { "provider": "<provider-id>", "model": "<model-id>" },
   "fallback": { "provider": "<provider-id>", "model": "<model-id>" },
   "reasoningEffort": "high",
-  "exploreBudget": { "toolCalls": 32, "modelRequests": 16 }
+  "exploreBudget": { "toolCalls": 32, "modelRequests": 16 },
+  "activeModelFallback": true
 }
 ```
 
 `exploreBudget` (optional) tunes the explore-mode spend caps (positive integers, at most 100 tool calls / 40 model requests); defaults are 24 / 12 when unset.
 
-Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). Missing file or invalid JSON fails gracefully to a generic second-model choice.
+`activeModelFallback` (optional, default `false`) opts into retrying the session's *active* model as a last resort — a self-review, and the result says so.
+
+Any configured Pi model (including custom providers) can be chosen per consultation; the optional `effort` argument overrides the default for one call (`none` through `max`). No model is ever picked implicitly: with no configured slots the advisor fails and points at `/advisor` (an explicit `provider`/`model` tool call still works if the config file is missing or unreadable).
 
 **How a consultation works (Claude-Code-advisor style):** the advisor automatically
 receives the redacted session transcript (including tool calls and results made so far)
@@ -66,10 +69,18 @@ on a tool call to omit the transcript. Two modes:
   authoritative verdict. Use only when the question requires locating code or verifying
   repository facts.
 
-Every result text ends with a model-visible status footer (`[advisor: mode=…, status=…,
-toolCalls=…, elapsed=…s]`); the same envelope plus `model`/`source` is also carried in the
-result `details` for logs and UI (`completed` / `timed_out` / `aborted` / `budget_exhausted`).
+Every result text ends with a model-visible status footer (`[advisor: mode=…, model=…,
+status=…, toolCalls=…, elapsed=…s]`); the same envelope plus `model`/`source` is also
+carried in the result `details` for logs and UI (`completed` / `timed_out` / `aborted` /
+`budget_exhausted`). When a later candidate answered after the primary was unavailable
+the footer adds `fallbackFrom=<first candidate>`; when the answering model is the
+session's active model it adds `independent=false` and a self-review warning.
 Usage is aggregated across all model requests, including every turn of an exploration.
+
+**Concurrency and size bounds:** at most 2 consultations run concurrently — extras queue
+and still complete, they are never rejected. Returned advice is capped at 100k
+characters and error diagnostics at 4k; anything larger is cut with a visible
+`[truncated: N more characters omitted]` marker.
 
 Models are managed with `/advisor`:
 
@@ -88,8 +99,11 @@ Per-model effort can be written inline with an `@` suffix (e.g. `/advisor primar
 gpt-6-astra@max`) or by editing `advisor.json` (per-slot `"effort"` key).
 
 Behavior notes:
-- **Retry chain**: primary → fallback; if both fail, your *active* model is retried as a
-  last resort. `/advisor show` prints the effective chain so this is never a surprise.
+- **Retry chain**: primary → fallback. No model is picked implicitly — with no
+  configured slots the advisor fails and points at `/advisor`. Your *active* model is
+  only retried as a last resort when `"activeModelFallback": true` (a self-review,
+  disclosed in the result footer). `/advisor` prints the effective chain so this is
+  never a surprise.
 - **`"none"` effort** requests no reasoning level; the advisor session then uses its own
   default (an explicit "off" is not expressible through the agent API).
 - **Session redaction** (transcript included by default; `includeSession: false` opts out)

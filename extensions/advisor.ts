@@ -17,6 +17,8 @@ import {
   uuidv7,
 } from "@earendil-works/pi-ai";
 import {
+  type AgentToolResult,
+  type AgentToolUpdateCallback,
   createAgentSession,
   DefaultResourceLoader,
   type ExtensionAPI,
@@ -33,6 +35,9 @@ import {
   type AdvisorTarget,
   assembleRequestText,
   buildCandidates,
+  capAdviceText,
+  capDiagnosticText,
+  createConcurrencyLimiter,
   isReasoningEffort,
   keepEnd,
   parseConfig,
@@ -47,6 +52,32 @@ const MAX_SESSION_CONTEXT_CHARS = 120_000;
 const ADVISOR_TOOLS = ["read", "grep", "find", "ls"];
 const ADVISOR_REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 const ADVISOR_EXPLORE_TIMEOUT_MS = 10 * 60 * 1000;
+/** Cap on concurrent advisor consultations (each is a whole agent session); excess calls queue. */
+const ADVISOR_MAX_CONCURRENT = 2;
+
+// Kept on globalThis so the cap survives pi's /reload within one process (same
+// nonce pattern as cron.ts); a new process gets a fresh limiter.
+const advisorRuntime = globalThis as typeof globalThis & {
+  __piAdvisorProcessNonce?: string;
+  __piAdvisorLimiter?: ReturnType<typeof createConcurrencyLimiter>;
+};
+if (advisorRuntime.__piAdvisorProcessNonce === undefined) {
+  advisorRuntime.__piAdvisorProcessNonce = uuidv7();
+}
+if (advisorRuntime.__piAdvisorLimiter === undefined) {
+  advisorRuntime.__piAdvisorLimiter = createConcurrencyLimiter(ADVISOR_MAX_CONCURRENT);
+}
+const advisorLimiter = advisorRuntime.__piAdvisorLimiter;
+
+/** Run one consultation under the process-level cap; callers beyond the cap queue, never reject. */
+async function withAdvisorSlot<T>(work: () => Promise<T>): Promise<T> {
+  await advisorLimiter.acquire();
+  try {
+    return await work();
+  } finally {
+    advisorLimiter.release();
+  }
+}
 
 const REVIEW_SYSTEM_PROMPT = `You are an independent senior engineering advisor. Give the
 calling coding agent a rigorous second opinion; do not attempt to use tools or
@@ -507,6 +538,197 @@ async function consultWithAgentSession(opts: {
   };
 }
 
+async function advisorExecute(
+  params: {
+    question: string;
+    provider?: string;
+    model?: string;
+    mode?: string;
+    effort?: string;
+    includeSession?: boolean;
+  },
+  signal: AbortSignal | undefined,
+  onUpdate: AgentToolUpdateCallback | undefined,
+  ctx: ExtensionContext,
+): Promise<AgentToolResult<Record<string, unknown>>> {
+  if (params.effort !== undefined && !isReasoningEffort(params.effort)) {
+    throw new Error(
+      `Invalid advisor effort "${params.effort}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
+    );
+  }
+  const mode = params.mode ?? "review";
+  if (mode !== "review" && mode !== "explore") {
+    throw new Error(`Invalid advisor mode "${mode}". Expected "review" or "explore".`);
+  }
+
+  // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
+  const { config, loadError } = loadConfigSafe();
+  const { candidates, explicit } = buildCandidates({
+    provider: params.provider,
+    modelId: params.model,
+    config,
+    activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+  });
+  if (!explicit && candidates.length === 0) {
+    throw new Error(
+      "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
+    );
+  }
+  const exploreBudget = config.exploreBudget ?? {
+    toolCalls: ADVISOR_MAX_TOOL_CALLS,
+    modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
+  };
+  // Claude-Code style: the advisor sees the transcript automatically; opt out with includeSession:false.
+  const transcript = params.includeSession === false ? "(not included)" : sessionTranscript(ctx);
+  const failures: string[] = [];
+  let combinedUsage: Usage | undefined;
+
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+    const candidate = candidates[candidateIndex];
+    let model: Model<any>;
+    try {
+      model = findModel(ctx, candidate.target);
+    } catch (error) {
+      failures.push(`${candidate.source}: ${capDiagnosticText((error as Error).message)}`);
+      continue;
+    }
+
+    const modelLabel = `${model.provider}/${model.id}`;
+    // Effort priority: tool-call override > per-model config > global default > medium.
+    const selectedEffort =
+      (params.effort as AdvisorReasoningEffort | undefined) ??
+      candidate.target.effort ??
+      config.reasoningEffort ??
+      "medium";
+    const startedAt = Date.now();
+    try {
+      // Fail fast on missing credentials before paying for a model call.
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+      if (!auth.ok) throw new Error(auth.error);
+
+      onUpdate?.({
+        content: [
+          { type: "text", text: `Consulting ${modelLabel} (${candidate.source}, ${mode})...` },
+        ],
+        details: { model: modelLabel, source: candidate.source, mode },
+      });
+      const result =
+        mode === "explore"
+          ? await consultWithAgentSession({
+              model,
+              modelLabel,
+              question: params.question,
+              transcript,
+              effort: selectedEffort,
+              cwd: ctx.cwd,
+              maxToolCalls: exploreBudget.toolCalls,
+              maxModelRequests: exploreBudget.modelRequests,
+              signal,
+              onUpdate: (update) => onUpdate?.(update),
+            })
+          : await consultWithStreamSimple({
+              model,
+              modelLabel,
+              question: params.question,
+              transcript,
+              effort: selectedEffort,
+              ctx,
+              signal,
+            });
+      const elapsedMs = Date.now() - startedAt;
+
+      if (result.usage) combinedUsage = addUsage(combinedUsage, result.usage);
+      // The footer is the model-visible disclosure: it always names who answered,
+      // whether the chain degraded, and whether independence was lost.
+      const flags: string[] = [];
+      if (candidateIndex > 0) {
+        const first = candidates[0].target;
+        flags.push(`fallbackFrom=${first.provider ?? "*"}/${first.model}`);
+      }
+      const selfReview =
+        ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
+      if (selfReview) flags.push("independent=false");
+      const statusFooter = (status: string) =>
+        `\n\n---\n[advisor: mode=${mode}, model=${modelLabel}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${flags.length > 0 ? `, ${flags.join(", ")}` : ""}${selfReview ? " — this advice came from the model already driving this session; treat it as self-review, not a second opinion" : ""}]`;
+      if (result.status === "aborted")
+        return {
+          content: [{ type: "text", text: "Advisor consultation cancelled." }],
+          details: {
+            model: modelLabel,
+            source: candidate.source,
+            status: "aborted",
+            mode,
+            elapsedMs,
+          },
+          usage: combinedUsage,
+        };
+      if (result.status === "timed_out") {
+        const message =
+          mode === "explore"
+            ? `advisor timed out after ${Math.round(ADVISOR_EXPLORE_TIMEOUT_MS / 60_000)} minutes (incomplete)`
+            : `advisor request timed out after ${Math.round(ADVISOR_REVIEW_TIMEOUT_MS / 60_000)} minutes (incomplete)`;
+        if (explicit) throw new Error(`${modelLabel}: ${message}`);
+        failures.push(`${candidate.source} (${modelLabel}): ${message}`);
+        continue;
+      }
+      if (result.status === "budget_exhausted") {
+        const partial = result.text
+          ? `\nPartial output before the budget was exhausted (incomplete, not a verdict):\n${capAdviceText(result.text)}`
+          : "";
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted")}`,
+            },
+          ],
+          details: {
+            model: modelLabel,
+            source: candidate.source,
+            status: "budget_exhausted",
+            mode,
+            toolCalls: result.toolCalls,
+            modelRequests: result.modelRequests,
+            elapsedMs,
+          },
+          usage: combinedUsage,
+        };
+      }
+      return {
+        content: [
+          { type: "text", text: `${capAdviceText(result.text)}${statusFooter("completed")}` },
+        ],
+        details: {
+          model: modelLabel,
+          source: candidate.source,
+          status: "completed",
+          mode,
+          toolCalls: result.toolCalls,
+          elapsedMs,
+        },
+        usage: combinedUsage,
+      };
+    } catch (error) {
+      if (signal?.aborted) {
+        return {
+          content: [{ type: "text", text: "Advisor consultation cancelled." }],
+          details: { model: modelLabel, source: candidate.source },
+        };
+      }
+      const message = capDiagnosticText(error instanceof Error ? error.message : String(error));
+      if (explicit) throw new Error(`${modelLabel}: ${message}`);
+      failures.push(`${candidate.source} (${modelLabel}): ${message}`);
+    }
+  }
+
+  const configWarning = loadError
+    ? ` Note: advisor config was unreadable (${loadError}); run /advisor reset to recover.`
+    : "";
+  throw new Error(
+    `No usable advisor model (tried: ${candidates.map((c) => c.source).join(" → ")}). ${failures.join("; ")}${configWarning}`,
+  );
+}
+
 export default function (pi: ExtensionAPI) {
   const slotFromArg = (raw: string): AdvisorSlot => {
     const value = raw.toLowerCase();
@@ -516,7 +738,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const usageHints =
-    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json).';
+    'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool sees the redacted session transcript automatically — pass the precise question, not pasted code (includeSession:false opts out). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls, hard spend caps; tunable via exploreBudget in advisor.json). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
 
   pi.registerCommand("advisor", {
     description:
@@ -640,7 +862,7 @@ export default function (pi: ExtensionAPI) {
     name: "advisor",
     label: "Advisor",
     description:
-      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor automatically receives the redacted session transcript, so pass the precise question rather than pasted code. Mode "review" (default) is a single model call answering from the transcript — use it for consequential decisions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) — use it only when the question requires locating code or verifying repository facts. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, and reasoning effort ("none".."max"). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json (manage these with the /advisor command).',
+      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor automatically receives the redacted session transcript, so pass the precise question rather than pasted code. Mode "review" (default) is a single model call answering from the transcript — use it for consequential decisions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) — use it only when the question requires locating code or verifying repository facts. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, and reasoning effort ("none".."max"). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json (manage these with the /advisor command). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
     promptSnippet:
       "Consult a configured Pi model for an independent expert review or design second opinion",
     promptGuidelines: [
@@ -687,195 +909,7 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(
-      _toolCallId,
-      params: {
-        question: string;
-        provider?: string;
-        model?: string;
-        mode?: string;
-        effort?: string;
-        includeSession?: boolean;
-      },
-      signal,
-      onUpdate,
-      ctx,
-    ) {
-      if (params.effort !== undefined && !isReasoningEffort(params.effort)) {
-        throw new Error(
-          `Invalid advisor effort "${params.effort}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
-        );
-      }
-      const mode = params.mode ?? "review";
-      if (mode !== "review" && mode !== "explore") {
-        throw new Error(`Invalid advisor mode "${mode}". Expected "review" or "explore".`);
-      }
-
-      // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
-      const { config, loadError } = loadConfigSafe();
-      const { candidates, explicit } = buildCandidates({
-        provider: params.provider,
-        modelId: params.model,
-        config,
-        activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
-      });
-      if (!explicit && candidates.length === 0) {
-        throw new Error(
-          "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
-        );
-      }
-      const exploreBudget = config.exploreBudget ?? {
-        toolCalls: ADVISOR_MAX_TOOL_CALLS,
-        modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
-      };
-      // Claude-Code style: the advisor sees the transcript automatically; opt out with includeSession:false.
-      const transcript =
-        params.includeSession === false ? "(not included)" : sessionTranscript(ctx);
-      const failures: string[] = [];
-      let combinedUsage: Usage | undefined;
-
-      for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
-        const candidate = candidates[candidateIndex];
-        let model: Model<any>;
-        try {
-          model = findModel(ctx, candidate.target);
-        } catch (error) {
-          failures.push(`${candidate.source}: ${(error as Error).message}`);
-          continue;
-        }
-
-        const modelLabel = `${model.provider}/${model.id}`;
-        // Effort priority: tool-call override > per-model config > global default > medium.
-        const selectedEffort =
-          (params.effort as AdvisorReasoningEffort | undefined) ??
-          candidate.target.effort ??
-          config.reasoningEffort ??
-          "medium";
-        const startedAt = Date.now();
-        try {
-          // Fail fast on missing credentials before paying for a model call.
-          const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-          if (!auth.ok) throw new Error(auth.error);
-
-          onUpdate?.({
-            content: [
-              { type: "text", text: `Consulting ${modelLabel} (${candidate.source}, ${mode})...` },
-            ],
-            details: { model: modelLabel, source: candidate.source, mode },
-          });
-          const result =
-            mode === "explore"
-              ? await consultWithAgentSession({
-                  model,
-                  modelLabel,
-                  question: params.question,
-                  transcript,
-                  effort: selectedEffort,
-                  cwd: ctx.cwd,
-                  maxToolCalls: exploreBudget.toolCalls,
-                  maxModelRequests: exploreBudget.modelRequests,
-                  signal,
-                  onUpdate: (update) => onUpdate?.(update),
-                })
-              : await consultWithStreamSimple({
-                  model,
-                  modelLabel,
-                  question: params.question,
-                  transcript,
-                  effort: selectedEffort,
-                  ctx,
-                  signal,
-                });
-          const elapsedMs = Date.now() - startedAt;
-
-          if (result.usage) combinedUsage = addUsage(combinedUsage, result.usage);
-          // The footer is the model-visible disclosure: it always names who answered,
-          // whether the chain degraded, and whether independence was lost.
-          const flags: string[] = [];
-          if (candidateIndex > 0) {
-            const first = candidates[0].target;
-            flags.push(`fallbackFrom=${first.provider ?? "*"}/${first.model}`);
-          }
-          const selfReview =
-            ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
-          if (selfReview) flags.push("independent=false");
-          const statusFooter = (status: string) =>
-            `\n\n---\n[advisor: mode=${mode}, model=${modelLabel}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${flags.length > 0 ? `, ${flags.join(", ")}` : ""}${selfReview ? " — this advice came from the model already driving this session; treat it as self-review, not a second opinion" : ""}]`;
-          if (result.status === "aborted")
-            return {
-              content: [{ type: "text", text: "Advisor consultation cancelled." }],
-              details: {
-                model: modelLabel,
-                source: candidate.source,
-                status: "aborted",
-                mode,
-                elapsedMs,
-              },
-              usage: combinedUsage,
-            };
-          if (result.status === "timed_out") {
-            const message =
-              mode === "explore"
-                ? `advisor timed out after ${Math.round(ADVISOR_EXPLORE_TIMEOUT_MS / 60_000)} minutes (incomplete)`
-                : `advisor request timed out after ${Math.round(ADVISOR_REVIEW_TIMEOUT_MS / 60_000)} minutes (incomplete)`;
-            if (explicit) throw new Error(`${modelLabel}: ${message}`);
-            failures.push(`${candidate.source} (${modelLabel}): ${message}`);
-            continue;
-          }
-          if (result.status === "budget_exhausted") {
-            const partial = result.text
-              ? `\nPartial output before the budget was exhausted (incomplete, not a verdict):\n${result.text}`
-              : "";
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Advisor exploration budget exhausted (${result.toolCalls}/${exploreBudget.toolCalls} tool calls, ${result.modelRequests}/${exploreBudget.modelRequests} model requests); this result is INCOMPLETE. Re-consult with a narrower question or mode "review".${partial}${statusFooter("budget_exhausted")}`,
-                },
-              ],
-              details: {
-                model: modelLabel,
-                source: candidate.source,
-                status: "budget_exhausted",
-                mode,
-                toolCalls: result.toolCalls,
-                modelRequests: result.modelRequests,
-                elapsedMs,
-              },
-              usage: combinedUsage,
-            };
-          }
-          return {
-            content: [{ type: "text", text: `${result.text}${statusFooter("completed")}` }],
-            details: {
-              model: modelLabel,
-              source: candidate.source,
-              status: "completed",
-              mode,
-              toolCalls: result.toolCalls,
-              elapsedMs,
-            },
-            usage: combinedUsage,
-          };
-        } catch (error) {
-          if (signal?.aborted) {
-            return {
-              content: [{ type: "text", text: "Advisor consultation cancelled." }],
-              details: { model: modelLabel, source: candidate.source },
-            };
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          if (explicit) throw new Error(`${modelLabel}: ${message}`);
-          failures.push(`${candidate.source} (${modelLabel}): ${message}`);
-        }
-      }
-
-      const configWarning = loadError
-        ? ` Note: advisor config was unreadable (${loadError}); run /advisor reset to recover.`
-        : "";
-      throw new Error(
-        `No usable advisor model (tried: ${candidates.map((c) => c.source).join(" → ")}). ${failures.join("; ")}${configWarning}`,
-      );
-    },
+    execute: (_toolCallId, params, signal, onUpdate, ctx) =>
+      withAdvisorSlot(() => advisorExecute(params, signal, onUpdate, ctx)),
   });
 }
