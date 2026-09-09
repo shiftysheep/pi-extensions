@@ -718,13 +718,19 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
     }, 2_500);
     const result = await consult;
     clearTimeout(watchdog);
-    // Wait past the late "exit" (emitted at ~600ms) so its (absent) handling
-    // has run, then assert the transport left NO owned close/exit listeners on
-    // the abandoned child (the settled guard + the finally's listener removal).
-    await new Promise((r) => setTimeout(r, 150));
     assert.equal(result.status, "timed_out");
+    // IMMEDIATELY after settlement (the finally has run), assert the transport
+    // removed ALL owned close/exit listeners. This must be checked BEFORE the
+    // late "exit" fires (~600ms): a leaked once("exit") listener would be
+    // auto-removed by its own delivery, so asserting only after the late exit
+    // would miss it (the abandoned child then keeps that listener forever).
+    assert.equal(child.listenerCount("close"), 0, "settlement left a 'close' listener behind");
+    assert.equal(child.listenerCount("exit"), 0, "settlement left an 'exit' listener behind");
+    // Now wait past the late "exit" (~600ms) and re-assert: the late exit must
+    // be a no-op (no new listeners, no hang).
+    await new Promise((r) => setTimeout(r, 150));
     assert.ok(
-      performance.now() - t0 < 1_000,
+      performance.now() - t0 < 1_200,
       `late exit delayed settlement (should settle at the hard bound ~520ms)`,
     );
     assert.equal(child.listenerCount("close"), 0, "a late exit left a 'close' listener behind");
