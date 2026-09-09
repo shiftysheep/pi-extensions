@@ -36,6 +36,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write # approve the release PR's own CI run (bot heads need approval)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,6 +82,18 @@ jobs:
           # lease would fail with "stale info" because checkout fetches tags
           # without remote-tracking refs.
           git push -f origin "refs/tags/${version}"
+          # A head branch pushed by the bot puts the PR's pull_request CI run
+          # in the "action required" state; approve it so the required check
+          # can complete (gh has no approve subcommand; use the API).
+          for i in $(seq 1 10); do
+            run_id=$(gh run list --limit 1 --branch "release/${version}" \
+              --json databaseId,status --jq '.[0] | select(.status != "completed") | .databaseId // empty')
+            if [ -n "$run_id" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" -X POST 2>/dev/null || true
+              break
+            fi
+            sleep 15
+          done
           # Reuse the release PR if a previous attempt left one open.
           pr_number=$(gh pr list --head "release/${version}" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr_number" ]; then
