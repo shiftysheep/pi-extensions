@@ -736,4 +736,39 @@ describe("consultWithChildProcess (mock child — hard-bound teardown)", () => {
     assert.equal(child.listenerCount("close"), 0, "a late exit left a 'close' listener behind");
     assert.equal(child.listenerCount("exit"), 0, "a late exit left an 'exit' listener behind");
   });
+
+  it("applies the child-scoped env to the spawn without mutating the host process.env", async () => {
+    const before = { ...process.env };
+    const capturedEnv: Record<string, string> = {};
+    const { child } = makeFakeChild();
+    const result = await consultWithChildProcess({
+      ...baseOpts,
+      deadline: performance.now() + 200,
+      config: { awsProfile: "prod", awsRegion: "us-west-2", env: { MY_CHILD_VAR: "yes" } },
+      __test: {
+        spawnImpl: (_cmd, _args, options) => {
+          if (options.env) Object.assign(capturedEnv, options.env);
+          return child;
+        },
+        killImpl: () => undefined,
+        teardownMarginMs: 100,
+      },
+    });
+    assert.equal(result.status, "timed_out"); // the fake child never answers
+    // The child saw the configured AWS + env vars, on top of the base allowlist.
+    assert.equal(capturedEnv.AWS_PROFILE, "prod");
+    assert.equal(capturedEnv.AWS_REGION, "us-west-2");
+    assert.equal(capturedEnv.AWS_DEFAULT_REGION, "us-west-2");
+    assert.equal(capturedEnv.MY_CHILD_VAR, "yes");
+    assert.ok(capturedEnv.PI_CODING_AGENT_DIR, "host agent dir must be set for the child");
+    assert.equal(capturedEnv.PATH, before.PATH); // base allowlist preserved
+    // Acceptance criterion: the host process.env is provably unchanged. (Compare a
+    // fresh plain-object snapshot, not process.env itself — Node's deepEqual treats
+    // the exotic process.env object as requiring reference equality.)
+    assert.deepEqual(
+      { ...process.env },
+      before,
+      "host process.env was mutated by the consultation",
+    );
+  });
 });

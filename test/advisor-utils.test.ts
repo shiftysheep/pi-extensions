@@ -16,6 +16,7 @@ import {
   assembleChildPrompt,
   assembleRequestText,
   buildCandidates,
+  buildChildEnv,
   buildChildPiArgs,
   capAdviceText,
   capDiagnosticText,
@@ -510,6 +511,9 @@ describe("parseConfig", () => {
         activeModelFallback: true,
         timeoutMs: 120_000,
         piBinary: undefined,
+        awsProfile: undefined,
+        awsRegion: undefined,
+        env: undefined,
       },
     );
   });
@@ -562,7 +566,7 @@ describe("parseConfig", () => {
   it("rejects the removed exploreBudget key as an unknown key", () => {
     assert.throws(
       () => parseConfig({ exploreBudget: { toolCalls: 5 } }, CONFIG_PATH),
-      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs, piBinary\)/,
+      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs, piBinary, awsProfile, awsRegion, env\)/,
     );
   });
 
@@ -634,6 +638,113 @@ describe("parseConfig", () => {
       () => parseConfig({ fallback: { model: "m", effort: "ultra" } }, CONFIG_PATH),
       new RegExp(`${CONFIG_PATH}: fallback.effort must be one of:`),
     );
+  });
+
+  it("passes through awsProfile, awsRegion, and env; rejects invalid values", () => {
+    const config = parseConfig(
+      { awsProfile: "prod", awsRegion: "us-west-2", env: { HTTPS_PROXY: "http://proxy:8080" } },
+      CONFIG_PATH,
+    );
+    assert.equal(config.awsProfile, "prod");
+    assert.equal(config.awsRegion, "us-west-2");
+    assert.deepEqual(config.env, { HTTPS_PROXY: "http://proxy:8080" });
+
+    assert.throws(
+      () => parseConfig({ awsProfile: "  " }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: awsProfile must be a non-empty string without NUL bytes.`),
+    );
+    assert.throws(
+      () => parseConfig({ awsProfile: 42 }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: awsProfile must be a non-empty string without NUL bytes.`),
+    );
+    assert.throws(
+      () => parseConfig({ awsRegion: "" }, CONFIG_PATH),
+      new RegExp(`${CONFIG_PATH}: awsRegion must be a non-empty string without NUL bytes.`),
+    );
+    // NUL in an AWS field would make Node's spawn throw; reject it up front.
+    assert.throws(
+      () => parseConfig({ awsProfile: "a\u0000b" }, CONFIG_PATH),
+      /awsProfile must be a non-empty string without NUL bytes/,
+    );
+    assert.throws(
+      () => parseConfig({ awsRegion: "a\u0000b" }, CONFIG_PATH),
+      /awsRegion must be a non-empty string without NUL bytes/,
+    );
+    // env must be an object mapping valid names to non-empty string values:
+    // no non-objects, no NUL (spawn throws), no '=' in names (ambiguous), no empty names.
+    for (const bad of [
+      "not-an-object",
+      [1, 2],
+      { A: "" },
+      { A: 5 },
+      null,
+      { "A\u0000B": "x" }, // NUL in name
+      { "A=B": "x" }, // '=' in name
+      { "": "x" }, // empty name
+      { A: "x\u0000y" }, // NUL in value
+    ]) {
+      assert.throws(
+        () => parseConfig({ env: bad }, CONFIG_PATH),
+        new RegExp(
+          `${CONFIG_PATH}: env must be an object mapping names to non-empty string values.`,
+        ),
+      );
+    }
+  });
+});
+
+describe("buildChildEnv (child-scoped environment)", () => {
+  const base: Record<string, string> = { PATH: "/usr/bin", HOME: "/home/u" };
+
+  it("returns a copy of the base allowlist when no config is given", () => {
+    assert.deepEqual(buildChildEnv(undefined, base), base);
+    assert.deepEqual(buildChildEnv({}, base), base);
+    assert.equal(base.AWS_PROFILE, undefined); // base not mutated
+  });
+
+  it("applies awsProfile -> AWS_PROFILE only", () => {
+    const env = buildChildEnv({ awsProfile: "prod" }, base);
+    assert.equal(env.AWS_PROFILE, "prod");
+    assert.equal(env.AWS_REGION, undefined);
+    assert.equal(env.AWS_DEFAULT_REGION, undefined);
+  });
+
+  it("applies awsRegion -> AWS_REGION and AWS_DEFAULT_REGION", () => {
+    const env = buildChildEnv({ awsRegion: "us-west-2" }, base);
+    assert.equal(env.AWS_REGION, "us-west-2");
+    assert.equal(env.AWS_DEFAULT_REGION, "us-west-2");
+    assert.equal(env.AWS_PROFILE, undefined);
+  });
+
+  it("applies the env map verbatim on top of the base allowlist", () => {
+    const env = buildChildEnv({ env: { HTTPS_PROXY: "http://p:8080" } }, base);
+    assert.equal(env.PATH, "/usr/bin"); // base preserved
+    assert.equal(env.HOME, "/home/u");
+    assert.equal(env.HTTPS_PROXY, "http://p:8080");
+  });
+
+  it("lets an explicit env key override the AWS mapping (last wins)", () => {
+    const env = buildChildEnv({ awsRegion: "us-east-1", env: { AWS_REGION: "eu-west-1" } }, base);
+    assert.equal(env.AWS_REGION, "eu-west-1"); // explicit env wins
+    assert.equal(env.AWS_DEFAULT_REGION, "us-east-1"); // awsRegion still sets this
+  });
+
+  it("does not mutate the caller's base object", () => {
+    const baseObj = { PATH: "/usr/bin" };
+    buildChildEnv({ awsProfile: "p", env: { X: "1" } }, baseObj);
+    assert.deepEqual(baseObj, { PATH: "/usr/bin" });
+  });
+
+  it("forwards a JSON-parsed __proto__ key verbatim (own property, no prototype clobber)", () => {
+    // JSON.parse uses DefineOwnProperty, so this is a real own "__proto__" entry
+    // (not the inherited accessor) - the env must forward it, not drop it.
+    // A variable (not a literal) indirection keeps this a static-analysis-safe test.
+    const protoKey = "__proto__";
+    const parsed = JSON.parse('{"__proto__":"child-value"}');
+    const env = buildChildEnv({ env: parsed }, base);
+    assert.ok(Object.keys(env).includes(protoKey), "the entry was dropped");
+    assert.equal((env as Record<string, string>)[protoKey], "child-value");
+    assert.equal(Object.getPrototypeOf(env), Object.prototype, "prototype was clobbered");
   });
 });
 

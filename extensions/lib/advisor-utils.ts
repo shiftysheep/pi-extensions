@@ -34,6 +34,16 @@ export type AdvisorConfig = {
   timeoutMs?: number;
   /** Explicit path to the pi binary the child-process transport spawns (default: "pi" on PATH). */
   piBinary?: string;
+  /** AWS profile for the child only (sets AWS_PROFILE). No default — applied as-is. */
+  awsProfile?: string;
+  /** AWS region for the child only (sets AWS_REGION and AWS_DEFAULT_REGION). No default. */
+  awsRegion?: string;
+  /**
+   * Additional environment variables applied to the child process ONLY (host
+   * process.env is never mutated). Applied on top of the base allowlist and the
+   * awsProfile/awsRegion mapping, so an explicit key here overrides them.
+   */
+  env?: Record<string, string>;
 };
 
 /** Allowed top-level advisor.json keys; anything else is a typo and is rejected. */
@@ -44,6 +54,9 @@ export const ALLOWED_CONFIG_KEYS = [
   "activeModelFallback",
   "timeoutMs",
   "piBinary",
+  "awsProfile",
+  "awsRegion",
+  "env",
 ] as const;
 
 export const TARGET_KEYS = ["provider", "model", "effort"] as const;
@@ -211,6 +224,17 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   ) {
     throw new Error(`${configPath}: piBinary must be a non-empty string path to the pi binary.`);
   }
+  if (config.awsProfile !== undefined && !isAwsFieldValue(config.awsProfile)) {
+    throw new Error(`${configPath}: awsProfile must be a non-empty string without NUL bytes.`);
+  }
+  if (config.awsRegion !== undefined && !isAwsFieldValue(config.awsRegion)) {
+    throw new Error(`${configPath}: awsRegion must be a non-empty string without NUL bytes.`);
+  }
+  if (config.env !== undefined && !isChildEnv(config.env)) {
+    throw new Error(
+      `${configPath}: env must be an object mapping names to non-empty string values.`,
+    );
+  }
   const primary = parseTarget(config.primary, "primary", configPath);
   const fallback = parseTarget(config.fallback, "fallback", configPath);
   if (primary && fallback && sameModel(primary, fallback)) {
@@ -225,6 +249,9 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
     activeModelFallback: config.activeModelFallback,
     timeoutMs: config.timeoutMs,
     piBinary: config.piBinary,
+    awsProfile: config.awsProfile,
+    awsRegion: config.awsRegion,
+    env: config.env,
   };
 }
 
@@ -612,6 +639,69 @@ export function childBaseEnv(): Record<string, string> {
     if (value !== undefined) env[key] = value;
   }
   return env;
+}
+
+/**
+ * Compose the child process environment. Starts from the base allowlist (never
+ * touching the host process.env), then applies the child-scoped AWS settings
+ * (awsProfile -> AWS_PROFILE, awsRegion -> AWS_REGION + AWS_DEFAULT_REGION) and
+ * finally the verbatim `env` map, so an explicit `env` key overrides the AWS
+ * mapping. There is no built-in profile or region default: each is applied only
+ * when configured. The result is a fresh object — the host process.env is never
+ * mutated, so concurrent consultations cannot race on it.
+ */
+export function buildChildEnv(
+  config: { awsProfile?: string; awsRegion?: string; env?: Record<string, string> } | undefined,
+  base: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...base };
+  if (!config) return out;
+  if (config.awsProfile) out.AWS_PROFILE = config.awsProfile;
+  if (config.awsRegion) {
+    out.AWS_REGION = config.awsRegion;
+    out.AWS_DEFAULT_REGION = config.awsRegion;
+  }
+  if (config.env) {
+    for (const [key, value] of Object.entries(config.env)) {
+      // Object.defineProperty (not out[key] = value) so a user-supplied key like
+      // "__proto__" becomes an own data property (verbatim forwarding) instead of
+      // invoking the inherited prototype setter and silently dropping the entry.
+      Object.defineProperty(out, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * True when a config `env` value is an object mapping valid names to valid
+ * string values. Names must be non-empty and contain no '=' (ambiguous on POSIX
+ * name=value pairs) or NUL; values must be non-empty and NUL-free (a NUL makes
+ * Node's spawn throw EILSEQ/EINVAL). All string, so no prototype pollution.
+ */
+export function isChildEnv(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.entries(value as Record<string, unknown>).every(
+    ([name, v]) =>
+      name.length > 0 &&
+      !name.includes("=") &&
+      !name.includes("\u0000") &&
+      typeof v === "string" &&
+      v.length > 0 &&
+      !v.includes("\u0000"),
+  );
+}
+
+/**
+ * A single AWS field value (profile/region): a string that is not whitespace-only
+ * and NUL-free (a NUL would make Node's spawn throw; whitespace-only is meaningless).
+ */
+export function isAwsFieldValue(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && !value.includes("\u0000");
 }
 
 /**

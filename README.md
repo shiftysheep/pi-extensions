@@ -77,6 +77,8 @@ Third-party packs are plain npm dependencies: pi runs `npm install` after clonin
 
 `piBinary` (optional) sets the path of the `pi` binary the advisor spawns for consultations (default: `pi` on `PATH`, or `$PI_BINARY` if set).
 
+**Child-scoped environment** (`awsProfile`, `awsRegion`, `env`, all optional) applies variables to the advisor child process *only* — the host `process.env` is never mutated, so concurrent consultations cannot race on it. `awsRegion` sets both `AWS_REGION` and `AWS_DEFAULT_REGION`; `awsProfile` sets `AWS_PROFILE`; `env` is a map of extra variables (e.g. `{ "HTTPS_PROXY": "http://proxy:8080" }`) applied on top of the base allowlist and the AWS mapping, so an explicit `env` key wins. There is **no built-in profile or region default** — each is applied only when configured. This is how you point a Bedrock-hosted advisor at a different AWS profile/region (or a different proxy / credential set) than the host session.
+
 The file is **strictly validated**: unknown keys (top level or in a model slot) are rejected with an error naming the field, and `primary`/`fallback` must be different models (a fallback that reruns the same model would just repeat the failure it exists to avoid).
 
 **Upgrading from the old `exploreBudget` key:** it no longer exists — remove it from `advisor.json` (keep your model slots) so strict validation passes again. Until then the file is ignored with a warning in the result, and explicit `provider`/`model` tool calls still work.
@@ -107,8 +109,8 @@ the host's ambient environment. Consequences for models with **no entry in
 are stripped; but ambient **file** credentials discovered through the standard
 `HOME`-relative locations (e.g. a GCP application-default-credentials file, or
 the default `~/.aws` profile) still work, because the child inherits `HOME`. For
-env-var-based models, use `/login` or a stored API key, or see issue #8 for the
-child-scoped environment. The child's `auth.json` copy has its OAuth **refresh
+env-var-based models, use `/login` or a stored API key, or set the
+child-scoped `env` / `awsProfile` / `awsRegion` (see the config reference above). The child's `auth.json` copy has its OAuth **refresh
 token stripped** (and is read-only), so the child can never perform a token
 refresh — which is what protects the host's refresh token from being rotated
 server-side. The access token is pre-refreshed in the host first, so a

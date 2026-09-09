@@ -26,10 +26,12 @@ import { join } from "node:path";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
+  type AdvisorConfig,
   AdvisorEventAccumulator,
   type AdvisorReasoningEffort,
   assembleChildPrompt,
   assembleRequestText,
+  buildChildEnv,
   buildChildPiArgs,
   childBaseEnv,
   decideChildOutcome,
@@ -71,7 +73,7 @@ export async function consultWithChildProcess(opts: {
   /** Absolute monotonic-clock deadline (performance.now() base) for the whole consultation. */
   deadline: number;
   signal?: AbortSignal;
-  config?: { piBinary?: string };
+  config?: AdvisorConfig;
   /**
    * Internal test seam (used only by test/advisor-child.test.ts). Lets a test
    * inject a fake child spawn, a mocked group-kill (so a fabricated pid is never
@@ -291,7 +293,10 @@ export async function consultWithChildProcess(opts: {
     if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
     if (remainingBudgetMs(opts.deadline, performance.now()) <= 0)
       throw new Error("consultation timed out during setup");
-    const env = { ...childBaseEnv(), PI_CODING_AGENT_DIR: workDir };
+    // Child-scoped env: base allowlist + configured awsProfile/awsRegion/env,
+    // applied ONLY to the child (host process.env is never mutated). The host
+    // agent dir is always set by the transport and cannot be overridden.
+    const env = { ...buildChildEnv(opts.config, childBaseEnv()), PI_CODING_AGENT_DIR: workDir };
     const proc = spawnImpl(resolvePiBinary(opts.config, process.env), args, {
       cwd: opts.cwd,
       env,
