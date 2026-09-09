@@ -5,23 +5,24 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
   ADVISOR_MAX_ADVICE_CHARS,
   ADVISOR_MAX_DIAGNOSTIC_CHARS,
-  ADVISOR_MAX_MODEL_REQUESTS,
-  ADVISOR_MAX_TOOL_CALLS,
+  AdvisorEventAccumulator,
+  addUsage,
   assembleRequestText,
   buildCandidates,
   capAdviceText,
   capDiagnosticText,
   capTranscriptEntries,
+  composeAdviceText,
   createConcurrencyLimiter,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
   MAX_TRANSCRIPT_ENTRY_CHARS,
   parseConfig,
-  parseExploreBudget,
   parseTarget,
   REASONING_EFFORTS,
   redactSensitiveText,
@@ -31,8 +32,26 @@ import {
   splitEffortSuffix,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
+  timeoutPrefix,
   withSlot,
 } from "../extensions/lib/advisor-utils.js";
+
+function mkUsage(input: number, output: number): Usage {
+  return {
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input, output, cacheRead: 0, cacheWrite: 0, total: input + output },
+  };
+}
+
+const assistantMsg = (text: string, usage?: Usage) => ({
+  role: "assistant",
+  content: [{ type: "text", text }],
+  ...(usage ? { usage } : {}),
+});
 
 const CONFIG_PATH = "/home/user/.pi/agent/advisor.json";
 
@@ -447,56 +466,6 @@ describe("parseTarget", () => {
   });
 });
 
-describe("parseExploreBudget", () => {
-  it("returns undefined when unset", () => {
-    assert.equal(parseExploreBudget(undefined, CONFIG_PATH), undefined);
-  });
-
-  it("fills the missing field with the default", () => {
-    assert.deepEqual(parseExploreBudget({ toolCalls: 10 }, CONFIG_PATH), {
-      toolCalls: 10,
-      modelRequests: ADVISOR_MAX_MODEL_REQUESTS,
-    });
-    assert.deepEqual(parseExploreBudget({ modelRequests: 3 }, CONFIG_PATH), {
-      toolCalls: ADVISOR_MAX_TOOL_CALLS,
-      modelRequests: 3,
-    });
-  });
-
-  it("rejects non-object and empty budgets", () => {
-    assert.throws(
-      () => parseExploreBudget("x", CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget must be an object with toolCalls/modelRequests.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({}, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget requires at least one of toolCalls/modelRequests.`),
-    );
-  });
-
-  it("rejects values that are not positive integers", () => {
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 0 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be a positive integer.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 2.5 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be a positive integer.`),
-    );
-  });
-
-  it("rejects values above the hard ceilings", () => {
-    assert.throws(
-      () => parseExploreBudget({ toolCalls: 101 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.toolCalls must be at most 100.`),
-    );
-    assert.throws(
-      () => parseExploreBudget({ modelRequests: 41 }, CONFIG_PATH),
-      new RegExp(`${CONFIG_PATH}: exploreBudget.modelRequests must be at most 40.`),
-    );
-  });
-});
-
 describe("parseConfig", () => {
   it("rejects non-object top levels", () => {
     assert.throws(
@@ -516,7 +485,6 @@ describe("parseConfig", () => {
           primary: { provider: "a", model: "m1", effort: "low" },
           fallback: { model: "m2" },
           reasoningEffort: "high",
-          exploreBudget: { toolCalls: 5 },
           activeModelFallback: true,
           timeoutMs: 120_000,
         },
@@ -527,7 +495,6 @@ describe("parseConfig", () => {
         // parseTarget returns explicit undefined keys for absent sub-fields.
         fallback: { provider: undefined, model: "m2", effort: undefined },
         reasoningEffort: "high",
-        exploreBudget: { toolCalls: 5, modelRequests: ADVISOR_MAX_MODEL_REQUESTS },
         activeModelFallback: true,
         timeoutMs: 120_000,
       },
@@ -539,7 +506,6 @@ describe("parseConfig", () => {
     assert.equal(config.primary, undefined);
     assert.equal(config.fallback, undefined);
     assert.equal(config.reasoningEffort, undefined);
-    assert.equal(config.exploreBudget, undefined);
     assert.equal(config.activeModelFallback, undefined);
   });
 
@@ -561,14 +527,17 @@ describe("parseConfig", () => {
     );
   });
 
-  it("rejects unknown keys inside a model slot and exploreBudget", () => {
+  it("rejects unknown keys inside a model slot", () => {
     assert.throws(
       () => parseConfig({ primary: { model: "m", providerd: "a" } }, CONFIG_PATH),
       /primary has unknown key "providerd" \(allowed: provider, model, effort\)/,
     );
+  });
+
+  it("rejects the removed exploreBudget key as an unknown key", () => {
     assert.throws(
-      () => parseConfig({ exploreBudget: { toolCall: 5 } }, CONFIG_PATH),
-      /exploreBudget has unknown key "toolCall" \(allowed: toolCalls, modelRequests\)/,
+      () => parseConfig({ exploreBudget: { toolCalls: 5 } }, CONFIG_PATH),
+      /unknown key "exploreBudget" \(allowed: primary, fallback, reasoningEffort, activeModelFallback, timeoutMs\)/,
     );
   });
 
@@ -825,5 +794,110 @@ describe("createConcurrencyLimiter", () => {
     );
     // The failed work's finally still released the slot, so this completes.
     await withSlot(async () => {});
+  });
+});
+
+describe("addUsage", () => {
+  it("sums usages and preserves absent optional fields", () => {
+    const sum = addUsage(mkUsage(1, 2), mkUsage(3, 4));
+    assert.equal(sum.input, 4);
+    assert.equal(sum.output, 6);
+    assert.equal(sum.totalTokens, 10);
+    assert.equal(sum.cost.total, 10);
+    assert.equal(sum.reasoning, undefined);
+    const withReasoning = addUsage({ ...mkUsage(1, 2), reasoning: 5 }, mkUsage(3, 4));
+    assert.equal(withReasoning.reasoning, 5);
+  });
+});
+
+describe("AdvisorEventAccumulator", () => {
+  it("keeps earlier findings when the interrupted final assistant turn is empty", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("finding one", mkUsage(1, 1)) });
+    acc.record({ type: "tool_execution_start", toolName: "grep" });
+    acc.record({ type: "turn_start" });
+    // The interrupted final turn: assistant message with no text (thinking/tools only).
+    acc.record({ type: "message_end", message: { role: "assistant", content: [] } });
+    assert.equal(acc.toolCalls, 1);
+    assert.equal(acc.modelRequests, 2);
+    assert.equal(acc.finalText(true), "finding one");
+    // A completed run reports the final answer.
+    assert.equal(acc.finalText(false), "");
+  });
+
+  it("survives a synthetic failure agent_end carrying only an empty message", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("early analysis", mkUsage(2, 3)) });
+    // agent_end after an exception contains only the (empty) failure message —
+    // it must not discard the collected text or usage.
+    acc.record({
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [] }],
+    });
+    assert.equal(acc.finalText(true), "early analysis");
+    assert.equal(acc.usage?.output, 3);
+  });
+
+  it("aggregates usage per assistant message_end, never from agent_end", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "turn_start" });
+    acc.record({ type: "message_end", message: assistantMsg("a", mkUsage(1, 1)) });
+    acc.record({ type: "message_end", message: assistantMsg("b", mkUsage(2, 2)) });
+    acc.record({
+      type: "agent_end",
+      messages: [assistantMsg("a", mkUsage(1, 1)), assistantMsg("b", mkUsage(2, 2))],
+    });
+    assert.equal(acc.usage?.input, 3);
+    assert.equal(acc.usage?.output, 3);
+  });
+
+  it("completed runs report the last assistant text; duplicates are not repeated", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "message_end", message: assistantMsg("answer") });
+    acc.record({ type: "message_end", message: assistantMsg("answer") });
+    assert.equal(acc.finalText(false), "answer");
+    assert.equal(acc.finalText(true), "answer");
+  });
+
+  it("interrupted output includes every finding, completed only the last", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({ type: "message_end", message: assistantMsg("finding A") });
+    acc.record({ type: "message_end", message: assistantMsg("finding B") });
+    assert.equal(acc.finalText(true), "finding A\n\nfinding B");
+    assert.equal(acc.finalText(false), "finding B");
+  });
+});
+
+describe("composeAdviceText", () => {
+  it("keeps long partial output through the advice cap with the truncation marker", () => {
+    const long = `partial output\n${"x".repeat(ADVISOR_MAX_ADVICE_CHARS + 1_000)}`;
+    const text = composeAdviceText(timeoutPrefix("explore", 60_000, long), long, "FOOTER");
+    assert.ok(text.includes("advisor timed out after 60 seconds (incomplete)"));
+    assert.ok(text.includes("[truncated: "));
+    assert.ok(text.endsWith("FOOTER"));
+  });
+
+  it("renders completed results without a prefix", () => {
+    assert.equal(composeAdviceText("", "advice", "FOOTER"), "adviceFOOTER");
+  });
+});
+
+describe("timeoutPrefix", () => {
+  it("marks explore and review timeouts incomplete, with or without partial output", () => {
+    assert.equal(
+      timeoutPrefix("explore", 60_000, ""),
+      "advisor timed out after 60 seconds (incomplete)",
+    );
+    assert.equal(
+      timeoutPrefix("review", 30_000, ""),
+      "advisor request timed out after 30 seconds (incomplete)",
+    );
+    const withPartial = timeoutPrefix("explore", 90_000, "partial text");
+    assert.ok(withPartial.includes("advisor timed out after 90 seconds (incomplete)"));
+    assert.ok(
+      withPartial.includes("Partial output before the timeout (incomplete, not a verdict):"),
+    );
   });
 });
