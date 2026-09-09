@@ -2,9 +2,10 @@
  * Consultation transport for the advisor extension: every advisor model turn
  * and tool call runs in an isolated child `pi` process, never in the host
  * process. The child gets a throwaway agent dir (mkdtemp) holding only a copy
- * of auth.json (mode 0600), receives the prompt as an @path file reference,
- * and streams NDJSON events back; the temp dir is removed in a finally block
- * on success, failure, timeout, and abort.
+ * of auth.json plus the host's models config (mode 0600, so custom providers
+ * and model overrides resolve identically), receives the prompt as an @path
+ * file reference, and streams NDJSON events back; the temp dir is removed in a
+ * finally block on success, failure, timeout, and abort.
  *
  * This is a privilege boundary, not a filesystem sandbox: the child's read
  * tools still reach anything the OS user can read.
@@ -14,6 +15,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -23,8 +25,11 @@ import {
   assembleRequestText,
   buildChildPiArgs,
   childBaseEnv,
+  decideChildOutcome,
+  parseNdjsonLine,
   remainingBudgetMs,
   resolvePiBinary,
+  splitNdjsonLines,
 } from "../lib/advisor-utils.js";
 import { ADVISOR_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT } from "./request.js";
 
@@ -98,10 +103,16 @@ export async function consultWithChildProcess(opts: {
       ),
       { mode: 0o600 },
     );
-    const hostAuth = join(getAgentDir(), "auth.json");
-    if (existsSync(hostAuth)) {
-      copyFileSync(hostAuth, join(workDir, "auth.json"));
-      chmodSync(join(workDir, "auth.json"), 0o600);
+    // The child resolves the same model catalog as the host: credentials and
+    // custom provider/model definitions (models.json, models-store.json) are
+    // copied over 0600. Extensions are still not loaded in the child.
+    const hostAgentDir = getAgentDir();
+    for (const name of ["auth.json", "models.json", "models-store.json"]) {
+      const hostFile = join(hostAgentDir, name);
+      if (existsSync(hostFile)) {
+        copyFileSync(hostFile, join(workDir, name));
+        chmodSync(join(workDir, name), 0o600);
+      }
     }
 
     const args = buildChildPiArgs({
@@ -111,6 +122,12 @@ export async function consultWithChildProcess(opts: {
       tools,
       promptPath,
     });
+    // The deadline is absolute and setup above consumed real time: re-check
+    // immediately before starting paid work, and time the kill from the
+    // absolute deadline, not from the pre-setup measurement.
+    if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
+    if (remainingBudgetMs(opts.deadline, performance.now()) <= 0)
+      throw new Error("consultation timed out during setup");
     const env = { ...childBaseEnv(), PI_CODING_AGENT_DIR: workDir };
     const proc = spawn(resolvePiBinary(opts.config, process.env), args, {
       cwd: opts.cwd,
@@ -127,64 +144,62 @@ export async function consultWithChildProcess(opts: {
       timedOut = true;
       killChild();
     };
-    timer = setTimeout(onDeadline, remainingMs);
+    timer = setTimeout(onDeadline, remainingBudgetMs(opts.deadline, performance.now()));
     opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
-    // NDJSON line buffer: events arrive split arbitrarily across chunks.
+    // NDJSON line buffer: events arrive split arbitrarily across chunks, and
+    // multibyte characters can split across chunk boundaries (StringDecoder
+    // keeps decoding consistent). Malformed lines are skipped, never thrown.
     let buffer = "";
+    const decoder = new StringDecoder("utf8");
     const handleLine = (line: string): void => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
-      let event: unknown;
       try {
-        event = JSON.parse(trimmed);
-      } catch {
-        return;
-      }
-      const typed = event as { type?: string; toolName?: string };
-      if (typeof typed.type !== "string") return;
-      const message = (event as { message?: unknown }).message;
-      const messages = (event as { messages?: unknown[] }).messages;
-      acc.record({ type: typed.type, toolName: typed.toolName, message, messages });
-      if (typed.type === "tool_execution_start") {
-        opts.onUpdate?.({
-          content: [
-            {
-              type: "text",
-              text: `${opts.modelLabel} is exploring the workspace (tool call ${acc.toolCalls}: ${typed.toolName})...`,
+        const parsed = parseNdjsonLine(line);
+        if (!parsed) return;
+        acc.record(parsed);
+        if (parsed.type === "tool_execution_start")
+          opts.onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: `${opts.modelLabel} is exploring the workspace (tool call ${acc.toolCalls}: ${parsed.toolName})...`,
+              },
+            ],
+            details: {
+              model: opts.modelLabel,
+              toolCalls: acc.toolCalls,
+              toolName: parsed.toolName,
             },
-          ],
-          details: { model: opts.modelLabel, toolCalls: acc.toolCalls, toolName: typed.toolName },
-        });
+          });
+      } catch {
+        // A malformed event (or a throwing update callback) must never crash
+        // the host or orphan the child: skip it and keep draining the stream.
       }
     };
-    stdout.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
-      let idx = buffer.indexOf("\n");
-      while (idx >= 0) {
-        const line = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 1);
-        handleLine(line);
-        idx = buffer.indexOf("\n");
-      }
-    });
+    const handleChunk = (chunk: Buffer): void => {
+      const { lines, rest } = splitNdjsonLines(buffer + decoder.write(chunk));
+      buffer = rest;
+      for (const line of lines) handleLine(line);
+    };
+    stdout.on("data", handleChunk);
     stderr.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4_000);
     });
 
-    const exitCode = await new Promise<number>((resolve, reject) => {
-      proc.once("error", (error) => reject(error));
-      proc.once("close", (code) => resolve(code ?? -1));
-    }).catch((error: Error) => {
+    // A spawn failure (ENOENT, bad argv) surfaces as the child's "error" event;
+    // a successful spawn always ends in "close", so awaiting close is enough.
+    let spawnError: Error | undefined;
+    proc.once("error", (error) => (spawnError = error));
+    await new Promise<void>((resolve) => proc.once("close", () => resolve()));
+    if (spawnError)
       throw new Error(
-        `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${error.message}`,
+        `Could not start the advisor child process "${resolvePiBinary(opts.config, process.env)}": ${spawnError.message}`,
       );
-    });
+    handleChunk(Buffer.alloc(0)); // flush the decoder tail + the last un-newlined line
+    const exitCode = proc.exitCode ?? -1;
 
     const interrupted = timedOut || opts.signal?.aborted === true;
-    if (proc.signalCode && !timedOut && !opts.signal?.aborted)
-      throw new Error(`the advisor child process was killed by signal ${proc.signalCode}`);
-    let text = acc.finalText(interrupted);
+    const text = acc.finalText(interrupted);
     if (timedOut)
       return {
         text,
@@ -201,26 +216,25 @@ export async function consultWithChildProcess(opts: {
         modelRequests: acc.modelRequests,
         status: "aborted",
       };
-    const lastError = acc.lastError;
-    if (exitCode !== 0 && !text) {
-      const detail =
-        stderrTail.trim() ||
-        lastError ||
-        `the advisor child process exited with code ${exitCode} without output`;
-      throw new Error(detail);
-    }
-    // pi exits 0 even when the model call failed (the error rides in the
-    // assistant message): surface it, so a failed review degrades to the
-    // fallback instead of returning an empty "completed" answer.
-    if (lastError && !text) throw new Error(lastError);
-    if (lastError && text)
-      text = `${text}\n\n(advisor child reported an error after this output: ${lastError})`;
+    // pi exits 0 even for failed or no-response consultations, so the outcome
+    // is decided from the observed events, not the exit code.
+    const outcome = decideChildOutcome({
+      exitCode,
+      signalCode: proc.signalCode,
+      timedOut: false,
+      aborted: false,
+      assistantResponse: acc.assistantResponse,
+      stopReason: acc.stopReason,
+      lastError: acc.lastError,
+      text,
+      stderr: stderrTail,
+    });
     return {
-      text: text || "The advisor returned no text.",
+      text: outcome.text,
       usage: acc.usage,
       toolCalls: acc.toolCalls,
       modelRequests: acc.modelRequests,
-      status: "completed",
+      status: outcome.status,
     };
   } finally {
     if (killTimer !== undefined) clearTimeout(killTimer);

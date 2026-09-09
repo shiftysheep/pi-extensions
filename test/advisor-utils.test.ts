@@ -21,12 +21,14 @@ import {
   childBaseEnv,
   composeAdviceText,
   createConcurrencyLimiter,
+  decideChildOutcome,
   effortToThinkingLevel,
   keepEnd,
   keepStart,
   MAX_QUESTION_CHARS,
   MAX_TRANSCRIPT_ENTRY_CHARS,
   parseConfig,
+  parseNdjsonLine,
   parseTarget,
   REASONING_EFFORTS,
   redactSensitiveText,
@@ -35,6 +37,7 @@ import {
   resolveConsultTimeoutMs,
   resolvePiBinary,
   splitEffortSuffix,
+  splitNdjsonLines,
   TRANSCRIPT_ENTRY_CAP_MARKER,
   textFromContent,
   timeoutPrefix,
@@ -861,6 +864,7 @@ describe("AdvisorEventAccumulator", () => {
   it("captures the last assistant error message from message_end events", () => {
     const acc = new AdvisorEventAccumulator();
     assert.equal(acc.lastError, undefined);
+    assert.equal(acc.assistantResponse, false);
     acc.record({
       type: "message_end",
       message: {
@@ -871,9 +875,25 @@ describe("AdvisorEventAccumulator", () => {
       },
     });
     assert.equal(acc.lastError, "Codex error: The 'nope' model is not supported.");
-    // A later successful message does not clear the earlier error record.
+    assert.equal(acc.stopReason, "error");
+    assert.equal(acc.assistantResponse, true);
+    // A successful retry clears the error history, so a transient error
+    // followed by success is not mislabeled as an error after the answer.
     acc.record({ type: "message_end", message: assistantMsg("recovered", mkUsage(1, 1)) });
-    assert.equal(acc.lastError, "Codex error: The 'nope' model is not supported.");
+    assert.equal(acc.lastError, undefined);
+    // assistantMsg has no stopReason, so the last observed one stands.
+    assert.equal(acc.stopReason, "error");
+  });
+
+  it("records a fallback error message when stopReason is error without errorMessage", () => {
+    const acc = new AdvisorEventAccumulator();
+    acc.record({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "error" },
+    });
+    assert.equal(acc.lastError, "the model request failed");
+    assert.equal(acc.stopReason, "error");
+    assert.equal(acc.assistantResponse, true);
   });
 
   it("aggregates usage per assistant message_end, never from agent_end", () => {
@@ -994,6 +1014,121 @@ describe("childBaseEnv", () => {
 describe("assembleChildPrompt", () => {
   it("joins the system prompt and the request text with a separator", () => {
     assert.equal(assembleChildPrompt("SYS", "REQ"), "SYS\n\n---\n\nREQ");
+  });
+});
+
+describe("decideChildOutcome", () => {
+  const base = {
+    exitCode: 0,
+    signalCode: null,
+    timedOut: false,
+    aborted: false,
+    assistantResponse: true,
+    stopReason: "stop",
+    lastError: undefined,
+    text: "advice",
+    stderr: "",
+  };
+
+  it("completes a clean run", () => {
+    assert.deepEqual(decideChildOutcome(base), { text: "advice", status: "completed" });
+  });
+
+  it("throws when the child was killed by an external signal", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, signalCode: "SIGKILL" }),
+      /killed by signal SIGKILL/,
+    );
+  });
+
+  it("throws on exit-0 with no assistant response, using stderr as the detail", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          assistantResponse: false,
+          text: "",
+          stderr: "no auth configured",
+        }),
+      /no auth configured/,
+    );
+  });
+
+  it("throws on exit-0 with no assistant response and no stderr", () => {
+    assert.throws(
+      () => decideChildOutcome({ ...base, assistantResponse: false, text: "" }),
+      /returned no assistant response/,
+    );
+  });
+
+  it("throws on an error stop reason with no text", () => {
+    assert.throws(
+      () =>
+        decideChildOutcome({
+          ...base,
+          text: "",
+          stopReason: "error",
+          lastError: "Codex error: boom",
+        }),
+      /Codex error: boom/,
+    );
+  });
+
+  it("marks nonzero-exit partial output as incomplete", () => {
+    const outcome = decideChildOutcome({ ...base, exitCode: 3 });
+    assert.equal(outcome.status, "timed_out");
+    assert.ok(outcome.text.includes("exited abnormally (exit 3)"));
+    assert.ok(outcome.text.includes("incomplete, not a verdict"));
+    assert.ok(outcome.text.includes("advice"));
+  });
+
+  it("keeps an error note attached to partial text on an error stop reason", () => {
+    const outcome = decideChildOutcome({
+      ...base,
+      stopReason: "error",
+      lastError: "rate limited",
+    });
+    assert.equal(outcome.status, "completed");
+    assert.ok(outcome.text.includes("reported an error after this output: rate limited"));
+  });
+
+  it("falls back to the no-text placeholder when the run produced nothing", () => {
+    const outcome = decideChildOutcome({ ...base, text: "" });
+    assert.equal(outcome.text, "The advisor returned no text.");
+  });
+});
+
+describe("splitNdjsonLines", () => {
+  it("splits on newlines and keeps the trailing partial line as rest", () => {
+    assert.deepEqual(splitNdjsonLines("a\nb\nc"), { lines: ["a", "b"], rest: "c" });
+    assert.deepEqual(splitNdjsonLines("a\n"), { lines: ["a"], rest: "" });
+    assert.deepEqual(splitNdjsonLines(""), { lines: [], rest: "" });
+  });
+});
+
+describe("parseNdjsonLine", () => {
+  it("accepts a well-formed event and drops malformed shapes", () => {
+    const parsed = parseNdjsonLine('{"type":"tool_execution_start","toolName":"grep"}');
+    assert.equal(parsed?.type, "tool_execution_start");
+    assert.equal(parsed?.toolName, "grep");
+    assert.equal(parsed?.message, undefined);
+    assert.equal(parseNdjsonLine(""), undefined);
+    assert.equal(parseNdjsonLine("   "), undefined);
+    assert.equal(parseNdjsonLine("not json"), undefined);
+    assert.equal(parseNdjsonLine("null"), undefined);
+    assert.equal(parseNdjsonLine("42"), undefined);
+    assert.equal(parseNdjsonLine("[1,2]"), undefined);
+    assert.equal(parseNdjsonLine('{"noType":true}'), undefined);
+  });
+
+  it("coerces optional fields to their accepted shapes", () => {
+    const parsed = parseNdjsonLine(
+      '{"type":"message_end","toolName":7,"messages":"nope","message":{"role":"assistant"}}',
+    );
+    assert.equal(parsed?.type, "message_end");
+    assert.equal(parsed?.toolName, undefined);
+    assert.equal(parsed?.messages, undefined);
+    assert.deepEqual(parsed?.message, { role: "assistant" });
   });
 });
 

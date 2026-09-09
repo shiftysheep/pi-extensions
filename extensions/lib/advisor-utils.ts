@@ -499,6 +499,8 @@ export class AdvisorEventAccumulator {
   private findings: string[] = [];
   private lastText = "";
   private lastErrorMessage: string | undefined;
+  private sawAssistant = false;
+  private lastStopReason: string | undefined;
 
   record(event: {
     type: string;
@@ -524,10 +526,16 @@ export class AdvisorEventAccumulator {
           errorMessage?: string;
         }
       | undefined;
-    if (!message || message.role !== "assistant") return;
+    if (message?.role !== "assistant") return;
+    this.sawAssistant = true;
     if (message.usage) this.combinedUsage = addUsage(this.combinedUsage, message.usage);
-    if (message.stopReason === "error" && message.errorMessage)
-      this.lastErrorMessage = message.errorMessage;
+    if (message.stopReason !== undefined) this.lastStopReason = message.stopReason;
+    // A failed turn records its error; a successful terminal turn clears the
+    // history, so a transient error followed by a retry is not mislabeled as
+    // "an error after this output".
+    if (message.stopReason === "error")
+      this.lastErrorMessage = message.errorMessage || "the model request failed";
+    else this.lastErrorMessage = undefined;
     const text = textFromContent(message.content).trim();
     this.lastText = text;
     if (text) {
@@ -547,6 +555,16 @@ export class AdvisorEventAccumulator {
   /** Error message from the last assistant message that ended in an error (if any). */
   get lastError(): string | undefined {
     return this.lastErrorMessage;
+  }
+
+  /** Stop reason of the last assistant message (if any assistant message arrived). */
+  get stopReason(): string | undefined {
+    return this.lastStopReason;
+  }
+
+  /** True once at least one assistant message_end event was recorded. */
+  get assistantResponse(): boolean {
+    return this.sawAssistant;
   }
 }
 
@@ -592,6 +610,106 @@ export function resolvePiBinary(config: { piBinary?: string } | undefined, env: 
   const fromEnv = env.PI_BINARY?.trim();
   if (fromEnv) return fromEnv;
   return "pi";
+}
+
+/** Observed state of a finished child advisor process, for decideChildOutcome. */
+export type ChildCompletionState = {
+  exitCode: number;
+  /** Termination signal, if the child died to one. */
+  signalCode: string | null;
+  /** True if our own deadline fired (or the caller aborted). */
+  timedOut: boolean;
+  aborted: boolean;
+  /** True once at least one assistant message_end event arrived. */
+  assistantResponse: boolean;
+  /** Stop reason of the last assistant message. */
+  stopReason?: string;
+  lastError?: string;
+  /** Final answer for a completed run; earlier findings when interrupted. */
+  text: string;
+  /** Capped child stderr tail, for diagnostics. */
+  stderr: string;
+};
+
+/**
+ * Decide how a finished child consultation is reported. pi exits 0 even when
+ * the model call failed (the error rides in the assistant message) and even
+ * for some startup diagnostics, so exit code alone is not a success signal.
+ * Throws for attempts the caller should route to the fallback chain.
+ */
+export function decideChildOutcome(state: ChildCompletionState): {
+  text: string;
+  status: "completed" | "timed_out";
+} {
+  if (state.signalCode && !state.timedOut && !state.aborted)
+    throw new Error(
+      `the advisor child process was killed by signal ${state.signalCode} before completing`,
+    );
+  if (!state.assistantResponse)
+    throw new Error(
+      state.stderr.trim() ||
+        state.lastError ||
+        `the advisor child process (exit ${state.exitCode}) returned no assistant response`,
+    );
+  if (state.stopReason === "error" && !state.text) throw new Error(state.lastError ?? state.stderr);
+  if (state.exitCode !== 0)
+    return {
+      text: state.text
+        ? `the advisor child process exited abnormally (exit ${state.exitCode}); the partial output below is incomplete, not a verdict:\n\n${state.text}`
+        : `the advisor child process exited abnormally (exit ${state.exitCode}) without output`,
+      status: "timed_out",
+    };
+  if (state.stopReason === "error")
+    return {
+      text: `${state.text}\n\n(advisor child reported an error after this output: ${state.lastError ?? "unknown error"})`,
+      status: "completed",
+    };
+  return { text: state.text || "The advisor returned no text.", status: "completed" };
+}
+
+/**
+ * Split one chunk of child stdout into complete NDJSON lines. Returns the
+ * lines plus the (possibly empty) remainder to prepend to the next chunk.
+ */
+export function splitNdjsonLines(buffer: string): { lines: string[]; rest: string } {
+  const lines: string[] = [];
+  let rest = buffer;
+  let idx = rest.indexOf("\n");
+  while (idx >= 0) {
+    lines.push(rest.slice(0, idx));
+    rest = rest.slice(idx + 1);
+    idx = rest.indexOf("\n");
+  }
+  return { lines, rest };
+}
+
+/**
+ * Parse one NDJSON line into the event shape AdvisorEventAccumulator accepts.
+ * Returns undefined for empty, non-JSON, or non-object lines — malformed
+ * output must never crash the host process.
+ */
+export function parseNdjsonLine(
+  line: string,
+): { type: string; toolName?: string; message?: unknown; messages?: unknown[] } | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+  let event: unknown;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (typeof event !== "object" || event === null) return undefined;
+  const typed = event as {
+    type?: unknown;
+    toolName?: unknown;
+    message?: unknown;
+    messages?: unknown;
+  };
+  if (typeof typed.type !== "string") return undefined;
+  const toolName = typeof typed.toolName === "string" ? typed.toolName : undefined;
+  const messages = Array.isArray(typed.messages) ? typed.messages : undefined;
+  return { type: typed.type, toolName, message: typed.message, messages };
 }
 
 /**
