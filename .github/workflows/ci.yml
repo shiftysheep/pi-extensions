@@ -82,18 +82,6 @@ jobs:
           # lease would fail with "stale info" because checkout fetches tags
           # without remote-tracking refs.
           git push -f origin "refs/tags/${version}"
-          # A head branch pushed by the bot puts the PR's pull_request CI run
-          # in the "action required" state; approve it so the required check
-          # can complete (gh has no approve subcommand; use the API).
-          for i in $(seq 1 10); do
-            run_id=$(gh run list --limit 1 --branch "release/${version}" \
-              --json databaseId,status --jq '.[0] | select(.status != "completed") | .databaseId // empty')
-            if [ -n "$run_id" ]; then
-              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" -X POST 2>/dev/null || true
-              break
-            fi
-            sleep 15
-          done
           # Reuse the release PR if a previous attempt left one open.
           pr_number=$(gh pr list --head "release/${version}" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr_number" ]; then
@@ -102,10 +90,19 @@ jobs:
               --body "Automatic release by the CI release job.")
             pr_number=${pr_url##*/}
           fi
-          # Checks take a moment to register after the PR is created; --watch
-          # fails immediately if none are reported yet.
+          # The PR's pull_request CI run can take a few minutes to appear and,
+          # for a head pushed by the bot, starts in the "action required" state.
+          # Poll until a check is reported on the PR, approving the run as it
+          # appears (gh has no approve subcommand; use the API).
           for i in $(seq 1 20); do
-            [ "$(gh pr view "$pr_number" --json statusCheckRollup --jq '.statusCheckRollup | length')" != "0" ] && break
+            run_id=$(gh run list --limit 1 --branch "release/${version}" \
+              --json databaseId,status --jq '.[0] | select(.status != "completed") | .databaseId // empty')
+            if [ -n "$run_id" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/approve" -X POST 2>/dev/null || true
+            fi
+            if [ "$(gh pr view "$pr_number" --json statusCheckRollup --jq '.statusCheckRollup | length')" != "0" ]; then
+              break
+            fi
             sleep 15
           done
           # Wait for the required check, then merge (a PR merge is allowed by protection).
