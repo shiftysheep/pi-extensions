@@ -71,6 +71,18 @@ function workDirs(): string[] {
   );
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** True if a process with this pid exists and is killable by us. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 function consult(bin: string, mode: "review" | "explore" = "review") {
   return consultWithChildProcess({
     model: MODEL,
@@ -200,12 +212,16 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
       );
       assert.ok(files.includes("prompt.txt"), `work dir missing prompt.txt: ${files}`);
       assert.equal(modeMap.get("prompt.txt"), "600", "prompt.txt must be 0600");
-      // Each host config file that exists must be copied 0600 and byte-identical.
+      // Each host config file that exists must be copied and byte-identical.
+      // auth.json is 0400 (read-only, so the child can never rotate the host's
+      // refresh token); models.json / models-store.json are 0600 read-only
+      // catalogs.
       const hostAgentDir = join(process.env.HOME ?? "", ".pi", "agent");
       for (const name of ["auth.json", "models.json", "models-store.json"]) {
         if (!existsSync(join(hostAgentDir, name))) continue;
         assert.ok(files.includes(name), `work dir missing ${name}: ${files}`);
-        assert.equal(modeMap.get(name), "600", `${name} must be 0600`);
+        const expectedMode = name === "auth.json" ? "400" : "600";
+        assert.equal(modeMap.get(name), expectedMode, `${name} must be 0${expectedMode}`);
         assert.equal(identicalMap.get(name), "same", `${name} must be byte-identical to host`);
       }
     } finally {
@@ -431,6 +447,60 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     }
     rmSync(pidFile, { force: true });
     assert.deepEqual(workDirs(), before, "work dir must be removed after the bounded wait");
+  });
+
+  it("kills an in-group descendant that holds the pipes after the leader exits (early-exit teardown)", {
+    timeout: 15_000,
+  }, async () => {
+    const before = workDirs();
+    const dir = mkdtempSync(join(tmpdir(), "pi-advisor-fake-"));
+    fakeDirs.push(dir);
+    // pidFile lives in the fake dir (cleaned by the after hook), not the shared
+    // tmpdir, so an interrupted run can't leave an artifact that pollutes
+    // workDirs() in a later test.
+    const pidFile = join(dir, "desc.pid");
+    // The leader emits a valid stop, then spawns an in-group descendant that
+    // inherits the pipes (holding them open) and stays alive, and exits 0. The
+    // "close" wait resolves via the leader dying + grace (NOT the deadline), so
+    // the consultation completes on the normal path — and the unconditional
+    // group teardown in finally must then SIGKILL the in-group descendant.
+    writeFileSync(
+      join(dir, "pi"),
+      "#!/usr/bin/env node\n" +
+        'process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"ok"}],stopReason:"stop",usage:{input:1,output:2}}}) + "\\n");\n' +
+        "setTimeout(() => {\n" +
+        `  require("node:child_process").spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},50);", ${JSON.stringify(pidFile)}], { stdio: ["ignore", "inherit", "inherit"] });\n` +
+        "  process.exit(0);\n" +
+        "}, 150);\n",
+    );
+    chmodSync(join(dir, "pi"), 0o755);
+    const result = await consultWithChildProcess({
+      model: MODEL,
+      modelLabel: "fake/fake-model",
+      question: "q",
+      transcript: "",
+      effort: "low",
+      cwd: process.cwd(),
+      mode: "review",
+      deadline: performance.now() + 8_000,
+      config: { piBinary: join(dir, "pi") },
+    });
+    // The leader exited 0 with a valid stop reason, so the consultation
+    // completes (not a timeout).
+    assert.equal(result.status, "completed");
+    assert.equal(result.text, "ok");
+    // The in-group descendant holds the pipes, so without the unconditional
+    // group teardown it would survive (and keep the host's event loop alive).
+    let pid = 0;
+    for (let i = 0; i < 60 && pid === 0; i++) {
+      if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, "utf8").trim());
+      else await sleep(50);
+    }
+    assert.ok(pid > 0, "descendant pid was not recorded");
+    for (let i = 0; i < 40 && isAlive(pid); i++) await sleep(50);
+    assert.equal(isAlive(pid), false, "in-group descendant survived the early-exit teardown");
+    rmSync(pidFile, { force: true });
+    assert.deepEqual(workDirs(), before, "work dir must be removed");
   });
 
   it("survives a throwing update callback without orphaning the child", async () => {

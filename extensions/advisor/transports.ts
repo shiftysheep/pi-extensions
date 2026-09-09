@@ -166,7 +166,16 @@ export async function consultWithChildProcess(opts: {
       const hostFile = join(hostAgentDir, name);
       if (existsSync(hostFile)) {
         copyFileSync(hostFile, join(workDir, name));
-        chmodSync(join(workDir, name), 0o600);
+        // auth.json is the credential store: make the child's copy READ-ONLY so
+        // the child can never rotate (and thereby invalidate) the host's refresh
+        // token. If the copied token turns out to be near-expiry and the child
+        // tries to refresh, the write fails and the model call degrades to an
+        // auth error (handled by the fallback chain) instead of corrupting the
+        // host's canonical credential. The pre-refresh in advisorExecute keeps
+        // the copied token fresh, so the normal case never needs to refresh.
+        // models.json / models-store.json are read-only catalogs anyway (0600).
+        const mode = name === "auth.json" ? 0o400 : 0o600;
+        chmodSync(join(workDir, name), mode);
       }
     }
 
@@ -266,9 +275,6 @@ export async function consultWithChildProcess(opts: {
     const exitCode = proc.exitCode ?? -1;
 
     if (interruptCause !== undefined) {
-      // Guarantee the group is actually dead before returning, so a
-      // SIGTERM-ignoring descendant does not survive the timeout/abort.
-      await awaitGroupTearDown();
       const interruptedText = acc.finalText(true);
       return {
         text: interruptedText,
@@ -298,6 +304,25 @@ export async function consultWithChildProcess(opts: {
       status: outcome.status,
     };
   } finally {
+    // Finish group teardown UNCONDITIONALLY, on every exit path (not just the
+    // interrupt path): an in-group descendant can outlive the immediate child
+    // after a clean exit too, and must not be left running. Escalate to
+    // SIGKILL and bound the wait on the immediate child dying, so a wedged
+    // group can never hang the slot. (No-op for a normally-exited plain child.
+    // A descendant that escaped to a new session cannot be signalled by group —
+    // a portable limitation — but destroying the pipes below still stops the
+    // host from being held alive by the open pipe.)
+    await awaitGroupTearDown();
+    // Stop reading the child's pipes. A descendant that escaped to a new
+    // session can still hold the write end after the group is gone; destroying
+    // the host's read handles stops it from keeping this process's event loop
+    // alive and from firing data/update callbacks after we have returned.
+    try {
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+    } catch {
+      /* already destroyed */
+    }
     if (killTimer !== undefined) clearTimeout(killTimer);
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onOuterAbort);

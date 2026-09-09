@@ -65,28 +65,24 @@ export function formatTarget(target: AdvisorTarget | undefined): string {
 /**
  * Best-effort pre-refresh of a near-expiry OAuth credential in the host's
  * canonical credential store, so a spawned child (which copies auth.json into a
- * throwaway agent dir) is *less likely* to need to refresh on its own copy.
+ * throwaway agent dir) inherits an already-fresh token.
  *
- * Why: the child's auth.json is deleted when it exits, so a refresh the child
- * performs on its own copy would rotate the token in a store that is then
- * discarded — for a rotating/single-use refresh token that invalidates the
- * host's refresh token. Refreshing in the host first means the child copies an
- * already-fresh token and usually never refreshes at all.
- *
- * This is a **mitigation, not a guarantee.** pi only refreshes a token that is
- * within its ~5-minute near-expiry window; a token just *outside* that window
- * at pre-refresh time can still cross into it during the child's run (especially
- * a long explore consultation), at which point the child would rotate it on its
- * disposable copy. Fully eliminating that race requires coordinating refresh and
- * persistence through a single canonical store (or a read-only child store),
- * which is part of the child-credential/environment design deferred to issue #8.
+ * This works together with the child transport, which copies auth.json into the
+ * child's agent dir and makes that copy READ-ONLY. The read-only copy is what
+ * protects the host: the child can never rotate (and thereby invalidate) the
+ * host's refresh token, because it cannot write its own copy. The pre-refresh's
+ * job is to keep the copied token *fresh* so the child does not need to refresh
+ * at all — pi only refreshes a token within its ~5-minute near-expiry window,
+ * and a token that crosses into that window during the child's run would fail
+ * its (read-only) refresh attempt and degrade to an auth error, handled by the
+ * fallback chain, instead of corrupting the host credential.
  *
  * `ctx.modelRegistry.getProviderAuth` resolves the provider's auth through pi —
  * which refreshes a near-expiry token and persists the rotated credential into
  * the host's real auth.json — so the child copies the fresh token.
  *
  * Best-effort: never throws. A refresh failure (or a hung refresh that the cap
- * times out) just means the child reports its own auth error and the fallback
+ * times out) just means the child may report its own auth error and the fallback
  * chain handles it; we must not block a consultation because a proactive
  * refresh could not complete. API-key providers (no OAuth) are a fast no-op.
  */

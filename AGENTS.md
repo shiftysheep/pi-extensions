@@ -90,9 +90,10 @@ wizard; release bumps always go through Python commitizen's `cz bump`.
   env extensions for the child belong in issue #8's design, not ad-hoc `env` merges. Because of that allowlist, a model with
   no `auth.json` entry whose credential is resolved from a *set env var* (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `AWS_PROFILE`/region, …) does not resolve in the child (the var is stripped); ambient *file* credentials found via the
-  inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. Known limitation addressed by #8. OAuth tokens
-  are pre-refreshed into the host `auth.json` before the child copies it (`preRefreshProviderAuth`) — a mitigation, not a
-  guarantee (a token crossing pi's ~5-minute refresh window during the child's run can still rotate on the child's copy).
+  inherited `HOME` (a GCP ADC file, the default `~/.aws` profile) still work. Known limitation addressed by #8. The child's
+  `auth.json` copy is read-only (transports.ts), so it can never rotate (and invalidate) the host's refresh token; tokens
+  are also pre-refreshed in the host first (`preRefreshProviderAuth`) so the child inherits a fresh token it need not
+  refresh. A near-expiry token that a child tries to refresh fails its read-only write and degrades to an auth error.
 - `node_modules/` is gitignored but `package-lock.json` is committed — don't ignore it.
 
 ## Hook setup (fresh clone / CI)
