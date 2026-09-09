@@ -129,9 +129,12 @@ function sessionTranscript(ctx: { sessionManager: { getBranch(): unknown[] } }):
     lines.push(`### ${label}\n${text}`);
   }
 
-  // Cap each entry before joining so one large tool result cannot evict the
-  // rest of the caller-supplied context; then redact and cap the whole thing.
-  const transcript = redactSensitiveText(capTranscriptEntries(lines).join("\n\n"));
+  // Redact each entry while it is still complete — a cap applied BEFORE
+  // redaction could sever a PEM block's closing delimiter and let key
+  // material survive. Then cap each entry so one large tool result cannot
+  // evict the rest of the caller-supplied context, and cap the whole thing.
+  const redacted = lines.map((line) => redactSensitiveText(line));
+  const transcript = redactSensitiveText(capTranscriptEntries(redacted).join("\n\n"));
   return keepEnd(transcript, MAX_SESSION_CONTEXT_CHARS, "[Earlier session context omitted.]\n\n");
 }
 
@@ -960,13 +963,13 @@ export default function (pi: ExtensionAPI) {
     name: "advisor",
     label: "Advisor",
     description:
-      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor does NOT receive the session transcript by default: cite workspace paths for anything on disk in the question, and paste only evidence that exists nowhere on disk (command output, a test failure, observed runtime behavior). includeSession:true opt-in attaches the redacted transcript as optional, caller-curated context the advisor must verify against the workspace. Mode "review" (default) is a single model call answering from the question — use it for consequential decisions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) that verifies the question against the workspace itself — use it when the answer must come from repository facts. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, reasoning effort ("none".."max"), and a per-call timeoutMs (clamped 30000..1800000; covers the whole consultation, fallback chain included; overrides the config timeoutMs and the mode default of 5 min review / 10 min explore). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json, which is strictly validated (unknown keys are rejected with an error naming the field). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
+      'Consult a configured Pi model for an independent expert review, debugging second opinion, or design recommendation. The advisor does NOT receive the session transcript by default: cite workspace paths for anything on disk in the question, and paste only evidence that exists nowhere on disk (command output, a test failure, observed runtime behavior). includeSession:true opt-in attaches the redacted transcript as optional, caller-curated context the advisor must verify against the workspace. Mode "review" (default) is a single model call answering from the question — cheap; use it for self-contained questions where a second opinion could change the approach. Mode "explore" runs the advisor as a read-only sub-agent (read/grep/find/ls, hard tool-call and model-request caps) that verifies the question against the workspace itself — use it whenever the answer must come from the source, e.g. any code review or claim about what code does, since the advisor does not see your session. Do not repeat a consultation without new evidence or a materially different question. Optionally select provider, model, reasoning effort ("none".."max"), and a per-call timeoutMs (clamped 30000..1800000; covers the whole consultation, fallback chain included; overrides the config timeoutMs and the mode default of 5 min review / 10 min explore). Defaults and request-level fallback are read from ~/.pi/agent/advisor.json, which is strictly validated (unknown keys are rejected with an error naming the field). At most 2 consultations run at once; extras queue. Returned advice is capped at 100k characters and error diagnostics at 4k; larger output is cut with a visible [truncated] marker.',
     promptSnippet:
       "Consult a configured Pi model for an independent expert review or design second opinion",
     promptGuidelines: [
       "The advisor does NOT see the session by default — cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (command output, a test failure, observed behavior); do not paste large code blocks or secrets.",
       "Use advisor after gathering relevant evidence when a task would benefit from an independent code review, debugging second opinion, security assessment, or design decision.",
-      "Use the default review mode for most consultations; set mode to explore only when the question requires locating code or verifying repository facts — exploration costs more tokens and time.",
+      "Use review mode (default) for self-contained questions and cheap second opinions; use mode: explore for questions whose answer must come from the source — e.g. 'is this code review correct?' or any claim about what the code does — since the advisor does not see your session and review mode cannot read the workspace. Explore costs more tokens and time.",
       "Use advisor.provider and advisor.model to select a configured Pi model when the configured advisor defaults are not appropriate.",
       "Do not repeat a consultation without new evidence or a materially different question.",
       "Treat the advisor response as advice to validate, not authority to blindly follow.",
@@ -989,7 +992,7 @@ export default function (pi: ExtensionAPI) {
       mode: Type.Optional(
         Type.String({
           description:
-            'Consultation mode. "review" (default): a single model call that answers from the question; it identifies missing evidence rather than inspecting the repo. "explore": the advisor runs a read-only agent (read/grep/find/ls) that verifies the question against the workspace itself; bounded by hard tool-call/model-request caps (configurable via exploreBudget in advisor.json) and costs more tokens and time.',
+            'Consultation mode. "review" (default): a single model call that answers from the question; cheap, but it cannot read the workspace — use it for self-contained questions. "explore": the advisor runs a read-only agent (read/grep/find/ls) that verifies the question against the workspace itself — use it for code reviews and any answer that must come from the source; bounded by hard tool-call/model-request caps (configurable via exploreBudget in advisor.json) and costs more tokens and time.',
           enum: ["review", "explore"],
         }),
       ),
