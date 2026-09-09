@@ -61,6 +61,13 @@ jobs:
             echo "No non-merge commits since ${last_tag}; nothing to release."
             exit 0
           fi
+          # A previous failed release attempt may have left a stray remote tag
+          # for the version about to be computed; cz bump cannot recreate a tag
+          # that already exists locally. Real release tags are always ancestors
+          # of HEAD, so any non-ancestor tag is stray and safe to drop.
+          for t in $(git tag -l 'v*'); do
+            git merge-base --is-ancestor "$t" HEAD 2>/dev/null || git tag -d "$t" >/dev/null
+          done
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           uv run --with 'commitizen==4.18.*' cz bump --yes
