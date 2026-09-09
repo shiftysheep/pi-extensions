@@ -74,9 +74,13 @@ jobs:
           # cz created the release commit + tag locally; ship them on a branch
           # and merge through a PR (direct pushes to main are rejected).
           version=$(git tag --points-at HEAD)
-          # force-with-lease: a retried run may already have pushed stale
-          # release/vX.Y.Z branch + tag refs from an earlier attempt.
-          git push --force-with-lease origin "HEAD:refs/heads/release/${version}" "refs/tags/${version}"
+          # force-with-lease: a retried run may already have pushed a stale
+          # release/vX.Y.Z branch from an earlier attempt.
+          git push --force-with-lease origin "HEAD:refs/heads/release/${version}"
+          # The tag is written only by this job, so a plain force is safe; a
+          # lease would fail with "stale info" because checkout fetches tags
+          # without remote-tracking refs.
+          git push -f origin "refs/tags/${version}"
           # Reuse the release PR if a previous attempt left one open.
           pr_number=$(gh pr list --head "release/${version}" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr_number" ]; then
