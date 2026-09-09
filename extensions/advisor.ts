@@ -538,21 +538,23 @@ async function consultWithAgentSession(opts: {
     }
   });
 
-  // The deadline is absolute: session creation above is already deducted.
-  if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
-  const remainingMs = remainingBudgetMs(opts.deadline, performance.now());
-  if (remainingMs <= 0) throw new Error("consultation timed out during setup");
+  // The deadline is absolute: session creation above is already deducted. The
+  // checks live inside the try so a setup-time abort/timeout still disposes the
+  // already-created session and removes its subscription.
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    void session.abort();
-  }, remainingMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const onOuterAbort = () => {
     void session.abort();
   };
-  opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
-
   try {
+    if (opts.signal?.aborted) throw new Error("aborted before the consultation started");
+    const remainingMs = remainingBudgetMs(opts.deadline, performance.now());
+    if (remainingMs <= 0) throw new Error("consultation timed out during setup");
+    timer = setTimeout(() => {
+      timedOut = true;
+      void session.abort();
+    }, remainingMs);
+    opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
     await session.prompt(
       assembleRequestText(opts.model, opts.question, opts.transcript, ADVISOR_SYSTEM_PROMPT.length),
       {
@@ -560,9 +562,10 @@ async function consultWithAgentSession(opts: {
       },
     );
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onOuterAbort);
     unsubscribe();
+    session.dispose();
   }
 
   if (timedOut)

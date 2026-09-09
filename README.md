@@ -96,6 +96,8 @@ Models are managed with `/advisor`:
 /advisor effort <level>               set the shared default reasoning effort (none..max)
 /advisor clear [slot]                 remove a slot, the default effort ("effort"), or both
 /advisor reset                        back up advisor.json to advisor.json.bak and start clean
+
+`/advisor reset` — and any `/advisor set|primary|fallback` run that repairs a broken file — backs the previous file up to `advisor.json.bak` first (only the latest backup is retained).
 ```
 
 Reasoning effort is layered: a tool-call `effort` override wins, then the model-specific
