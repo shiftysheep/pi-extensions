@@ -36,14 +36,17 @@ pi config                # enable/disable individual extensions from here or the
 The package's `pi` manifest lists each `extensions/*.ts` entry explicitly, so you can install the repo and load only the extension(s) you want — e.g. just the advisor, without cron, the permission gate, the status line, or any bundled pack:
 
 ```bash
-# from the package's settings object (pi config / settings.json):
+# from the package's settings object (pi config / settings.json).
+# Empty skills/prompts arrays keep the bundled packs' resources off too:
 {
   "source": "git:github.com/shiftysheep/pi-extensions@v2.1.0",
-  "extensions": ["extensions/advisor.ts"]   # only this entry loads
+  "extensions": ["extensions/advisor.ts"],
+  "skills": [],
+  "prompts": []
 }
 ```
 
-Or, for a local checkout, pass the extension file directly as a single-extension source (no npm deps needed — it only uses pi's bundled core packages):
+Or, for a local checkout, pass the extension file directly as a single-extension source (no npm deps needed — it only uses pi's bundled core packages; pi keeps a reference to the file, so keep `extensions/advisor/` and `extensions/lib/` in place):
 
 ```bash
 pi install /path/to/pi-extensions/extensions/advisor.ts
