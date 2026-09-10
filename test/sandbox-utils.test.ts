@@ -58,6 +58,7 @@ describe("parseSandboxConfig", () => {
         homeCaches: "ro",
         network: "deny",
         userCommands: true,
+        loginShell: false,
       },
       P,
     );
@@ -67,6 +68,7 @@ describe("parseSandboxConfig", () => {
     assert.equal(cfg.homeCaches, "ro");
     assert.equal(cfg.network, "deny");
     assert.equal(cfg.userCommands, true);
+    assert.equal(cfg.loginShell, false);
   });
   it("rejects non-objects", () => {
     assert.throws(() => parseSandboxConfig(null, P), /expected a JSON object/);
@@ -82,6 +84,7 @@ describe("parseSandboxConfig", () => {
     assert.throws(() => parseSandboxConfig({ home: "maybe" }, P), /"home" must be/);
     assert.throws(() => parseSandboxConfig({ homeCaches: "maybe" }, P), /"homeCaches" must be/);
     assert.throws(() => parseSandboxConfig({ network: "sometimes" }, P), /"network" must be/);
+    assert.throws(() => parseSandboxConfig({ loginShell: "yes" }, P), /"loginShell" must be/);
   });
 });
 
@@ -252,6 +255,7 @@ describe("wrapWithBwrap", () => {
   const policy = {
     writableRoots: ["/home/u/proj", "/tmp", "/dev", "/proc"],
     network: "deny" as const,
+    loginShell: true,
   };
   it("ro-binds / first, binds rw roots, unshares net/user/pid", () => {
     const cmd = wrapWithBwrap("ls -la", policy, CTX);
@@ -266,11 +270,19 @@ describe("wrapWithBwrap", () => {
     const cmd = wrapWithBwrap("ls", { ...policy, network: "allow" }, CTX);
     assert.ok(!cmd.includes("--unshare-net"));
   });
+  it("uses -c when loginShell is false", () => {
+    const cmd = wrapWithBwrap("ls", { ...policy, loginShell: false }, CTX);
+    assert.ok(cmd.endsWith("-- /bin/bash -c 'ls'"));
+  });
 });
 
 describe("wrapWithLandlock", () => {
   it("passes rw roots and the helper path", () => {
-    const policy = { writableRoots: ["/home/u/proj", "/tmp"], network: "allow" as const };
+    const policy = {
+      writableRoots: ["/home/u/proj", "/tmp"],
+      network: "allow" as const,
+      loginShell: true,
+    };
     const cmd = wrapWithLandlock("ls", policy, {
       ...CTX,
       helperPath: "/home/u/.cache/pi-sandbox-landlock",
@@ -280,6 +292,14 @@ describe("wrapWithLandlock", () => {
         "'/home/u/.cache/pi-sandbox-landlock' --rw '/home/u/proj' --rw '/tmp' -- /bin/bash -lc 'ls'",
       ),
     );
+  });
+  it("uses -c when loginShell is false", () => {
+    const cmd = wrapWithLandlock(
+      "ls",
+      { writableRoots: ["/tmp"], network: "allow", loginShell: false },
+      CTX,
+    );
+    assert.ok(cmd.endsWith("-- /bin/bash -c 'ls'"));
   });
 });
 
@@ -319,6 +339,24 @@ describe("buildSeatbeltProfile", () => {
     assert.ok(profile.includes('(subpath "/spaced \\"dir\\"")'));
     assert.ok(profile.includes('(subpath "/back\\\\slash")'));
   });
+  it("grants /dev as specific device literals, not a subpath", () => {
+    const profile = buildSeatbeltProfile({ writableRoots: ["/tmp", "/dev"], network: "deny" });
+    assert.ok(!profile.includes('(subpath "/dev")'));
+    assert.ok(profile.includes('(allow file-write-data (literal "/dev/null")'));
+    assert.ok(profile.includes('(literal "/dev/stdout")'));
+    assert.ok(profile.includes('(literal "/dev/stderr")'));
+    assert.ok(profile.includes('(literal "/dev/tty")'));
+    assert.ok(profile.includes('(subpath "/tmp")'));
+  });
+  it("emits no device grants when /dev is not a root", () => {
+    const profile = buildSeatbeltProfile({ writableRoots: ["/tmp"], network: "deny" });
+    assert.ok(!profile.includes("file-write-data"));
+  });
+  it("/dev-only roots still emit the device grants", () => {
+    const profile = buildSeatbeltProfile({ writableRoots: ["/dev"], network: "deny" });
+    assert.ok(!profile.includes("file-write*"));
+    assert.ok(profile.includes("file-write-data"));
+  });
 });
 
 describe("sbplQuote", () => {
@@ -331,16 +369,28 @@ describe("sbplQuote", () => {
 
 describe("wrapWithSandboxExec", () => {
   it("embeds the profile inline (no -- separator)", () => {
-    const cmd = wrapWithSandboxExec("ls", { writableRoots: ["/tmp"], network: "allow" }, CTX);
+    const cmd = wrapWithSandboxExec(
+      "ls",
+      { writableRoots: ["/tmp"], network: "allow", loginShell: true },
+      CTX,
+    );
     assert.ok(cmd.startsWith("sandbox-exec -p '"));
     assert.ok(cmd.includes("(version 1)"));
     assert.ok(cmd.endsWith("/bin/bash -lc 'ls'"));
     assert.ok(!cmd.includes(" -- "));
   });
+  it("uses -c when loginShell is false", () => {
+    const cmd = wrapWithSandboxExec(
+      "ls",
+      { writableRoots: ["/tmp"], network: "allow", loginShell: false },
+      CTX,
+    );
+    assert.ok(cmd.endsWith("/bin/bash -c 'ls'"));
+  });
 });
 
 describe("wrapCommand dispatch", () => {
-  const policy = { writableRoots: ["/tmp"], network: "allow" as const };
+  const policy = { writableRoots: ["/tmp"], network: "allow" as const, loginShell: true };
   it("routes to each runner", () => {
     assert.ok(wrapCommand("bwrap", "ls", policy, CTX).startsWith("bwrap "));
     assert.ok(wrapCommand("landlock", "ls", policy, CTX).includes("--rw '/tmp'"));

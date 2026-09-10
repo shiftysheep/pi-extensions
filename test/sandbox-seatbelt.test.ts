@@ -96,6 +96,33 @@ describe("seatbelt profile", () => {
     assert.ok(r.stdout.includes("OK"));
   });
 
+  it("allows stderr redirects to /dev/null", () => {
+    const r = run("printf x 2> /dev/null && echo OK");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("OK"));
+  });
+
+  it("allows pipes (file-write on anonymous pipes under deny-default)", () => {
+    const r = run("echo hi | cat && echo PIPE_OK");
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("PIPE_OK"));
+  });
+
+  it("allows tee to /dev/stderr (fd alias grant)", () => {
+    const r = run("echo warn | tee /dev/stderr >/dev/null; echo tee=$?");
+    assert.ok(r.stdout.includes("tee="), r.stdout + r.stderr);
+    assert.ok(r.stdout.includes("tee=0"), `tee /dev/stderr must succeed: ${r.stdout} ${r.stderr}`);
+  });
+
+  it("allows bash process substitution (writes to /dev/fd/N)", () => {
+    const res = spawnSync(b, ["-p", profile("allow"), "/bin/bash", "-c", "cat < <(echo sub)"], {
+      encoding: "utf8",
+      timeout: RUN_TIMEOUT_MS,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.ok(res.stdout.includes("sub"), res.stdout + res.stderr);
+  });
+
   it("executes external binaries with args intact", () => {
     const res = spawnSync(b, ["-p", profile("allow"), "/bin/echo", "a b", "c'd"], {
       encoding: "utf8",
