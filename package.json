@@ -11,7 +11,7 @@
     "lint": "biome check",
     "format": "biome check --write",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts",
+    "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
     "check": "biome check && tsc --noEmit && npm test",
     "commit": "cz",
     "commit:msg": "commitlint --edit",
