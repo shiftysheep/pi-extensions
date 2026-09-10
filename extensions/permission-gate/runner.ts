@@ -12,7 +12,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { SandboxRunner, SandboxRunnerChoice } from "../lib/sandbox-utils.js";
+import {
+  buildSeatbeltProfile,
+  type SandboxRunner,
+  type SandboxRunnerChoice,
+  shellQuote,
+} from "../lib/sandbox-utils.js";
 
 export type RunnerProbeResult =
   | { ok: true; runner: SandboxRunner; detail: string; helperPath?: string }
@@ -104,11 +109,86 @@ function probeLandlock(): RunnerProbeResult {
   };
 }
 
-/** sandbox-exec: presence only (profiles are validated by the OS at runtime). */
+/**
+ * sandbox-exec: run a real canary, like the bwrap/Landlock probes. A
+ * presence-only check let broken profiles through (invalid SBPL, see #43) and
+ * then failed EVERY command at runtime instead of degrading to gate-only.
+ * The canary proves the generated profile parses and the write boundary
+ * holds: write inside the root OK, write outside denied.
+ */
 function probeSandboxExec(): RunnerProbeResult {
   const bin = which("sandbox-exec");
   if (!bin) return { ok: false, reason: "sandbox-exec not found (macOS only)" };
-  return { ok: true, runner: "sandbox-exec", detail: bin };
+  let parent: string | undefined;
+  try {
+    parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sandbox-exec-probe-"));
+    // Seatbelt matches subpaths against CANONICAL paths; mkdtemp under
+    // $TMPDIR may be a symlinked form (/var/folders -> /private/var/folders).
+    const canaryDir = fs.realpathSync(path.join(parent, "canary"));
+    fs.mkdirSync(canaryDir);
+    const canaryFile = path.join(canaryDir, "canary");
+    const outside = path.join(parent, "outside.txt");
+    // Baseline: the outside target must be writable WITHOUT the sandbox, so
+    // a later denial is attributable to the sandbox, not file permissions.
+    const baseline = spawnSync("/bin/sh", ["-c", `touch ${shellQuote(outside)}`], {
+      encoding: "utf8",
+      timeout: CANARY_TIMEOUT_MS,
+    });
+    if (baseline.status !== 0) {
+      return {
+        ok: false,
+        reason: `sandbox-exec canary setup failed: outside target not writable (${(
+          baseline.stderr ?? ""
+        ).trim()})`,
+      };
+    }
+    const profile = buildSeatbeltProfile({ writableRoots: [canaryDir], network: "allow" });
+    const write = spawnSync(
+      bin,
+      [
+        "-p",
+        profile,
+        "/bin/sh",
+        "-c",
+        `printf ok > ${shellQuote(canaryFile)} && cat ${shellQuote(canaryFile)}`,
+      ],
+      { encoding: "utf8", timeout: CANARY_TIMEOUT_MS },
+    );
+    if (write.status !== 0 || !write.stdout.includes("ok")) {
+      return {
+        ok: false,
+        reason: `sandbox-exec canary failed (exit ${write.status ?? "?"}): ${
+          (write.stderr ?? "").trim() || "profile rejected or write boundary broken"
+        }`,
+      };
+    }
+    const denied = spawnSync(
+      bin,
+      ["-p", profile, "/bin/sh", "-c", `touch ${shellQuote(outside)} && echo SHOULD_BE_DENIED`],
+      { encoding: "utf8", timeout: CANARY_TIMEOUT_MS },
+    );
+    if (denied.status === null) {
+      return { ok: false, reason: "sandbox-exec canary timed out on the denied-write check" };
+    }
+    if (denied.status === 0) {
+      return {
+        ok: false,
+        reason:
+          "sandbox-exec canary: write outside the writable roots was NOT denied (boundary broken)",
+      };
+    }
+    return { ok: true, runner: "sandbox-exec", detail: bin };
+  } catch (err) {
+    return { ok: false, reason: `sandbox-exec canary setup failed: ${String(err)}` };
+  } finally {
+    if (parent) {
+      try {
+        fs.rmSync(parent, { recursive: true, force: true });
+      } catch {
+        // cleanup failure must not override the probe result
+      }
+    }
+  }
 }
 
 export function resolveRunner(choice: SandboxRunnerChoice): RunnerProbeResult {
