@@ -68,6 +68,7 @@ import { type SelectItem, SelectList, type SelectListTheme, Text } from "@earend
 import {
   applySandboxToggle,
   buildWritableRoots,
+  canonicalizeTarget,
   isInsideAnyRoot,
   mergeSandboxConfigs,
   parseSandboxConfig,
@@ -324,7 +325,24 @@ export default function (pi: ExtensionAPI) {
     homeDir: os.homedir(),
     shellPath: "/bin/bash",
     helperPath: state.active ? state.helperPath : undefined,
+    tmpDir: process.env.TMPDIR,
   });
+
+  /** fs predicates shared by policy building and the write/edit guard. */
+  const dirExists = (p: string): boolean => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  const canon = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
 
   /** Probe runners and build the policy for a merged config. */
   function computeState(
@@ -341,13 +359,7 @@ export default function (pi: ExtensionAPI) {
         ],
       };
     const policy = {
-      writableRoots: buildWritableRoots(cfg, runnerContext(cwd), (p) => {
-        try {
-          return fs.statSync(p).isDirectory();
-        } catch {
-          return false;
-        }
-      }),
+      writableRoots: buildWritableRoots(cfg, runnerContext(cwd), dirExists, canon),
       network: cfg.network ?? "allow",
     };
     const networkEnforced = probe.runner !== "landlock";
@@ -406,7 +418,11 @@ export default function (pi: ExtensionAPI) {
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
       if (!state.active) return undefined;
       const target = path.resolve(ctx.cwd, String((event.input as { path?: string }).path ?? ""));
-      if (isInsideAnyRoot(target, state.policy.writableRoots)) return undefined;
+      // Containment must compare like-with-like: roots are canonicalized in
+      // buildWritableRoots, so canonicalize the target the same way (deepest
+      // existing ancestor + missing tail) or /tmp/file would miss /private/tmp.
+      if (isInsideAnyRoot(canonicalizeTarget(target, dirExists, canon), state.policy.writableRoots))
+        return undefined;
       if (!ctx.hasUI) {
         return {
           block: true,

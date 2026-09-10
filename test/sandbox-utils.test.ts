@@ -9,6 +9,7 @@ import {
   applySandboxToggle,
   buildSeatbeltProfile,
   buildWritableRoots,
+  canonicalizeTarget,
   isInsideAnyRoot,
   isInsideRoot,
   mergeSandboxConfigs,
@@ -167,6 +168,70 @@ describe("buildWritableRoots", () => {
     const roots = buildWritableRoots({ home: "rw" }, CTX, exists);
     assert.ok(roots.includes("/home/u"));
     assert.ok(!roots.includes("/home/u/.cache")); // subsumed by /home/u
+  });
+  it("canonicalizes symlinked roots (macOS /tmp -> /private/tmp)", () => {
+    const REALPATH: Record<string, string> = {
+      "/tmp": "/private/tmp",
+      "/tmp/scratch": "/private/tmp/scratch",
+      "/dev": "/some/dev", // even if /dev were a symlink, it stays literal
+      "/var/scratch": "/private/var/scratch",
+      "/var/folders/xx/T": "/private/var/folders/xx/T",
+    };
+    const fs2 = new Set(FS).add("/tmp/scratch").add("/var/scratch").add("/var/folders/xx/T");
+    const roots = buildWritableRoots(
+      { writable: ["/tmp/scratch", "/var/scratch"] },
+      { ...CTX, tmpDir: "/var/folders/xx/T" },
+      (p) => fs2.has(p),
+      (p) => REALPATH[p] ?? p,
+    );
+    assert.ok(roots.includes("/private/tmp")); // system root canonicalized
+    assert.ok(!roots.includes("/tmp")); // literal symlink form never emitted
+    // configured paths canonicalized; /tmp/scratch subsumed by /private/tmp
+    assert.ok(!roots.includes("/tmp/scratch"));
+    assert.ok(!roots.includes("/private/tmp/scratch"));
+    assert.ok(roots.includes("/private/var/scratch"));
+    assert.ok(!roots.includes("/var/scratch"));
+    assert.ok(roots.includes("/private/var/folders/xx/T")); // $TMPDIR added, canonicalized
+    assert.ok(roots.includes("/dev")); // device root stays literal (bwrap --dev)
+    assert.ok(!roots.includes("/some/dev"));
+  });
+  it("skips a $TMPDIR that canonicalizes to /", () => {
+    const roots = buildWritableRoots(
+      {},
+      { ...CTX, tmpDir: "/var/folders/root" },
+      (p) => FS.has(p) || p === "/var/folders/root",
+      (p) => (p === "/var/folders/root" ? "/" : p),
+    );
+    assert.ok(!roots.includes("/"));
+  });
+  it("omits $TMPDIR when ctx.tmpDir is unset", () => {
+    const roots = buildWritableRoots({}, CTX, exists);
+    assert.ok(!roots.some((r) => r.includes("/var/folders")));
+  });
+  it("skips a missing $TMPDIR instead of walking up to /", () => {
+    const roots = buildWritableRoots({}, { ...CTX, tmpDir: "/var/folders/gone" }, exists);
+    assert.ok(!roots.includes("/"));
+    assert.ok(!roots.some((r) => r.includes("/var/folders")));
+  });
+});
+
+describe("canonicalizeTarget", () => {
+  const REALPATH: Record<string, string> = { "/tmp": "/private/tmp" };
+  const rp = (p: string) => REALPATH[p] ?? p;
+  it("canonicalizes via the deepest existing ancestor", () => {
+    assert.equal(canonicalizeTarget("/tmp/file.txt", exists, rp), "/private/tmp/file.txt");
+  });
+  it("appends the missing tail for new files", () => {
+    assert.equal(
+      canonicalizeTarget("/home/u/proj/sub/new/f.txt", exists, rp),
+      "/home/u/proj/sub/new/f.txt",
+    );
+  });
+  it("canonicalizes an existing directory target", () => {
+    assert.equal(canonicalizeTarget("/tmp", exists, rp), "/private/tmp");
+  });
+  it("falls back to the literal path when nothing exists", () => {
+    assert.equal(canonicalizeTarget("/nope/way/nope/f", exists, rp), "/nope/way/nope/f");
   });
 });
 
