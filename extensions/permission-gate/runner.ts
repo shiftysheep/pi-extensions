@@ -214,8 +214,10 @@ function probeSandboxExec(): RunnerProbeResult {
     parent = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sandbox-exec-probe-"));
     // Seatbelt matches subpaths against CANONICAL paths; mkdtemp under
     // $TMPDIR may be a symlinked form (/var/folders -> /private/var/folders).
-    const canaryDir = fs.realpathSync(path.join(parent, "canary"));
-    fs.mkdirSync(canaryDir);
+    // mkdir FIRST: realpath(3) requires the path to exist.
+    const canaryDirRaw = path.join(parent, "canary");
+    fs.mkdirSync(canaryDirRaw);
+    const canaryDir = fs.realpathSync(canaryDirRaw);
     const canaryFile = path.join(canaryDir, "canary");
     const outside = path.join(parent, "outside.txt");
     // Baseline: the outside target must be writable WITHOUT the sandbox, so
