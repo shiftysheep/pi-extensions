@@ -213,6 +213,17 @@ So a project can opt in or out independently of your global default — e.g. glo
 }
 ```
 
+**Capability matrix** — what each runner actually enforces:
+
+| Runner | Platform | Filesystem boundary | Network policy | Privilege to set up | Notes |
+|---|---|---|---|---|---|
+| `bwrap` | Linux | rw only under writable roots (fresh private `/tmp`, `/proc` under the default root set) | enforced (`--unshare-net`) | unprivileged user namespaces | preferred; canary-probed at session start |
+| `landlock` | Linux ≥ 5.13 | rw only under writable roots | **not enforced** (warning) | C compiler (checked at session start), or a prebuilt `landlockHelper` | fallback; canary-probed |
+| `sandbox-exec` | macOS | rw only under writable roots | enforced | none | Seatbelt; Apple-deprecated (removal ⇒ gate-only); canary-probed |
+| *(none)* | Windows / no runner available | **gate-only** (heuristic prompts) | n/a | n/a | fail-open by default; `failIfUnavailable: true` blocks instead |
+
+The story in one line: the gate is a heuristic prompt guard; the sandbox is the OS-level boundary; landlock cannot do network; and when no runner can be established you either get a loud fail-open warning or a fail-closed block — never a silent middle ground.
+
 **Commands** (all take effect immediately, no `/reload` needed):
 
 - `/sandbox` — live status (runner, writable roots, network policy, fallback reason, config paths).
