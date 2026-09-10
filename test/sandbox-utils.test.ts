@@ -11,6 +11,7 @@ import {
   buildSeatbeltProfile,
   buildWritableRoots,
   canonicalizeTarget,
+  describeSandboxState,
   isInsideAnyRoot,
   isInsideRoot,
   isNoexecPath,
@@ -24,6 +25,7 @@ import {
   resolveExistingRoot,
   type SandboxConfig,
   sandboxConfigPath,
+  sandboxStateSignature,
   sbplQuote,
   shellQuote,
   wrapCommand,
@@ -624,5 +626,77 @@ describe("parseWritableList", () => {
   });
   it("single unquoted path", () => {
     assert.deepEqual(parseWritableList("/tmp/x"), ["/tmp/x"]);
+  });
+});
+
+describe("sandboxStateSignature", () => {
+  it("distinguishes the four effective states", () => {
+    assert.equal(sandboxStateSignature({ active: false, enabled: false }), "off");
+    assert.equal(
+      sandboxStateSignature({ active: false, enabled: true, reason: "no bwrap" }),
+      "enabled-unavailable",
+    );
+    assert.equal(
+      sandboxStateSignature({ active: false, enabled: true, reason: "no bwrap", failClosed: true }),
+      "failclosed",
+    );
+    assert.equal(
+      sandboxStateSignature({
+        active: true,
+        enabled: true,
+        runner: "bwrap",
+        policy: { writableRoots: ["/w"], network: "allow", loginShell: true },
+        networkEnforced: true,
+      }),
+      "active:bwrap",
+    );
+  });
+  it("same state yields the same signature (change detection)", () => {
+    const a = { active: false, enabled: false } as const;
+    assert.equal(
+      sandboxStateSignature(a),
+      sandboxStateSignature({ active: false, enabled: false }),
+    );
+  });
+});
+
+describe("describeSandboxState", () => {
+  it("describes an active sandbox with roots and network policy", () => {
+    assert.equal(
+      describeSandboxState({
+        active: true,
+        enabled: true,
+        runner: "landlock",
+        policy: { writableRoots: ["/w/a", "/w/b"], network: "deny", loginShell: false },
+        networkEnforced: false,
+      }),
+      "ACTIVE (landlock): writes only inside /w/a, /w/b; network deny requested but NOT enforced",
+    );
+  });
+  it("reports network denied only when actually enforced", () => {
+    assert.equal(
+      describeSandboxState({
+        active: true,
+        enabled: true,
+        runner: "bwrap",
+        policy: { writableRoots: ["/w"], network: "deny", loginShell: true },
+        networkEnforced: true,
+      }),
+      "ACTIVE (bwrap): writes only inside /w; network denied",
+    );
+  });
+  it("describes disabled and unavailable states", () => {
+    assert.equal(
+      describeSandboxState({ active: false, enabled: false }),
+      "DISABLED: no filesystem restrictions",
+    );
+    assert.equal(
+      describeSandboxState({ active: false, enabled: true, reason: "no runner" }),
+      "enabled but no runner available; commands run UNSANDBOXED",
+    );
+    assert.equal(
+      describeSandboxState({ active: false, enabled: true, reason: "no runner", failClosed: true }),
+      "enabled but no runner available; affected commands are BLOCKED",
+    );
   });
 });

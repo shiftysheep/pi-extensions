@@ -82,6 +82,7 @@ import {
   applySandboxToggle,
   buildWritableRoots,
   canonicalizeTarget,
+  describeSandboxState,
   isInsideAnyRoot,
   managedSandboxConfigPath,
   mergeSandboxConfigs,
@@ -93,7 +94,9 @@ import {
   type SandboxPolicy,
   type SandboxRunnerChoice,
   type SandboxScope,
+  type SandboxState,
   sandboxConfigPath,
+  sandboxStateSignature,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
 import { findDangerousPowerShellRule } from "./permission-gate/powershell-rules.js";
@@ -108,25 +111,6 @@ const USAGE =
   '  /sandbox on       enable (project scope; runner defaults to "auto"; an explicit runner in either scope is kept)\n' +
   "  /sandbox off      disable (project scope)\n" +
   "  /sandbox config   interactive editor (pick the global or project scope)";
-
-type SandboxState =
-  | { active: false; enabled: false }
-  | {
-      active: false;
-      enabled: true;
-      reason: string;
-      /** failIfUnavailable: commands are BLOCKED, not run unsandboxed. */
-      failClosed?: boolean;
-    }
-  | {
-      active: true;
-      enabled: true;
-      runner: "bwrap" | "landlock" | "sandbox-exec";
-      policy: SandboxPolicy;
-      helperPath?: string;
-      /** false when network=deny is requested but the runner cannot enforce it (landlock). */
-      networkEnforced: boolean;
-    };
 
 /** Both scope config file paths for a working directory. */
 function sandboxConfigFiles(cwd: string): Record<SandboxScope, string> {
@@ -533,6 +517,26 @@ export default function (pi: ExtensionAPI) {
     }
     if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
     applySandbox(loaded.config, ctx.ui, ctx.cwd, true, loaded.managedConfig);
+  });
+
+  // --- Tell the MODEL about sandbox state changes -------------------------
+  // Toggles (/sandbox on|off, config edits) are only visible to the user in the
+  // TUI; without this the model keeps assuming the old restrictions (or their
+  // absence) and mistakes an intentional toggle for a transient failure.
+  let lastStateSignature: string | undefined;
+
+  pi.on("before_agent_start", (event) => {
+    const signature = sandboxStateSignature(state);
+    const changed = lastStateSignature !== undefined && signature !== lastStateSignature;
+    lastStateSignature = signature;
+    if (!changed && !state.active) return;
+    const notes: string[] = [];
+    if (changed)
+      notes.push(
+        `[sandbox] State changed since your last turn — now ${describeSandboxState(state)}. This is an intentional user action, not a transient error: update your assumptions about which paths are writable and whether commands are restricted.`,
+      );
+    if (state.active) notes.push(`[sandbox] Current state: ${describeSandboxState(state)}.`);
+    return { systemPrompt: `${event.systemPrompt}\n\n${notes.join("\n")}` };
   });
 
   pi.on("tool_call", async (event, ctx) => {

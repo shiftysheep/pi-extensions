@@ -109,6 +109,48 @@ export type SandboxPolicy = {
   loginShell: boolean;
 };
 
+/** Effective sandbox state after config + runner probing. */
+export type SandboxState =
+  | { active: false; enabled: false }
+  | {
+      active: false;
+      enabled: true;
+      reason: string;
+      /** failIfUnavailable: commands are BLOCKED, not run unsandboxed. */
+      failClosed?: boolean;
+    }
+  | {
+      active: true;
+      enabled: true;
+      runner: "bwrap" | "landlock" | "sandbox-exec";
+      policy: SandboxPolicy;
+      helperPath?: string;
+      /** false when network=deny is requested but the runner cannot enforce it (landlock). */
+      networkEnforced: boolean;
+    };
+
+/** Compact identity of a SandboxState, used to detect changes between turns. */
+export function sandboxStateSignature(state: SandboxState): string {
+  if (state.active) return `active:${state.runner}`;
+  if (!state.enabled) return "off";
+  return state.failClosed ? "failclosed" : "enabled-unavailable";
+}
+
+/** One-line human/model-readable description of the effective sandbox state. */
+export function describeSandboxState(state: SandboxState): string {
+  if (state.active) {
+    const network =
+      state.policy.network !== "deny"
+        ? "allowed"
+        : state.networkEnforced
+          ? "denied"
+          : "deny requested but NOT enforced";
+    return `ACTIVE (${state.runner}): writes only inside ${state.policy.writableRoots.join(", ")}; network ${network}`;
+  }
+  if (!state.enabled) return "DISABLED: no filesystem restrictions";
+  return `enabled but no runner available${state.failClosed ? "; affected commands are BLOCKED" : "; commands run UNSANDBOXED"}`;
+}
+
 export type RunnerContext = {
   cwd: string;
   homeDir: string;
