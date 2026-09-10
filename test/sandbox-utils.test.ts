@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  applyManagedSandboxConfig,
   applySandboxToggle,
   buildSeatbeltProfile,
   buildWritableRoots,
@@ -13,6 +14,7 @@ import {
   isInsideAnyRoot,
   isInsideRoot,
   isNoexecPath,
+  managedSandboxConfigPath,
   mergeSandboxConfigs,
   normalizeHelperPath,
   normalizeSandboxPath,
@@ -90,6 +92,10 @@ describe("parseSandboxConfig", () => {
     assert.throws(() => parseSandboxConfig({ network: "sometimes" }, P), /"network" must be/);
     assert.throws(() => parseSandboxConfig({ loginShell: "yes" }, P), /"loginShell" must be/);
     assert.throws(() => parseSandboxConfig({ landlockHelper: "" }, P), /"landlockHelper" must be/);
+    assert.throws(
+      () => parseSandboxConfig({ failIfUnavailable: "yes" }, P),
+      /"failIfUnavailable" must be/,
+    );
   });
 });
 
@@ -507,6 +513,63 @@ describe("mergeSandboxConfigs", () => {
   it("project writable: [] overrides a non-empty global list (empty is defined)", () => {
     const merged = mergeSandboxConfigs({ writable: ["~/g"] }, { writable: [] });
     assert.deepEqual(merged.writable, []);
+  });
+});
+
+describe("applyManagedSandboxConfig", () => {
+  it("returns the user config unchanged when managed is empty", () => {
+    const user = { enabled: true, writable: ["/a"] };
+    assert.equal(applyManagedSandboxConfig(user, {}), user);
+  });
+  it("pins scalar keys (admin can force enabled despite user opt-out)", () => {
+    const merged = applyManagedSandboxConfig(
+      { enabled: false, runner: "bwrap", failIfUnavailable: false },
+      { enabled: true, failIfUnavailable: true },
+    );
+    assert.equal(merged.enabled, true);
+    assert.equal(merged.failIfUnavailable, true);
+    assert.equal(merged.runner, "bwrap"); // unset in managed: user value kept
+  });
+  it("managed scalars win over user values", () => {
+    const merged = applyManagedSandboxConfig(
+      { network: "allow" as const, home: "rw" as const },
+      { network: "deny" as const },
+    );
+    assert.equal(merged.network, "deny");
+    assert.equal(merged.home, "rw");
+  });
+  it("writable can only be narrowed (intersection)", () => {
+    const merged = applyManagedSandboxConfig(
+      { writable: ["/opt", "/etc"] },
+      { writable: ["/opt", "/var"] },
+    );
+    assert.deepEqual(merged.writable, ["/opt"]);
+  });
+  it("managed writable: [] narrows everything away", () => {
+    const merged = applyManagedSandboxConfig({ writable: ["/etc"] }, { writable: [] });
+    assert.deepEqual(merged.writable, []);
+  });
+  it("unset managed writable leaves the user list unrestricted", () => {
+    const merged = applyManagedSandboxConfig({ writable: ["/etc"] }, { enabled: true });
+    assert.deepEqual(merged.writable, ["/etc"]);
+  });
+  it("does not mutate its inputs", () => {
+    const user = { enabled: false, writable: ["/a", "/b"] };
+    const managed = { enabled: true, writable: ["/a"] };
+    applyManagedSandboxConfig(user, managed);
+    assert.deepEqual(user, { enabled: false, writable: ["/a", "/b"] });
+    assert.deepEqual(managed, { enabled: true, writable: ["/a"] });
+  });
+});
+
+describe("managedSandboxConfigPath", () => {
+  it("posix: /etc/pi/agent/sandbox.json", () => {
+    assert.equal(managedSandboxConfigPath("linux"), "/etc/pi/agent/sandbox.json");
+    assert.equal(managedSandboxConfigPath("darwin"), "/etc/pi/agent/sandbox.json");
+  });
+  it("win32: %ProgramData%\\pi\\agent\\sandbox.json", () => {
+    assert.equal(managedSandboxConfigPath("win32"), "C:\\ProgramData\\pi\\agent\\sandbox.json");
+    assert.equal(managedSandboxConfigPath("win32", "D:\\PD"), "D:\\PD\\pi\\agent\\sandbox.json");
   });
 });
 

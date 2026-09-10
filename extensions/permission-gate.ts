@@ -40,8 +40,14 @@
  *     "network": "allow",       // allow | deny (deny is a no-op+warning on landlock)
  *     "userCommands": false,    // also sandbox user `!` commands
  *     "loginShell": true,        // true: bash -lc (login profile sourced); false: bash -c
- *     "landlockHelper": "~/bin/pi-sandbox-landlock"  // prebuilt helper (skip compilation)
+ *     "landlockHelper": "~/bin/pi-sandbox-landlock",  // prebuilt helper (skip compilation)
+ *     "failIfUnavailable": false // true: block commands when no runner resolves (fail-closed)
  *   }
+ *
+ * A third, highest-precedence MANAGED scope exists for admin/fleet use:
+ * /etc/pi/agent/sandbox.json (Windows: %ProgramData%\pi\agent\sandbox.json).
+ * Scalar keys there win outright (an admin can pin enabled: true);
+ * "writable" can only be narrowed (intersected) by lower scopes.
  *
  * Commands:
  *   /sandbox          show live status (runner, writable roots, network policy)
@@ -64,6 +70,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
+  type BashOperations,
   CONFIG_DIR_NAME,
   createLocalBashOperations,
   getAgentDir,
@@ -71,10 +78,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type SelectItem, SelectList, type SelectListTheme, Text } from "@earendil-works/pi-tui";
 import {
+  applyManagedSandboxConfig,
   applySandboxToggle,
   buildWritableRoots,
   canonicalizeTarget,
   isInsideAnyRoot,
+  managedSandboxConfigPath,
   mergeSandboxConfigs,
   parseSandboxConfig,
   parseWritableList,
@@ -102,7 +111,13 @@ const USAGE =
 
 type SandboxState =
   | { active: false; enabled: false }
-  | { active: false; enabled: true; reason: string }
+  | {
+      active: false;
+      enabled: true;
+      reason: string;
+      /** failIfUnavailable: commands are BLOCKED, not run unsandboxed. */
+      failClosed?: boolean;
+    }
   | {
       active: true;
       enabled: true;
@@ -123,14 +138,24 @@ function sandboxConfigFiles(cwd: string): Record<SandboxScope, string> {
 }
 
 export type LoadedSandboxConfigs = {
-  /** Merged (per-key, project wins) config. Empty on error. */
+  /** Merged config (per-key project wins, then the managed layer). Empty on error. */
   config: SandboxConfig;
   /** Per-scope configs as read (project is {} when untrusted or on error). */
   globalConfig: SandboxConfig;
   projectConfig: SandboxConfig;
+  /** Managed (admin) config as read; {} when the file is absent. */
+  managedConfig: SandboxConfig;
   files: Record<SandboxScope, string>;
-  /** Set when either scope file failed to parse/validate. */
+  /** Managed config file path (highest precedence). */
+  managedFile: string;
+  /** Set when any scope file failed to parse/validate. */
   error?: string;
+  /** Advisory warning (e.g. a lower scope was invalid but the managed
+   * policy is enforced anyway). */
+  warning?: string;
+  /** A malformed MANAGED file: fail closed — refuse to run without a
+   * verified admin policy. */
+  managedFailClosed?: boolean;
 };
 
 /** Read + strictly validate one scope file. Absent file = empty config. */
@@ -145,25 +170,82 @@ function readScopeConfig(file: string): SandboxConfig {
  */
 function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandboxConfigs {
   const files = sandboxConfigFiles(cwd);
+  const managedFile = managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA);
+  // The managed layer is read INDEPENDENTLY: a malformed user file must not
+  // drop the admin policy, and vice versa.
+  let managedConfig: SandboxConfig | undefined;
+  let managedError: string | undefined;
+  try {
+    managedConfig = readScopeConfig(managedFile);
+  } catch (err) {
+    managedError = String(err instanceof Error ? err.message : err);
+  }
   let globalConfig: SandboxConfig;
   let projectConfig: SandboxConfig;
   try {
     globalConfig = readScopeConfig(files.global);
     projectConfig = projectTrusted ? readScopeConfig(files.project) : {};
   } catch (err) {
+    const lowerError = String(err instanceof Error ? err.message : err);
+    if (managedError) {
+      return {
+        config: {},
+        globalConfig: {},
+        projectConfig: {},
+        managedConfig: {},
+        files,
+        managedFile,
+        error: `${lowerError}; managed: ${managedError}`,
+        managedFailClosed: true,
+      };
+    }
+    if (managedConfig && Object.keys(managedConfig).length > 0) {
+      // A lower-scope error must not defeat managed enforcement: run the
+      // managed policy alone (fail-closed if it says so).
+      return {
+        config: applyManagedSandboxConfig({}, managedConfig),
+        globalConfig: {},
+        projectConfig: {},
+        managedConfig,
+        files,
+        managedFile,
+        warning: `${lowerError} — managed policy enforced instead`,
+      };
+    }
     return {
       config: {},
       globalConfig: {},
       projectConfig: {},
+      managedConfig: {},
       files,
-      error: String(err instanceof Error ? err.message : err),
+      managedFile,
+      error: lowerError,
+    };
+  }
+  if (managedError) {
+    // A malformed managed file fails closed: refuse to run without a
+    // verified admin policy.
+    return {
+      config: {},
+      globalConfig: {},
+      projectConfig: {},
+      managedConfig: {},
+      files,
+      managedFile,
+      error: `managed config invalid: ${managedError}`,
+      managedFailClosed: true,
     };
   }
   return {
-    config: mergeSandboxConfigs(globalConfig, projectConfig),
+    config: applyManagedSandboxConfig(
+      mergeSandboxConfigs(globalConfig, projectConfig),
+      managedConfig ?? {},
+    ),
     globalConfig,
     projectConfig,
+    managedConfig: managedConfig ?? {},
     files,
+    managedFile,
   };
 }
 
@@ -322,6 +404,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       description: "prebuilt Landlock helper path (skips compilation; Linux only)",
     },
     {
+      value: "failIfUnavailable",
+      label: `failIfUnavailable: ${draft.failIfUnavailable ?? "false"}`,
+      description: "block commands instead of running unsandboxed when no runner resolves",
+    },
+    {
       value: "writable",
       label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
       description: "extra directories sandboxed commands may write to",
@@ -333,6 +420,7 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
 
 export default function (pi: ExtensionAPI) {
   let config: SandboxConfig = {};
+  let managedConfig: SandboxConfig = {};
   let state: SandboxState = { active: false, enabled: false };
   let localBashOps: ReturnType<typeof createLocalBashOperations> | undefined;
 
@@ -367,13 +455,17 @@ export default function (pi: ExtensionAPI) {
   ): { state: SandboxState; warnings: string[] } {
     if (!cfg.enabled) return { state: { active: false, enabled: false }, warnings: [] };
     const probe = resolveRunner(cfg.runner ?? "auto", { landlockHelper: cfg.landlockHelper });
-    if (!probe.ok)
+    if (!probe.ok) {
+      const failClosed = cfg.failIfUnavailable === true;
       return {
-        state: { active: false, enabled: true, reason: probe.reason },
+        state: { active: false, enabled: true, reason: probe.reason, failClosed },
         warnings: [
-          `Sandbox enabled but no runner available (${probe.reason}). Commands run UNSANDBOXED; all permission gates are armed.`,
+          failClosed
+            ? `Sandbox enabled with failIfUnavailable: no runner available (${probe.reason}). Bash/PowerShell/write/edit will be BLOCKED rather than run unsandboxed.`
+            : `Sandbox enabled but no runner available (${probe.reason}). Commands run UNSANDBOXED; all permission gates are armed.`,
         ],
       };
+    }
     const policy = {
       writableRoots: buildWritableRoots(cfg, runnerContext(cwd), dirExists, canon),
       network: cfg.network ?? "allow",
@@ -405,8 +497,10 @@ export default function (pi: ExtensionAPI) {
     ui: ExtensionUIContext,
     cwd: string,
     announce: boolean,
+    managed: SandboxConfig,
   ): SandboxState {
     config = cfg;
+    managedConfig = managed;
     const next = computeState(cwd, cfg);
     state = next.state;
     for (const warning of next.warnings) ui.notify(warning, "warning");
@@ -423,17 +517,37 @@ export default function (pi: ExtensionAPI) {
     // workspace root must key off the session's cwd.
     const loaded = loadSandboxConfigs(ctx.cwd, ctx.isProjectTrusted());
     if (loaded.error) {
-      state = { active: false, enabled: true, reason: `invalid config: ${loaded.error}` };
-      ctx.ui.notify(`Sandbox disabled: ${loaded.error}`, "warning");
+      state = {
+        active: false,
+        enabled: true,
+        reason: `invalid config: ${loaded.error}`,
+        failClosed: loaded.managedFailClosed,
+      };
+      ctx.ui.notify(
+        loaded.managedFailClosed
+          ? `Sandbox config invalid (${loaded.error}) — fail-closed: commands are BLOCKED until the config is fixed`
+          : `Sandbox disabled: ${loaded.error}`,
+        "warning",
+      );
       return;
     }
-    applySandbox(loaded.config, ctx.ui, ctx.cwd, true);
+    if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
+    applySandbox(loaded.config, ctx.ui, ctx.cwd, true, loaded.managedConfig);
   });
 
   pi.on("tool_call", async (event, ctx) => {
     // --- write/edit path guard (tools write directly, no shell involved) ---
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      if (!state.active) return undefined;
+      if (!state.active) {
+        if (state.enabled && state.failClosed) {
+          return {
+            block: true,
+            terminate: true,
+            reason: `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing unsandboxed writes`,
+          };
+        }
+        return undefined;
+      }
       const target = path.resolve(ctx.cwd, String((event.input as { path?: string }).path ?? ""));
       // Containment must compare like-with-like: roots are canonicalized in
       // buildWritableRoots, so canonicalize the target the same way (deepest
@@ -463,6 +577,15 @@ export default function (pi: ExtensionAPI) {
 
     const isPowerShell = isToolCallEventType("powershell", event);
     if (!isToolCallEventType("bash", event) && !isPowerShell) return undefined;
+    // Fail-closed: sandbox enabled + failIfUnavailable but no runner
+    // resolved — refuse to run unsandboxed (bash and powershell alike).
+    if (!state.active && state.enabled && state.failClosed) {
+      return {
+        block: true,
+        terminate: true,
+        reason: `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing to run unsandboxed`,
+      };
+    }
     const command = String(event.input.command ?? "");
 
     // --- heuristic gate (checked on the ORIGINAL command, before wrapping) ---
@@ -499,7 +622,26 @@ export default function (pi: ExtensionAPI) {
 
   // --- user `!` commands: intercept execution when opted in ---
   pi.on("user_bash", () => {
-    if (!state.active || !config.userCommands) return undefined;
+    if (!config.userCommands) return undefined;
+    if (!state.active) {
+      // Fail-closed: user ! commands are blocked too, not run unsandboxed.
+      if (state.enabled && state.failClosed) {
+        const reason = `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — user ! commands are blocked`;
+        return {
+          operations: {
+            async exec(
+              _command: string,
+              _cwd: string,
+              options: Parameters<BashOperations["exec"]>[2],
+            ) {
+              options.onData(Buffer.from(reason));
+              return { exitCode: 126 };
+            },
+          },
+        };
+      }
+      return undefined;
+    }
     // Snapshot the whole runner context (incl. helperPath) at intercept time so
     // a later /sandbox toggle can't mix generations inside one exec.
     const runner = state.runner;
@@ -542,13 +684,24 @@ export default function (pi: ExtensionAPI) {
     writeScopeConfig(loaded.files.project, toggled);
     // Recompute from the configs we already hold (no re-read of the file we just wrote).
     const next = applySandbox(
-      mergeSandboxConfigs(loaded.globalConfig, toggled),
+      applyManagedSandboxConfig(
+        mergeSandboxConfigs(loaded.globalConfig, toggled),
+        loaded.managedConfig,
+      ),
       ctx.ui,
       ctx.cwd,
       false,
+      loaded.managedConfig,
     );
     if (!enabled) {
-      ctx.ui.notify("Sandbox off", "info");
+      if (next.enabled) {
+        ctx.ui.notify(
+          "Sandbox remains enabled: a managed policy pins enabled: true (lower scopes cannot turn it off)",
+          "warning",
+        );
+      } else {
+        ctx.ui.notify("Sandbox off", "info");
+      }
       return;
     }
     // When no runner is available, applySandbox already warned (announcements
@@ -646,6 +799,21 @@ export default function (pi: ExtensionAPI) {
       const trimmed = v.trim();
       return trimmed === "" ? { landlockHelper: undefined } : { landlockHelper: trimmed };
     }
+    if (option === "failIfUnavailable") {
+      const v = await promptSelect(ctx, "Fail closed when no sandbox runner is available", [
+        {
+          value: "false",
+          label: "false",
+          description: "warn and run unsandboxed (default; interactive/dev use)",
+        },
+        {
+          value: "true",
+          label: "true",
+          description: "BLOCK bash/powershell/write/edit when the boundary can't be established",
+        },
+      ]);
+      return v === undefined ? undefined : { failIfUnavailable: v === "true" };
+    }
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",
       draft.writable?.join(", "),
@@ -726,7 +894,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Sandbox state unchanged: ${reloaded.error}`, "error");
       return;
     }
-    applySandbox(reloaded.config, ctx.ui, ctx.cwd, true);
+    applySandbox(reloaded.config, ctx.ui, ctx.cwd, true, reloaded.managedConfig);
   }
 
   pi.registerCommand("sandbox", {
@@ -757,12 +925,20 @@ export default function (pi: ExtensionAPI) {
         lines.push(`User ! commands: ${config.userCommands ? "sandboxed" : "not sandboxed"}`);
       } else {
         lines.push(`Sandbox: FALLBACK (enabled, but ${state.reason})`);
-        lines.push("Commands run unsandboxed; ALL permission gates are armed.");
+        if (state.failClosed) {
+          lines.push("failIfUnavailable: bash/powershell/write/edit are BLOCKED (fail-closed).");
+        } else {
+          lines.push("Commands run unsandboxed; ALL permission gates are armed.");
+        }
       }
       const files = sandboxConfigFiles(ctx.cwd);
       const trustNote = ctx.isProjectTrusted() ? "" : " (not trusted)";
+      const managedLine =
+        Object.keys(managedConfig).length > 0
+          ? ` / ${managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA)} (managed, wins)`
+          : "";
       lines.push(
-        `Config: ${files.project} (project, wins per-key)${trustNote} / ${files.global} (global)`,
+        `Config: ${files.project} (project, wins per-key)${trustNote} / ${files.global} (global)${managedLine}`,
       );
       lines.push(
         "Gate categories: system rules always gated; filesystem rules gated whenever the sandbox is inactive (disabled or fallback).",
