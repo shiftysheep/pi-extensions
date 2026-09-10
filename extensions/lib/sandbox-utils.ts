@@ -89,6 +89,11 @@ export type RunnerContext = {
   shellPath: string;
   /** landlock runner only: path to the compiled helper binary. */
   helperPath?: string;
+  /**
+   * Platform temp dir ($TMPDIR on macOS: /var/folders/...). Added to the
+   * writable roots when set; canonical resolution of /tmp alone misses it.
+   */
+  tmpDir?: string;
 };
 
 /**
@@ -254,19 +259,42 @@ export function resolveExistingRoot(path: string, exists: (p: string) => boolean
   return current === "" ? "/" : current;
 }
 
-/** Build the effective writable-root set from config. Pure: fs injected. */
+/**
+ * Build the effective writable-root set from config. Pure: fs injected.
+ *
+ * `realpath` canonicalizes each root (fs.realpath at the call site). This
+ * matters for Seatbelt: `(subpath ...)` matches the CANONICAL filesystem
+ * path, so on macOS a literal /tmp root never matches writes that resolve
+ * to /private/tmp. Defaults to the identity so pure callers/tests can omit
+ * it; for bwrap/landlock canonicalization is harmless (both resolve paths
+ * to the same inode view).
+ */
 export function buildWritableRoots(
   config: SandboxConfig,
   ctx: RunnerContext,
   exists: (p: string) => boolean,
+  realpath: (p: string) => string = (p) => p,
 ): string[] {
   const roots = new Set<string>();
-  const add = (p: string) => roots.add(resolveExistingRoot(normalizeSandboxPath(p, ctx), exists));
+  const add = (p: string) =>
+    roots.add(realpath(resolveExistingRoot(normalizeSandboxPath(p, ctx), exists)));
   add(ctx.cwd); // workspace
   for (const entry of config.writable ?? []) add(entry);
   // DAC-backstopped pseudo-roots that keep common patterns working:
-  // `> /dev/null`, /proc/self writes, scratch space.
-  for (const systemRoot of ["/tmp", "/dev", "/proc"]) if (exists(systemRoot)) roots.add(systemRoot);
+  // `> /dev/null`, /proc/self writes, scratch space. /dev stays LITERAL:
+  // it is a mount point (never a symlink in practice) and the bwrap wrapper
+  // keys the minimal `--dev /dev` off the exact string "/dev".
+  if (exists("/tmp")) roots.add(realpath("/tmp"));
+  if (exists("/dev")) roots.add("/dev");
+  if (exists("/proc")) roots.add(realpath("/proc"));
+  // The platform temp dir ($TMPDIR on macOS) — /tmp's canonical form does
+  // not cover it. Added only when it EXISTS and canonicalizes to something
+  // narrower than "/": a missing or degenerate TMPDIR must be skipped, never
+  // ancestor-walked (that could escalate to "/").
+  if (ctx.tmpDir && exists(ctx.tmpDir)) {
+    const tmp = realpath(ctx.tmpDir);
+    if (tmp !== "/") roots.add(tmp);
+  }
   if (config.home === "rw") add(ctx.homeDir);
   // Default-writable $HOME cache/tool dirs (opt-out via homeCaches: "ro").
   // Added only when the dir EXISTS: unlike `writable` entries, a missing cache
@@ -275,13 +303,28 @@ export function buildWritableRoots(
   if (config.homeCaches !== "ro") {
     for (const rel of HOME_CACHE_ROOTS) {
       const abs = `${ctx.homeDir}/${rel}`;
-      if (exists(abs)) roots.add(abs);
+      if (exists(abs)) roots.add(realpath(abs));
     }
   }
   // A root subsuming another is redundant.
   return [...roots].filter(
     (r) => ![...roots].some((other) => other !== r && isInsideRoot(r, other)),
   );
+}
+
+/**
+ * Canonicalize a write target for containment checks against canonicalized
+ * writable roots: resolve the deepest existing ancestor via realpath, then
+ * append the missing trailing components lexically (the target may not exist
+ * yet — e.g. a new file). Pure: fs injected.
+ */
+export function canonicalizeTarget(
+  target: string,
+  exists: (p: string) => boolean,
+  realpath: (p: string) => string,
+): string {
+  const base = resolveExistingRoot(target, exists);
+  return realpath(base) + target.slice(base.length);
 }
 
 /** True when `candidate` equals `root` or is beneath it (string-based). */
