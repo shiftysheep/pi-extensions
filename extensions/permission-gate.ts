@@ -5,7 +5,10 @@
  *
  * 1. HEURISTIC GATE (always on) — prompts for confirmation before bash
  *    commands that look dangerous (recursive `rm`, privilege escalation,
- *    world-writable `chmod`, raw device writes, mkfs, power actions).
+ *    world-writable `chmod`, raw device writes, mkfs, power actions) and,
+ *    via a separate PowerShell rule set, before dangerous PowerShell
+ *    cmdlets (recursive `Remove-Item`, disk wipes, elevation, `iex`, ACL
+ *    changes, machine-wide registry writes).
  *
  * 2. OS SANDBOX (opt-in via sandbox.json `enabled: true`) — wraps the agent's
  *    bash commands in a filesystem sandbox:
@@ -84,6 +87,7 @@ import {
   sandboxConfigPath,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
+import { findDangerousPowerShellRule } from "./permission-gate/powershell-rules.js";
 import { findDangerousRule, shouldGate } from "./permission-gate/rules.js";
 import { resolveRunner } from "./permission-gate/runner.js";
 
@@ -457,12 +461,15 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    if (!isToolCallEventType("bash", event)) return undefined;
+    const isPowerShell = isToolCallEventType("powershell", event);
+    if (!isToolCallEventType("bash", event) && !isPowerShell) return undefined;
     const command = String(event.input.command ?? "");
 
     // --- heuristic gate (checked on the ORIGINAL command, before wrapping) ---
-    const match = findDangerousRule(command);
-    if (match && shouldGate(match, state.active)) {
+    // PowerShell has its own rule set: cmdlets/aliases/parameters differ
+    // from bash, so it is NEVER routed through the bash tokenizer.
+    const match = isPowerShell ? findDangerousPowerShellRule(command) : findDangerousRule(command);
+    if (match && shouldGate(match, !isPowerShell && state.active)) {
       if (!ctx.hasUI) {
         return {
           block: true,
@@ -476,8 +483,8 @@ export default function (pi: ExtensionAPI) {
       if (!ok) return { block: true, terminate: true, reason: "Blocked by user" };
     }
 
-    // --- sandbox wrap ---
-    if (state.active && command) {
+    // --- sandbox wrap (bash only: the wrappers build a bash command line) ---
+    if (!isPowerShell && state.active && command) {
       // Mutate the shared input object IN PLACE: the agent executes the tool with its own
       // args reference (event.input === args), so reassigning event.input would be lost.
       (event.input as { command: string }).command = wrapCommand(
