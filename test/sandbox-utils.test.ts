@@ -12,7 +12,9 @@ import {
   canonicalizeTarget,
   isInsideAnyRoot,
   isInsideRoot,
+  isNoexecPath,
   mergeSandboxConfigs,
+  normalizeHelperPath,
   normalizeSandboxPath,
   parseSandboxConfig,
   parseWritableList,
@@ -59,6 +61,7 @@ describe("parseSandboxConfig", () => {
         network: "deny",
         userCommands: true,
         loginShell: false,
+        landlockHelper: "/opt/pi-sandbox-landlock",
       },
       P,
     );
@@ -69,6 +72,7 @@ describe("parseSandboxConfig", () => {
     assert.equal(cfg.network, "deny");
     assert.equal(cfg.userCommands, true);
     assert.equal(cfg.loginShell, false);
+    assert.equal(cfg.landlockHelper, "/opt/pi-sandbox-landlock");
   });
   it("rejects non-objects", () => {
     assert.throws(() => parseSandboxConfig(null, P), /expected a JSON object/);
@@ -85,6 +89,7 @@ describe("parseSandboxConfig", () => {
     assert.throws(() => parseSandboxConfig({ homeCaches: "maybe" }, P), /"homeCaches" must be/);
     assert.throws(() => parseSandboxConfig({ network: "sometimes" }, P), /"network" must be/);
     assert.throws(() => parseSandboxConfig({ loginShell: "yes" }, P), /"loginShell" must be/);
+    assert.throws(() => parseSandboxConfig({ landlockHelper: "" }, P), /"landlockHelper" must be/);
   });
 });
 
@@ -235,6 +240,47 @@ describe("canonicalizeTarget", () => {
   });
   it("falls back to the literal path when nothing exists", () => {
     assert.equal(canonicalizeTarget("/nope/way/nope/f", exists, rp), "/nope/way/nope/f");
+  });
+});
+
+describe("isNoexecPath", () => {
+  const MI = [
+    "23 20 0:23 / / rw,relatime - ext4 /dev/root rw",
+    "30 23 0:30 / /home rw,noatime - btrfs /dev/sda2 rw",
+    "31 30 0:31 / /home/user rw,noexec - overlay /dev/overlay rw",
+  ].join("\n");
+  it("detects noexec on the innermost matching mount", () => {
+    assert.ok(isNoexecPath(MI, "/home/user/x"));
+    assert.ok(isNoexecPath(MI, "/home/user"));
+  });
+  it("does not inherit noexec from sibling mounts", () => {
+    assert.ok(!isNoexecPath(MI, "/home/other"));
+    assert.ok(!isNoexecPath(MI, "/"));
+  });
+  it("is false when nothing matches", () => {
+    assert.ok(!isNoexecPath(MI, "/var/cache"));
+  });
+  it("matches a noexec root mount for every path", () => {
+    const MI_ROOT = "1 0 0:1 / / rw,noexec - ext4 /dev/root rw";
+    assert.ok(isNoexecPath(MI_ROOT, "/home/user/.cache"));
+    assert.ok(isNoexecPath(MI_ROOT, "/"));
+  });
+  it("decodes octal-escaped mount points (space)", () => {
+    const MI_ESC = "32 30 0:32 / /mnt/my\\040dir rw,noexec - ext4 /dev/x rw";
+    assert.ok(isNoexecPath(MI_ESC, "/mnt/my dir/sub"));
+    assert.ok(!isNoexecPath(MI_ESC, "/mnt/other"));
+  });
+});
+
+describe("normalizeHelperPath", () => {
+  it("expands ~ and keeps absolute paths", () => {
+    assert.equal(normalizeHelperPath("~/bin/h", "/home/u"), "/home/u/bin/h");
+    assert.equal(normalizeHelperPath("~", "/home/u"), "/home/u");
+    assert.equal(normalizeHelperPath("/opt/h", "/home/u"), "/opt/h");
+  });
+  it("rejects relative paths", () => {
+    assert.equal(normalizeHelperPath("rel/h", "/home/u"), undefined);
+    assert.equal(normalizeHelperPath("./h", "/home/u"), undefined);
   });
 });
 

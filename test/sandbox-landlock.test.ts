@@ -6,11 +6,13 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { HELPER_SOURCE_SHA256 } from "../extensions/permission-gate/runner.js";
 
 const SOURCE = fileURLToPath(
   new URL("../extensions/permission-gate/landlock-helper.c", import.meta.url),
@@ -46,6 +48,17 @@ if (cc) {
 } else {
   skipReason = "no C compiler available (cc/gcc/clang)";
 }
+
+describe("landlock helper source integrity", () => {
+  it("committed source matches the pinned SHA-256", () => {
+    const digest = crypto.createHash("sha256").update(fs.readFileSync(SOURCE)).digest("hex");
+    assert.equal(
+      digest,
+      HELPER_SOURCE_SHA256,
+      "landlock-helper.c changed — update HELPER_SOURCE_SHA256 in extensions/permission-gate/runner.ts in the same commit",
+    );
+  });
+});
 
 describe("landlock helper", () => {
   if (skipReason || !helper || !ws) {
