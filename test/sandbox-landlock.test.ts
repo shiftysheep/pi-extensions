@@ -67,6 +67,18 @@ describe("landlock helper", () => {
     return { status: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
   }
 
+  function runDirect(
+    args: string[],
+    command: string,
+    commandArgs: string[],
+  ): { status: number; stdout: string; stderr: string } {
+    const res = spawnSync(h, [...args, "--", command, ...commandArgs], {
+      encoding: "utf8",
+      cwd: w,
+    });
+    return { status: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+  }
+
   it("passes through the exit code", () => {
     assert.equal(run(["--rw", w], "exit 42").status, 42);
   });
@@ -96,6 +108,36 @@ describe("landlock helper", () => {
     const r = run(["--rw", w], `mv ${w}/a.txt ${w}/b.txt && echo MV_OK`);
     assert.equal(r.status, 0);
     assert.ok(r.stdout.includes("MV_OK"));
+  });
+
+  it("allows direct cross-directory rename inside --rw roots", () => {
+    const sourceDir = path.join(w, "direct-rename-source");
+    const source = path.join(sourceDir, "full.rmeta");
+    const destination = path.join(w, "direct-rename-destination.rmeta");
+    const prepared = run(["--rw", w], `mkdir -p ${sourceDir} && : > ${source}`);
+    assert.equal(prepared.status, 0, prepared.stderr);
+
+    const renamed = runDirect(["--rw", w], process.execPath, [
+      "-e",
+      "require('node:fs').renameSync(process.argv[1], process.argv[2])",
+      source,
+      destination,
+    ]);
+    assert.equal(renamed.status, 0, renamed.stderr);
+    assert.ok(fs.existsSync(destination));
+  });
+
+  it("denies symlink and FIFO creation outside --rw roots", () => {
+    const readOnlyDir = fs.mkdtempSync(path.join(os.homedir(), ".pi-landlock-ro-"));
+    try {
+      const symlink = run(["--rw", w], `ln -s /etc/hostname ${readOnlyDir}/link`);
+      assert.notEqual(symlink.status, 0, "symlink creation outside roots must fail");
+
+      const fifo = run(["--rw", w], `mkfifo ${readOnlyDir}/fifo`);
+      assert.notEqual(fifo.status, 0, "FIFO creation outside roots must fail");
+    } finally {
+      fs.rmSync(readOnlyDir, { recursive: true, force: true });
+    }
   });
 
   it("denies writes to /dev/null unless /dev is a root", () => {

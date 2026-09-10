@@ -60,16 +60,22 @@
 #define PI_LL_RESTRICT_SELF (__NR_landlock_create_ruleset + 2)
 
 /* Stable access-flag values (see include/uapi/linux/landlock.h). */
-#define A_READ_FILE (1ULL << 0)    /* ABI 1 */
+#define A_EXECUTE (1ULL << 0)      /* ABI 1 */
 #define A_WRITE_FILE (1ULL << 1)   /* ABI 1 */
-#define A_EXECUTE (1ULL << 2)      /* ABI 1 */
+#define A_READ_FILE (1ULL << 2)    /* ABI 1 */
 #define A_READ_DIR (1ULL << 3)     /* ABI 1 */
-#define A_REMOVE_FILE (1ULL << 4)  /* ABI 1 */
-#define A_RENAME_FILE (1ULL << 5)  /* ABI 1 */
-#define A_MAKE_EXEC (1ULL << 6)    /* ABI 1 */
-#define A_IOCTL_DEV (1ULL << 7)    /* ABI 2 */
-#define A_TRUNCATE (1ULL << 8)     /* ABI 2 */
-#define A_REFER (1ULL << 9)        /* ABI 3: source of link()/rename() */
+#define A_REMOVE_DIR (1ULL << 4)   /* ABI 1 */
+#define A_REMOVE_FILE (1ULL << 5)  /* ABI 1 */
+#define A_MAKE_CHAR (1ULL << 6)    /* ABI 1 */
+#define A_MAKE_DIR (1ULL << 7)     /* ABI 1 */
+#define A_MAKE_REG (1ULL << 8)     /* ABI 1 */
+#define A_MAKE_SOCK (1ULL << 9)    /* ABI 1 */
+#define A_MAKE_FIFO (1ULL << 10)   /* ABI 1 */
+#define A_MAKE_BLOCK (1ULL << 11)  /* ABI 1 */
+#define A_MAKE_SYM (1ULL << 12)    /* ABI 1 */
+#define A_REFER (1ULL << 13)       /* ABI 2: source of link()/rename() */
+#define A_TRUNCATE (1ULL << 14)    /* ABI 3 */
+#define A_IOCTL_DEV (1ULL << 15)   /* ABI 5 */
 
 #define RULE_PATH_BENEATH 1
 #define CREATE_RULESET_VERSION (1U)
@@ -121,12 +127,12 @@ static int query_new_version(void) {
 }
 
 static unsigned long long handled_set(int abi) {
-    unsigned long long handled = A_READ_FILE | A_WRITE_FILE | A_EXECUTE | A_READ_DIR |
-                                 A_REMOVE_FILE | A_RENAME_FILE | A_MAKE_EXEC;
-    if (abi >= 2)
-        handled |= A_IOCTL_DEV | A_TRUNCATE;
-    if (abi >= 3)
-        handled |= A_REFER;
+    unsigned long long handled = A_EXECUTE | A_WRITE_FILE | A_READ_FILE | A_READ_DIR |
+                                 A_REMOVE_DIR | A_REMOVE_FILE | A_MAKE_CHAR | A_MAKE_DIR |
+                                 A_MAKE_REG | A_MAKE_SOCK | A_MAKE_FIFO | A_MAKE_BLOCK | A_MAKE_SYM;
+    if (abi >= 2) handled |= A_REFER;
+    if (abi >= 3) handled |= A_TRUNCATE;
+    if (abi >= 5) handled |= A_IOCTL_DEV;
     return handled;
 }
 
