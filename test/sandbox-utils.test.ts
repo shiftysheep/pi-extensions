@@ -19,6 +19,7 @@ import {
   resolveExistingRoot,
   type SandboxConfig,
   sandboxConfigPath,
+  sbplQuote,
   shellQuote,
   wrapCommand,
   wrapWithBwrap,
@@ -225,12 +226,41 @@ describe("buildSeatbeltProfile", () => {
     });
     assert.ok(profile.includes("(deny default)"));
     assert.ok(profile.includes("(allow file-read*)"));
-    assert.ok(profile.includes("(subpath '/Users/u/proj')"));
+    assert.ok(profile.includes('(subpath "/Users/u/proj")'));
     assert.ok(!profile.includes("network-outbound"));
+  });
+  it("uses SBPL double-quoted strings, never shell single quotes", () => {
+    const profile = buildSeatbeltProfile({
+      writableRoots: ["/Users/u/proj", "/tmp"],
+      network: "allow",
+    });
+    assert.ok(profile.includes('(subpath "/Users/u/proj")'));
+    assert.ok(profile.includes('(subpath "/tmp")'));
+    assert.ok(!profile.includes("'"));
   });
   it("allows network when policy allows", () => {
     const profile = buildSeatbeltProfile({ writableRoots: ["/tmp"], network: "allow" });
     assert.ok(profile.includes("network-outbound"));
+  });
+  it("emits no file-write rule for empty writable roots (deny-all writes)", () => {
+    const profile = buildSeatbeltProfile({ writableRoots: [], network: "deny" });
+    assert.ok(!profile.includes("file-write"));
+  });
+  it("handles special characters in roots", () => {
+    const profile = buildSeatbeltProfile({
+      writableRoots: ['/spaced "dir"', "/back\\slash"],
+      network: "deny",
+    });
+    assert.ok(profile.includes('(subpath "/spaced \\"dir\\"")'));
+    assert.ok(profile.includes('(subpath "/back\\\\slash")'));
+  });
+});
+
+describe("sbplQuote", () => {
+  it("double-quotes and escapes backslashes and double quotes", () => {
+    assert.equal(sbplQuote("/tmp"), '"/tmp"');
+    assert.equal(sbplQuote('/weird"path'), '"/weird\\"path"');
+    assert.equal(sbplQuote("/back\\slash"), '"/back\\\\slash"');
   });
 });
 
