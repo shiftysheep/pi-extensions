@@ -358,22 +358,33 @@ export function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
 /**
  * Wrap a command for bubblewrap: everything read-only, writable roots bound
  * rw, minimal /dev, unshared user/pid namespaces; network unshared on deny.
+ * /tmp and /proc get FRESH private mounts (--tmpfs/--proc) instead of rw
+ * bind-mounts of the host dirs: scratch space still works, but the sandbox
+ * can neither read nor clobber other processes' sockets/temp state.
+ * (Surviving rw binds are never under /tmp or /proc — buildWritableRoots
+ * subsumes them into those roots.)
  */
 export function wrapWithBwrap(command: string, policy: SandboxPolicy, ctx: RunnerContext): string {
   const binds = policy.writableRoots
-    .filter((r) => r !== "/dev")
+    .filter((r) => r !== "/dev" && r !== "/tmp" && r !== "/proc")
     .map((r) => `--bind ${shellQuote(r)} ${shellQuote(r)}`)
     .join(" ");
   const net = policy.network === "deny" ? "--unshare-net " : "";
   const dev = policy.writableRoots.includes("/dev") ? "--dev /dev " : "";
+  const tmpfs = policy.writableRoots.includes("/tmp") ? "--tmpfs /tmp " : "";
+  // --proc after --unshare-pid: the fresh procfs must be mounted in the
+  // sandbox's own pid namespace.
+  const proc = policy.writableRoots.includes("/proc") ? "--proc /proc " : "";
   const shellFlags = policy.loginShell ? "-lc" : "-c";
   return [
     "bwrap",
     "--ro-bind / /",
     binds ? ` ${binds}` : "",
     dev,
-    net,
+    tmpfs,
     "--unshare-user --unshare-pid",
+    proc,
+    net,
     `-- ${ctx.shellPath} ${shellFlags} ${shellQuote(command)}`,
   ]
     .join(" ")

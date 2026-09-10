@@ -266,6 +266,24 @@ describe("wrapWithBwrap", () => {
     assert.ok(cmd.includes("--unshare-user --unshare-pid"));
     assert.ok(cmd.endsWith(`-- /bin/bash -lc 'ls -la'`));
   });
+  it("uses fresh --tmpfs /tmp and --proc /proc instead of rw host binds", () => {
+    const cmd = wrapWithBwrap("ls", policy, CTX);
+    assert.ok(cmd.includes("--tmpfs /tmp"));
+    assert.ok(cmd.includes("--proc /proc"));
+    assert.ok(!cmd.includes("--bind '/tmp'"));
+    assert.ok(!cmd.includes("--bind '/proc'"));
+    // --proc must come after the pid namespace is unshared
+    assert.ok(cmd.indexOf("--unshare-pid") < cmd.indexOf("--proc /proc"));
+  });
+  it("omits --tmpfs/--proc when /tmp and /proc are not roots", () => {
+    const cmd = wrapWithBwrap(
+      "ls",
+      { writableRoots: ["/home/u/proj"], network: "allow", loginShell: true },
+      CTX,
+    );
+    assert.ok(!cmd.includes("--tmpfs"));
+    assert.ok(!cmd.includes("--proc"));
+  });
   it("keeps network when allow", () => {
     const cmd = wrapWithBwrap("ls", { ...policy, network: "allow" }, CTX);
     assert.ok(!cmd.includes("--unshare-net"));
