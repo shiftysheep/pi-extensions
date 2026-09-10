@@ -25,7 +25,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 ## Install
 
 ```bash
-pi install git:github.com/shiftysheep/pi-extensions@v2.4.2
+pi install git:github.com/shiftysheep/pi-extensions@v2.4.3
 pi update --extensions   # reconcile this package to its pinned ref later
 pi -e git:github.com/shiftysheep/pi-extensions    # try without installing (current run only)
 pi config                # enable/disable individual extensions from here or the bundled packages
@@ -39,7 +39,7 @@ The package's `pi` manifest lists each `extensions/*.ts` entry explicitly, so yo
 # from the package's settings object (pi config / settings.json).
 # Empty skills/prompts arrays keep the bundled packs' resources off too:
 {
-  "source": "git:github.com/shiftysheep/pi-extensions@v2.4.2",
+  "source": "git:github.com/shiftysheep/pi-extensions@v2.4.3",
   "extensions": ["extensions/advisor.ts"],
   "skills": [],
   "prompts": []
