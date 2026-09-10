@@ -35,7 +35,8 @@
  *     "home": "ro",             // ro | rw — access to $HOME (default ro)
  *     "homeCaches": "rw",       // rw | ro — writable $HOME cache dirs (default rw; see HOME_CACHE_ROOTS)
  *     "network": "allow",       // allow | deny (deny is a no-op+warning on landlock)
- *     "userCommands": false     // also sandbox user `!` commands
+ *     "userCommands": false,    // also sandbox user `!` commands
+ *     "loginShell": true        // true: bash -lc (login profile sourced); false: bash -c
  *   }
  *
  * Commands:
@@ -306,6 +307,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       description: "also sandbox user ! commands",
     },
     {
+      value: "loginShell",
+      label: `loginShell: ${draft.loginShell ?? "true"}`,
+      description: "true: bash -lc (sources ~/.bash_profile); false: plain bash -c",
+    },
+    {
       value: "writable",
       label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
       description: "extra directories sandboxed commands may write to",
@@ -361,6 +367,7 @@ export default function (pi: ExtensionAPI) {
     const policy = {
       writableRoots: buildWritableRoots(cfg, runnerContext(cwd), dirExists, canon),
       network: cfg.network ?? "allow",
+      loginShell: cfg.loginShell ?? true,
     };
     const networkEnforced = probe.runner !== "landlock";
     return {
@@ -600,6 +607,21 @@ export default function (pi: ExtensionAPI) {
         },
       ]);
       return v === undefined ? undefined : { userCommands: v === "true" };
+    }
+    if (option === "loginShell") {
+      const v = await promptSelect(ctx, "Login shell for sandboxed commands", [
+        {
+          value: "true",
+          label: "true",
+          description: "bash -lc — sources /etc/profile + ~/.bash_profile (default)",
+        },
+        {
+          value: "false",
+          label: "false",
+          description: "bash -c — no login profiles; inherited env and BASH_ENV still apply",
+        },
+      ]);
+      return v === undefined ? undefined : { loginShell: v === "true" };
     }
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",

@@ -23,6 +23,7 @@ export const SANDBOX_ALLOWED_KEYS = [
   "homeCaches",
   "network",
   "userCommands",
+  "loginShell",
 ] as const;
 
 /**
@@ -75,12 +76,21 @@ export type SandboxConfig = {
   network?: "allow" | "deny";
   /** Also sandbox user `!` commands. Default: false. */
   userCommands?: boolean;
+  /**
+   * Run sandboxed commands in a LOGIN shell (`bash -lc`, sources
+   * /etc/profile + ~/.bash_profile) vs a plain non-login shell (`bash -c`).
+   * Default: true (preserves the historical behavior and login-profile env).
+   * Note: `bash -c` still honors an inherited BASH_ENV.
+   */
+  loginShell?: boolean;
 };
 
 export type SandboxPolicy = {
   /** Absolute writable roots (deduped, existing). Everything else is read-only. */
   writableRoots: string[];
   network: "allow" | "deny";
+  /** Login shell (`-lc`) vs plain `-c` for the wrapped command. */
+  loginShell: boolean;
 };
 
 export type RunnerContext = {
@@ -161,6 +171,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
       throw new Error(`${configPath}: "userCommands" must be a boolean`);
     }
     config.userCommands = obj.userCommands;
+  }
+  if (obj.loginShell !== undefined) {
+    if (typeof obj.loginShell !== "boolean") {
+      throw new Error(`${configPath}: "loginShell" must be a boolean`);
+    }
+    config.loginShell = obj.loginShell;
   }
   return config;
 }
@@ -350,6 +366,7 @@ export function wrapWithBwrap(command: string, policy: SandboxPolicy, ctx: Runne
     .join(" ");
   const net = policy.network === "deny" ? "--unshare-net " : "";
   const dev = policy.writableRoots.includes("/dev") ? "--dev /dev " : "";
+  const shellFlags = policy.loginShell ? "-lc" : "-c";
   return [
     "bwrap",
     "--ro-bind / /",
@@ -357,7 +374,7 @@ export function wrapWithBwrap(command: string, policy: SandboxPolicy, ctx: Runne
     dev,
     net,
     "--unshare-user --unshare-pid",
-    `-- ${ctx.shellPath} -lc ${shellQuote(command)}`,
+    `-- ${ctx.shellPath} ${shellFlags} ${shellQuote(command)}`,
   ]
     .join(" ")
     .replace(/\s+/g, " ")
@@ -376,16 +393,35 @@ export function wrapWithLandlock(
 ): string {
   const helper = ctx.helperPath ?? "pi-sandbox-landlock";
   const rwArgs = policy.writableRoots.map((r) => `--rw ${shellQuote(r)}`).join(" ");
-  return `${shellQuote(helper)} ${rwArgs} -- ${ctx.shellPath} -lc ${shellQuote(command)}`;
+  const shellFlags = policy.loginShell ? "-lc" : "-c";
+  return `${shellQuote(helper)} ${rwArgs} -- ${ctx.shellPath} ${shellFlags} ${shellQuote(command)}`;
 }
+
+/**
+ * Devices the Seatbelt profile grants write access to when /dev is a
+ * writable root — explicit literals instead of a blanket /dev subpath
+ * grant (raw block-device writes are exactly what the gate's `system`
+ * category treats as dangerous). Mirrors SAFE_DEV_TARGETS in
+ * permission-gate/rules.ts (minus /dev/full and /dev/fd, which are never
+ * written to intentionally).
+ */
+export const SEATBELT_DEV_WRITABLE = [
+  "/dev/null",
+  "/dev/stdout",
+  "/dev/stderr",
+  "/dev/tty",
+] as const;
 
 /**
  * Generate a Seatbelt (sandbox-exec) profile: deny-by-default, reads and
  * process ops allowed, writes only under the writable roots, network gated
  * by policy. Validated on macOS 26.6.2 (arm64) against a canary matrix
- * (read/write/exec/network).
+ * (read/write/exec/network). NOTE: sandbox-exec is Apple-deprecated (still
+ * functional as of macOS 26.6.2); see the README for the removal risk.
  */
-export function buildSeatbeltProfile(policy: SandboxPolicy): string {
+export function buildSeatbeltProfile(
+  policy: Pick<SandboxPolicy, "writableRoots" | "network">,
+): string {
   const lines = [
     "(version 1)",
     "(deny default)",
@@ -395,8 +431,17 @@ export function buildSeatbeltProfile(policy: SandboxPolicy): string {
   // With no writable roots, emit no file-write rule at all: a bare
   // `(allow file-write*)` would grant unrestricted writes.
   if (policy.writableRoots.length > 0) {
-    const subpaths = policy.writableRoots.map((r) => `(subpath ${sbplQuote(r)})`).join(" ");
-    lines.push(`(allow file-write* ${subpaths})`);
+    const subpaths = policy.writableRoots
+      .filter((r) => r !== "/dev")
+      .map((r) => `(subpath ${sbplQuote(r)})`)
+      .join(" ");
+    if (subpaths) lines.push(`(allow file-write* ${subpaths})`);
+  }
+  // /dev: grant the specific safe devices only, never the whole subpath.
+  if (policy.writableRoots.includes("/dev")) {
+    lines.push(
+      `(allow file-write-data ${SEATBELT_DEV_WRITABLE.map((d) => `(literal ${sbplQuote(d)})`).join(" ")})`,
+    );
   }
   if (policy.network === "allow")
     lines.push("(allow network-bind network-outbound network-inbound)");
@@ -411,7 +456,8 @@ export function wrapWithSandboxExec(
   ctx: RunnerContext,
 ): string {
   const profile = buildSeatbeltProfile(policy);
-  return `sandbox-exec -p ${shellQuote(profile)} ${ctx.shellPath} -lc ${shellQuote(command)}`;
+  const shellFlags = policy.loginShell ? "-lc" : "-c";
+  return `sandbox-exec -p ${shellQuote(profile)} ${ctx.shellPath} ${shellFlags} ${shellQuote(command)}`;
 }
 
 /** Dispatch to the per-runner wrapper. Throws on an unknown runner. */
