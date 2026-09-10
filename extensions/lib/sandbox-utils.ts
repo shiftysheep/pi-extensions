@@ -25,6 +25,7 @@ export const SANDBOX_ALLOWED_KEYS = [
   "userCommands",
   "loginShell",
   "landlockHelper",
+  "failIfUnavailable",
 ] as const;
 
 /**
@@ -91,6 +92,13 @@ export type SandboxConfig = {
    * of falling back to a build). Linux/landlock only.
    */
   landlockHelper?: string;
+  /**
+   * Fail CLOSED when the sandbox is enabled but no runner can be resolved:
+   * bash/powershell/write/edit are BLOCKED instead of running unsandboxed
+   * with a warning (the default, fail-open, suits interactive/dev use).
+   * For enforced/fleet adoption.
+   */
+  failIfUnavailable?: boolean;
 };
 
 export type SandboxPolicy = {
@@ -192,6 +200,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     }
     config.landlockHelper = obj.landlockHelper;
   }
+  if (obj.failIfUnavailable !== undefined) {
+    if (typeof obj.failIfUnavailable !== "boolean") {
+      throw new Error(`${configPath}: "failIfUnavailable" must be a boolean`);
+    }
+    config.failIfUnavailable = obj.failIfUnavailable;
+  }
   return config;
 }
 
@@ -241,6 +255,50 @@ export function applySandboxToggle(
     enabled: true,
     ...(config.runner === undefined ? { runner: inheritedRunner ?? ("auto" as const) } : {}),
   };
+}
+
+/**
+ * Managed (admin) sandbox config file path. Pure: platform (and the
+ * Windows ProgramData dir) are injected. This is the third, highest-
+ * precedence scope — see applyManagedSandboxConfig.
+ */
+export function managedSandboxConfigPath(platform: string, programData?: string): string {
+  return platform === "win32"
+    ? `${programData ?? "C:\\ProgramData"}\\pi\\agent\\sandbox.json`
+    : "/etc/pi/agent/sandbox.json";
+}
+
+/**
+ * Apply the managed (admin) layer on top of a merged user config
+ * (mirrors the managed-settings model of other agent CLIs):
+ * - scalar keys (`enabled`, `failIfUnavailable`, `runner`, `network`,
+ *   `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`):
+ *   the managed value WINS — an admin can pin `enabled: true` and cap
+ *   what developers can change;
+ * - `writable`: lower scopes can only NARROW, never widen — the effective
+ *   list is the intersection (entries the lower scopes chose that the
+ *   managed layer also allows); an unset managed `writable` leaves the
+ *   lower scope unrestricted.
+ * Pure.
+ */
+export function applyManagedSandboxConfig(
+  user: SandboxConfig,
+  managed: SandboxConfig,
+): SandboxConfig {
+  if (Object.keys(managed).length === 0) return user;
+  const merged: SandboxConfig = { ...user };
+  for (const key of SANDBOX_ALLOWED_KEYS) {
+    const value = managed[key];
+    if (value === undefined) continue;
+    if (key === "writable") {
+      const allowed = value as string[];
+      const lower = user.writable ?? [];
+      (merged as Record<string, unknown>).writable = lower.filter((p) => allowed.includes(p));
+    } else {
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+  return merged;
 }
 
 /** Split a comma-separated writable-paths line (the config UI input). Pure. */
