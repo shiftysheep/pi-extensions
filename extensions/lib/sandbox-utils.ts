@@ -221,6 +221,15 @@ export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+/**
+ * Double-quote a string for embedding in a Seatbelt (SBPL) profile. SBPL
+ * only accepts double-quoted strings — shellQuote's single quotes produce
+ * profiles that sandbox-exec rejects ("unexpected symbol argument").
+ */
+export function sbplQuote(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
 /** Expand a leading "~" and resolve relative paths against cwd. Pure: no fs. */
 export function normalizeSandboxPath(input: string, ctx: { cwd: string; homeDir: string }): string {
   let p = input;
@@ -330,18 +339,22 @@ export function wrapWithLandlock(
 /**
  * Generate a Seatbelt (sandbox-exec) profile: deny-by-default, reads and
  * process ops allowed, writes only under the writable roots, network gated
- * by policy. NOTE: untested on macOS — validate on a real machine before
- * relying on it.
+ * by policy. Validated on macOS 26.6.2 (arm64) against a canary matrix
+ * (read/write/exec/network).
  */
 export function buildSeatbeltProfile(policy: SandboxPolicy): string {
-  const subpaths = policy.writableRoots.map((r) => `(subpath ${shellQuote(r)})`).join(" ");
   const lines = [
     "(version 1)",
     "(deny default)",
     "(allow process-fork process-exec process-info* mach-lookup sysctl-read)",
     "(allow file-read*)",
-    `(allow file-write* ${subpaths})`,
   ];
+  // With no writable roots, emit no file-write rule at all: a bare
+  // `(allow file-write*)` would grant unrestricted writes.
+  if (policy.writableRoots.length > 0) {
+    const subpaths = policy.writableRoots.map((r) => `(subpath ${sbplQuote(r)})`).join(" ");
+    lines.push(`(allow file-write* ${subpaths})`);
+  }
   if (policy.network === "allow")
     lines.push("(allow network-bind network-outbound network-inbound)");
   return lines.join("\n");

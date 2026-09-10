@@ -19,7 +19,7 @@ repos:
         # Biome 2 doesn't check markdown/yaml; passing only-ignored files would fail the hook
         types: [text]
         stages: [pre-commit]
-        exclude: '^\.git/|\.(md|markdown|txt|toml|ya?ml|sh)$|^LICENSE$'
+        exclude: '^\.git/|\.(md|markdown|txt|toml|ya?ml|sh)$|^LICENSE$|^\.gitignore$'
 
       - id: typecheck
         name: tsc --noEmit (typecheck)
