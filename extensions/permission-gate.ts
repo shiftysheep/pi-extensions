@@ -36,7 +36,8 @@
  *     "homeCaches": "rw",       // rw | ro — writable $HOME cache dirs (default rw; see HOME_CACHE_ROOTS)
  *     "network": "allow",       // allow | deny (deny is a no-op+warning on landlock)
  *     "userCommands": false,    // also sandbox user `!` commands
- *     "loginShell": true        // true: bash -lc (login profile sourced); false: bash -c
+ *     "loginShell": true,        // true: bash -lc (login profile sourced); false: bash -c
+ *     "landlockHelper": "~/bin/pi-sandbox-landlock"  // prebuilt helper (skip compilation)
  *   }
  *
  * Commands:
@@ -312,6 +313,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       description: "true: bash -lc (sources ~/.bash_profile); false: plain bash -c",
     },
     {
+      value: "landlockHelper",
+      label: `landlockHelper: ${draft.landlockHelper ?? "(compile on first use)"}`,
+      description: "prebuilt Landlock helper path (skips compilation; Linux only)",
+    },
+    {
       value: "writable",
       label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
       description: "extra directories sandboxed commands may write to",
@@ -356,7 +362,7 @@ export default function (pi: ExtensionAPI) {
     cfg: SandboxConfig,
   ): { state: SandboxState; warnings: string[] } {
     if (!cfg.enabled) return { state: { active: false, enabled: false }, warnings: [] };
-    const probe = resolveRunner(cfg.runner ?? "auto");
+    const probe = resolveRunner(cfg.runner ?? "auto", { landlockHelper: cfg.landlockHelper });
     if (!probe.ok)
       return {
         state: { active: false, enabled: true, reason: probe.reason },
@@ -622,6 +628,16 @@ export default function (pi: ExtensionAPI) {
         },
       ]);
       return v === undefined ? undefined : { loginShell: v === "true" };
+    }
+    if (option === "landlockHelper") {
+      const v = await ctx.ui.input(
+        "Prebuilt Landlock helper path (empty = compile on first use)",
+        draft.landlockHelper ?? "",
+        { signal: ctx.signal },
+      );
+      if (v === undefined) return undefined;
+      const trimmed = v.trim();
+      return trimmed === "" ? { landlockHelper: undefined } : { landlockHelper: trimmed };
     }
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",

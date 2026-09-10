@@ -8,12 +8,16 @@
  */
 
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildSeatbeltProfile,
+  isNoexecPath,
+  normalizeHelperPath,
+  resolveExistingRoot,
   type SandboxRunner,
   type SandboxRunnerChoice,
   shellQuote,
@@ -66,35 +70,121 @@ function probeBwrap(): RunnerProbeResult {
 
 const HELPER_SOURCE = fileURLToPath(new URL("./landlock-helper.c", import.meta.url));
 
+/**
+ * Known-good SHA-256 of landlock-helper.c. The helper is compiled from this
+ * source on first use; a tampered/modified source fails the probe CLOSED
+ * instead of silently compiling unexpected code. Update in the same commit
+ * that changes the source.
+ */
+export const HELPER_SOURCE_SHA256 =
+  "7e9071c027c127ef6ff57544b760e3043108022f3e41f402b4a617822f1ba149";
+
 export function landlockHelperPath(): string {
   return path.join(os.homedir(), ".cache", "pi-extensions", "pi-sandbox-landlock");
 }
 
-/** Landlock: build the helper (if stale) and verify the kernel accepts it. */
-function probeLandlock(): RunnerProbeResult {
-  const cc = which("cc") ?? which("gcc") ?? which("clang");
-  if (!cc)
-    return { ok: false, reason: "no C compiler found (cc/gcc/clang) to build the landlock helper" };
-  const out = landlockHelperPath();
-  try {
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    const srcStat = fs.statSync(HELPER_SOURCE);
-    const stale = !fs.existsSync(out) || fs.statSync(out).mtimeMs < srcStat.mtimeMs;
-    if (stale) {
-      const build = spawnSync(cc, ["-O2", "-o", out, HELPER_SOURCE], {
-        encoding: "utf8",
-        timeout: BUILD_TIMEOUT_MS,
+/**
+ * Landlock: use a prebuilt helper when configured (no compilation),
+ * otherwise build the helper (if stale) behind a source-integrity check,
+ * and verify the kernel accepts it.
+ */
+function probeLandlock(override?: string): RunnerProbeResult {
+  let out: string;
+  if (override !== undefined) {
+    // An explicit override is a directive: a missing/unusable file fails
+    // the probe instead of silently compiling a different binary. The path
+    // is normalized to absolute so validation and execution refer to the
+    // same binary (a relative path would be cwd-relative for accessSync
+    // but a PATH search for spawn).
+    const resolved = normalizeHelperPath(override, os.homedir());
+    if (resolved === undefined) {
+      return {
+        ok: false,
+        reason: `landlockHelper must be an absolute path (or start with ~): ${override}`,
+      };
+    }
+    try {
+      fs.accessSync(resolved, fs.constants.X_OK);
+    } catch {
+      return {
+        ok: false,
+        reason: `configured landlockHelper is not an executable file: ${resolved}`,
+      };
+    }
+    out = resolved;
+  } else {
+    const cc = which("cc") ?? which("gcc") ?? which("clang");
+    if (!cc)
+      return {
+        ok: false,
+        reason: "no C compiler found (cc/gcc/clang) to build the landlock helper",
+      };
+    out = landlockHelperPath();
+    // noexec cache dir (common on hardened /home): fail with an actionable
+    // message instead of a confusing exec failure after a wasted build.
+    // Canonicalize first: a symlinked ancestor can sit on a different mount.
+    try {
+      const dir = path.dirname(out);
+      const base = resolveExistingRoot(dir, (p) => {
+        try {
+          fs.statSync(p);
+          return true;
+        } catch {
+          return false;
+        }
       });
-      if (build.status !== 0) {
+      let canonBase = base;
+      try {
+        canonBase = fs.realpathSync(base);
+      } catch {
+        // keep the literal base
+      }
+      const mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
+      if (isNoexecPath(mountinfo, canonBase + dir.slice(base.length))) {
         return {
           ok: false,
-          reason: `landlock helper build failed: ${(build.stderr ?? "").trim().slice(-300)}`,
+          reason: `landlock helper cache dir is mounted noexec: ${path.dirname(out)} — set "landlockHelper" to an exec-capable path`,
         };
       }
-      fs.chmodSync(out, 0o700);
+    } catch {
+      // mountinfo unreadable (odd container); the canary below will surface
+      // any exec failure.
     }
-  } catch (err) {
-    return { ok: false, reason: `landlock helper build failed: ${String(err)}` };
+    // Source integrity: refuse to compile unexpected code.
+    try {
+      const digest = crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(HELPER_SOURCE))
+        .digest("hex");
+      if (digest !== HELPER_SOURCE_SHA256) {
+        return {
+          ok: false,
+          reason: `landlock-helper.c failed the integrity check (sha256 ${digest.slice(0, 12)}\u2026 \u2260 expected) — refusing to compile; restore the pristine source or set "landlockHelper" to a trusted prebuilt binary`,
+        };
+      }
+    } catch (err) {
+      return { ok: false, reason: `landlock helper source unreadable: ${String(err)}` };
+    }
+    try {
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      const srcStat = fs.statSync(HELPER_SOURCE);
+      const stale = !fs.existsSync(out) || fs.statSync(out).mtimeMs < srcStat.mtimeMs;
+      if (stale) {
+        const build = spawnSync(cc, ["-O2", "-o", out, HELPER_SOURCE], {
+          encoding: "utf8",
+          timeout: BUILD_TIMEOUT_MS,
+        });
+        if (build.status !== 0) {
+          return {
+            ok: false,
+            reason: `landlock helper build failed: ${(build.stderr ?? "").trim().slice(-300)}`,
+          };
+        }
+        fs.chmodSync(out, 0o700);
+      }
+    } catch (err) {
+      return { ok: false, reason: `landlock helper build failed: ${String(err)}` };
+    }
   }
   const canary = spawnSync(out, ["--rw", "/tmp", "--", "/bin/sh", "-c", "true"], {
     encoding: "utf8",
@@ -191,7 +281,15 @@ function probeSandboxExec(): RunnerProbeResult {
   }
 }
 
-export function resolveRunner(choice: SandboxRunnerChoice): RunnerProbeResult {
+export type RunnerProbeOptions = {
+  /** Prebuilt Landlock helper path (sandbox.json "landlockHelper"). */
+  landlockHelper?: string;
+};
+
+export function resolveRunner(
+  choice: SandboxRunnerChoice,
+  opts: RunnerProbeOptions = {},
+): RunnerProbeResult {
   if (choice === "none") return { ok: false, reason: 'runner is set to "none"' };
 
   if (process.platform === "darwin") {
@@ -204,11 +302,11 @@ export function resolveRunner(choice: SandboxRunnerChoice): RunnerProbeResult {
   if (process.platform === "linux") {
     if (choice === "sandbox-exec") return { ok: false, reason: "sandbox-exec is macOS-only" };
     if (choice === "bwrap") return probeBwrap();
-    if (choice === "landlock") return probeLandlock();
+    if (choice === "landlock") return probeLandlock(opts.landlockHelper);
     // auto: bwrap first (stronger isolation), landlock as fallback
     const bwrap = probeBwrap();
     if (bwrap.ok) return bwrap;
-    const landlock = probeLandlock();
+    const landlock = probeLandlock(opts.landlockHelper);
     if (landlock.ok) return landlock;
     return {
       ok: false,

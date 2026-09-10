@@ -24,6 +24,7 @@ export const SANDBOX_ALLOWED_KEYS = [
   "network",
   "userCommands",
   "loginShell",
+  "landlockHelper",
 ] as const;
 
 /**
@@ -83,6 +84,13 @@ export type SandboxConfig = {
    * Note: `bash -c` still honors an inherited BASH_ENV.
    */
   loginShell?: boolean;
+  /**
+   * Explicit path to a prebuilt Landlock helper binary. When set, the
+   * helper is used as-is and NO compilation happens (an explicit override
+   * is a directive, not a hint — a missing file fails the probe instead
+   * of falling back to a build). Linux/landlock only.
+   */
+  landlockHelper?: string;
 };
 
 export type SandboxPolicy = {
@@ -177,6 +185,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
       throw new Error(`${configPath}: "loginShell" must be a boolean`);
     }
     config.loginShell = obj.loginShell;
+  }
+  if (obj.landlockHelper !== undefined) {
+    if (typeof obj.landlockHelper !== "string" || obj.landlockHelper.length === 0) {
+      throw new Error(`${configPath}: "landlockHelper" must be a non-empty string`);
+    }
+    config.landlockHelper = obj.landlockHelper;
   }
   return config;
 }
@@ -341,6 +355,49 @@ export function canonicalizeTarget(
 ): string {
   const base = resolveExistingRoot(target, exists);
   return realpath(base) + target.slice(base.length);
+}
+
+/**
+ * Decode a mount point from /proc/self/mountinfo: the kernel octal-escapes
+ * special characters (\040 space, \011 tab, \012 newline, \134 backslash);
+ * a backslash is always followed by exactly three octal digits.
+ */
+export function decodeMountPoint(encoded: string): string {
+  return encoded.replace(/\\([0-7]{3})/g, (_, oct: string) =>
+    String.fromCharCode(parseInt(oct, 8)),
+  );
+}
+
+/**
+ * True when `dir` sits on a mount whose options include noexec (common on
+ * hardened /home). Pure: the /proc/self/mountinfo text is injected.
+ * Picks the LONGEST matching mount point (the innermost mount).
+ */
+export function isNoexecPath(mountinfo: string, dir: string): boolean {
+  let best: { mp: string; noexec: boolean } | undefined;
+  for (const line of mountinfo.split("\n")) {
+    const parts = line.split(" ");
+    if (parts.length < 6) continue;
+    const mp = decodeMountPoint(parts[4]);
+    if (mp !== "/" && dir !== mp && !dir.startsWith(`${mp}/`)) continue;
+    const noexec = parts[5].split(",").includes("noexec");
+    if (!best || mp.length > best.mp.length) best = { mp, noexec };
+  }
+  return best?.noexec ?? false;
+}
+
+/**
+ * Normalize a configured landlockHelper path: expand a leading ~ and
+ * require an absolute result. Pure. Returns undefined when the input is
+ * not absolute (after ~ expansion) — a relative path would let the
+ * validation (cwd-relative) and the execution (PATH search) refer to
+ * different binaries.
+ */
+export function normalizeHelperPath(override: string, homeDir: string): string | undefined {
+  let p = override;
+  if (p === "~") p = homeDir;
+  else if (p.startsWith("~/")) p = `${homeDir}${p.slice(1)}`;
+  return p.startsWith("/") ? p : undefined;
 }
 
 /** True when `candidate` equals `root` or is beneath it (string-based). */
