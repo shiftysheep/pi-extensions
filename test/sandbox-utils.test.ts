@@ -66,6 +66,8 @@ describe("parseSandboxConfig", () => {
         userCommands: true,
         loginShell: false,
         landlockHelper: "/opt/pi-sandbox-landlock",
+        failIfUnavailable: true,
+        blockTerminates: true,
       },
       P,
     );
@@ -77,6 +79,8 @@ describe("parseSandboxConfig", () => {
     assert.equal(cfg.userCommands, true);
     assert.equal(cfg.loginShell, false);
     assert.equal(cfg.landlockHelper, "/opt/pi-sandbox-landlock");
+    assert.equal(cfg.failIfUnavailable, true);
+    assert.equal(cfg.blockTerminates, true);
   });
   it("rejects non-objects", () => {
     assert.throws(() => parseSandboxConfig(null, P), /expected a JSON object/);
@@ -97,6 +101,10 @@ describe("parseSandboxConfig", () => {
     assert.throws(
       () => parseSandboxConfig({ failIfUnavailable: "yes" }, P),
       /"failIfUnavailable" must be/,
+    );
+    assert.throws(
+      () => parseSandboxConfig({ blockTerminates: "yes" }, P),
+      /"blockTerminates" must be/,
     );
   });
 });
