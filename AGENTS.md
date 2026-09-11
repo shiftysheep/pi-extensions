@@ -7,8 +7,9 @@ Agent instructions for this repository.
 A [pi](https://pi.dev) coding-agent package: four custom TypeScript extensions in
 `extensions/` plus recommended third-party pi packages pulled in as npm dependencies
 (declared in `dependencies` + `bundledDependencies`; resolved from the registry at
-install time, never vendored). See README.md for user-facing docs — don't duplicate
-that content here, keep it in the README.
+install time, never vendored). User-facing docs live in README.md (landing page)
+and docs/ (one page per extension) — don't duplicate that content here; keep it
+in the README/docs pages.
 
 ## Commands
 
@@ -55,7 +56,8 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
   Use `npm run commit` or write `<type>: <summary>` messages (types: feat, fix, chore,
   docs, refactor, ...).
 - **New extension file**: drop it in `extensions/` and add `./extensions/<file>.ts` to
-  the `pi.extensions` array in `package.json`, plus a row in the README's extensions table.
+  the `pi.extensions` array in `package.json`, plus a row in the README's extensions
+  table and a reference page under `docs/` (linked from that row).
 
 ## Versioning & release
 
