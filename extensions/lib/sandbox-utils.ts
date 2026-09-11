@@ -29,13 +29,16 @@ export const SANDBOX_ALLOWED_KEYS = [
 ] as const;
 
 /**
- * $HOME-relative cache/tool dirs made writable by default (homeCaches: "rw",
- * the default) so common dev tooling works out of the box: XDG cache
+ * $HOME-relative cache/tool dirs made writable when homeCaches: "rw"
+ * (opt-in) so common dev tooling works out of the box: XDG cache
  * (pre-commit, pip, uv, virtualenv, huggingface, …), package-manager caches,
- * and tool install locations. Deliberately excludes credential/config dirs
- * (.ssh, .aws, .gnupg, .config). Home-relative so they track $HOME; extended
- * in buildWritableRoots only for dirs that already exist (a missing dir is
- * skipped, never walked up to $HOME).
+ * and tool install locations. Default is "ro": several of these dirs can
+ * hold credentials or executable shims (.cargo, .gem, .m2, .local/bin), and
+ * a silently-writable toolchain is a supply-chain risk. Deliberately
+ * excludes credential/config dirs (.ssh, .aws, .gnupg, .config).
+ * Home-relative so they track $HOME; extended in buildWritableRoots only
+ * for dirs that already exist (a missing dir is skipped, never walked up
+ * to $HOME).
  */
 export const HOME_CACHE_ROOTS = [
   ".cache",
@@ -70,8 +73,9 @@ export type SandboxConfig = {
   writable?: string[];
   /** Access to $HOME. Default: "ro". */
   home?: "rw" | "ro";
-  /** Writable $HOME cache/tool dirs (HOME_CACHE_ROOTS). Default: "rw". Set
-   * "ro" for a stricter sandbox that leaves every $HOME subdir read-only. */
+  /** Writable $HOME cache/tool dirs (HOME_CACHE_ROOTS). Default: "ro" (these
+   * dirs can hold credentials/executables). Set "rw" to let common dev
+   * tooling write to them. */
   homeCaches?: "rw" | "ro";
   /** Network policy. Default: "allow". Enforced by bwrap/seatbelt; a no-op
    * (with a warning) on landlock, which cannot restrict networks. */
@@ -108,6 +112,51 @@ export type SandboxPolicy = {
   /** Login shell (`-lc`) vs plain `-c` for the wrapped command. */
   loginShell: boolean;
 };
+
+/** Effective sandbox state after config + runner probing. */
+export type SandboxState =
+  | { active: false; enabled: false }
+  | {
+      active: false;
+      enabled: true;
+      reason: string;
+      /** failIfUnavailable: commands are BLOCKED, not run unsandboxed. */
+      failClosed?: boolean;
+    }
+  | {
+      active: true;
+      enabled: true;
+      runner: "bwrap" | "landlock" | "sandbox-exec";
+      policy: SandboxPolicy;
+      helperPath?: string;
+      /** false when network=deny is requested but the runner cannot enforce it (landlock). */
+      networkEnforced: boolean;
+    };
+
+/** Compact identity of a SandboxState, used to detect changes between turns.
+ * Active states include the writable roots and network enforcement so
+ * policy-only edits are noticed, not just runner changes. */
+export function sandboxStateSignature(state: SandboxState): string {
+  if (state.active)
+    return `active:${state.runner}:${state.policy.writableRoots.join(",")}:net=${state.policy.network}${state.networkEnforced ? "" : "-unenforced"}`;
+  if (!state.enabled) return "off";
+  return state.failClosed ? "failclosed" : "enabled-unavailable";
+}
+
+/** One-line human/model-readable description of the effective sandbox state. */
+export function describeSandboxState(state: SandboxState): string {
+  if (state.active) {
+    const network =
+      state.policy.network !== "deny"
+        ? "allowed"
+        : state.networkEnforced
+          ? "denied"
+          : "deny requested but NOT enforced";
+    return `ACTIVE (${state.runner}): writes only inside ${state.policy.writableRoots.join(", ")}; network ${network}`;
+  }
+  if (!state.enabled) return "DISABLED: no filesystem restrictions";
+  return `enabled but no runner available${state.failClosed ? "; affected commands are BLOCKED" : "; commands run UNSANDBOXED"}`;
+}
 
 export type RunnerContext = {
   cwd: string;
@@ -356,18 +405,26 @@ export function resolveExistingRoot(path: string, exists: (p: string) => boolean
  * to /private/tmp. Defaults to the identity so pure callers/tests can omit
  * it; for bwrap/landlock canonicalization is harmless (both resolve paths
  * to the same inode view).
+ *
+ * Configured `writable` entries that DO NOT EXIST are omitted and reported
+ * in `missingWritable` — never resolved to an existing ancestor. Widening
+ * `/missing/path` to `/` would silently make the whole filesystem writable.
  */
 export function buildWritableRoots(
   config: SandboxConfig,
   ctx: RunnerContext,
   exists: (p: string) => boolean,
   realpath: (p: string) => string = (p) => p,
-): string[] {
+): { roots: string[]; missingWritable: string[] } {
   const roots = new Set<string>();
-  const add = (p: string) =>
-    roots.add(realpath(resolveExistingRoot(normalizeSandboxPath(p, ctx), exists)));
+  const missingWritable: string[] = [];
+  const add = (p: string) => roots.add(realpath(p));
   add(ctx.cwd); // workspace
-  for (const entry of config.writable ?? []) add(entry);
+  for (const entry of config.writable ?? []) {
+    const norm = normalizeSandboxPath(entry, ctx);
+    if (exists(norm)) add(norm);
+    else missingWritable.push(norm);
+  }
   // DAC-backstopped pseudo-roots that keep common patterns working:
   // `> /dev/null`, /proc/self writes, scratch space. /dev stays LITERAL:
   // it is a mount point (never a symlink in practice) and the bwrap wrapper
@@ -384,20 +441,21 @@ export function buildWritableRoots(
     if (tmp !== "/") roots.add(tmp);
   }
   if (config.home === "rw") add(ctx.homeDir);
-  // Default-writable $HOME cache/tool dirs (opt-out via homeCaches: "ro").
-  // Added only when the dir EXISTS: unlike `writable` entries, a missing cache
-  // dir must NOT fall back to its ancestor via resolveExistingRoot, or a
-  // absent ~/.cargo would silently make all of $HOME writable.
-  if (config.homeCaches !== "ro") {
+  // Opt-in writable $HOME cache/tool dirs (homeCaches: "rw").
+  // Added only when the dir EXISTS: a missing cache dir must NOT fall back
+  // to its ancestor via resolveExistingRoot, or an absent ~/.cargo would
+  // silently make all of $HOME writable.
+  if (config.homeCaches === "rw") {
     for (const rel of HOME_CACHE_ROOTS) {
       const abs = `${ctx.homeDir}/${rel}`;
       if (exists(abs)) roots.add(realpath(abs));
     }
   }
   // A root subsuming another is redundant.
-  return [...roots].filter(
+  const deduped = [...roots].filter(
     (r) => ![...roots].some((other) => other !== r && isInsideRoot(r, other)),
   );
+  return { roots: deduped, missingWritable };
 }
 
 /**
