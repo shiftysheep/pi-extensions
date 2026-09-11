@@ -28,11 +28,12 @@ export type GateRule = {
 };
 
 /** Split a command line into shell segments (top-level separators only).
- * `>&` and `>|` are REDIRECTION operators, not separators: a `&`/`|`
- * immediately after `>` stays inside the segment. */
+ * `>&` and `>|` are REDIRECTION operators, not separators: an unescaped `>`
+ * immediately before `&`/`|` stays inside the segment. An ESCAPED `>`
+ * (`\>`) is a literal, so the following `|`/`&` is a real separator. */
 export function segments(command: string): string[] {
   return command
-    .split(/&&|\|\||(?<!>)[;&|]|\n/)
+    .split(/&&|\|\||(?<![^\\]>)[;&|]|\n/)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -90,6 +91,76 @@ const SAFE_DEV_TARGETS = [
 function isUnsafeDevTarget(target: string): boolean {
   if (!target.startsWith("/dev/")) return false;
   return !SAFE_DEV_TARGETS.some((s) => target === s || target.startsWith(`${s}/`));
+}
+
+/**
+ * Extract redirection targets from a segment, quote-aware. Handles >, >>,
+ * >&, >|; skips escaped characters and quoted spans (a quoted EXAMPLE of a
+ * redirect is not a redirect); parses the target as a shell word, so
+ * concatenated quoting (`>'tmp'/dev/sda`) yields the literal `tmp/dev/sda`
+ * and a fully quoted target (`>"/dev/sda"`) yields `/dev/sda`.
+ */
+function redirectTargets(segment: string): string[] {
+  const targets: string[] = [];
+  let i = 0;
+  while (i < segment.length) {
+    const ch = segment[i];
+    if (ch === "\\" && i + 1 < segment.length) {
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const q = ch;
+      i++;
+      while (i < segment.length && segment[i] !== q) {
+        if (segment[i] === "\\") i++;
+        i++;
+      }
+      i++;
+      continue;
+    }
+    if (ch === ">") {
+      let j = i + 1;
+      if (segment[j] === ">") j++;
+      if (segment[j] === "&" || segment[j] === "|") j++;
+      while (segment[j] === " ") j++;
+      let target = "";
+      while (j < segment.length) {
+        const c = segment[j];
+        if (c === " ") break;
+        if (c === "'" || c === '"') {
+          const q = c;
+          j++;
+          while (j < segment.length && segment[j] !== q) {
+            if (segment[j] === "\\") j++;
+            target += segment[j] ?? "";
+            j++;
+          }
+          j++;
+          continue;
+        }
+        if (c === "\\" && j + 1 < segment.length) {
+          j++;
+          target += segment[j];
+          j++;
+          continue;
+        }
+        target += c;
+        j++;
+      }
+      targets.push(target);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return targets;
+}
+
+/** Option-sensitive check that ignores operands after a `--` terminator. */
+function optionsBeforeTerminator(args: string[]): string[] {
+  const dd = args.indexOf("--");
+  return dd === -1 ? args : args.slice(0, dd);
 }
 
 /**
@@ -203,25 +274,30 @@ const POWER_ACTIONS: readonly CatalogEntry[] = [
 ];
 
 const DEVICE_WIPES: readonly CatalogEntry[] = [
-  // -n/--no-act is a dry run: inspect, not wipe.
+  // -n/--no-act is a dry run: inspect, not wipe. Only OPTIONS (before any
+  // `--`) count — an operand named --no-act is not a dry-run flag.
   {
     cmds: ["wipefs"],
     test: (args) =>
-      !args.some((a) => a === "--no-act" || a === "--help" || /^-(?!-)[A-Za-z]*n/.test(a)),
+      !optionsBeforeTerminator(args).some(
+        (a) => a === "--no-act" || a === "--help" || /^-(?!-)[A-Za-z]*n/.test(a),
+      ),
   },
   {
     cmds: ["blkdiscard"],
-    test: (args) => !args.some((a) => a === "--dry-run" || /^-(?!-)[A-Za-z]*n/.test(a)),
+    test: (args) =>
+      !optionsBeforeTerminator(args).some((a) => a === "--dry-run" || /^-(?!-)[A-Za-z]*n/.test(a)),
   },
   { cmds: ["sgdisk"], has: ["--zap-all"] },
   { cmds: ["parted"], has: ["rm"] },
 ];
 
 const VOLUME_DESTROYS: readonly CatalogEntry[] = [
-  // -t/--test is a dry run.
+  // -t/--test is a dry run (options only, before any `--`).
   {
     cmds: ["lvremove", "vgremove"],
-    test: (args) => !args.some((a) => a === "--test" || /^-(?!-)[A-Za-z]*t/.test(a)),
+    test: (args) =>
+      !optionsBeforeTerminator(args).some((a) => a === "--test" || /^-(?!-)[A-Za-z]*t/.test(a)),
   },
   { cmds: ["zpool", "zfs"], sub: ["destroy"] },
 ];
@@ -375,17 +451,7 @@ const RULES: GateRule[] = [
     name: "raw device write (redirect)",
     disposition: "deny",
     test: (command) =>
-      segments(command).some((seg) => {
-        // Quoted spans are stripped first: a quoted EXAMPLE of a redirect
-        // (`printf '%s' 'cat img >/dev/sda'`) is not a device write.
-        const unquoted = seg.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, "");
-        // Each redirection target is checked independently (operators >, >>,
-        // >&, >|), so a trailing `2>&1` cannot hide a device write earlier in
-        // the segment (`cat img >/dev/sda 2>&1`).
-        return [...unquoted.matchAll(/>(?:&|\|)?\s*(\/dev\/[A-Za-z0-9._\-/]+)/g)].some((m) =>
-          isUnsafeDevTarget(m[1]),
-        );
-      }),
+      segments(command).some((seg) => redirectTargets(seg).some(isUnsafeDevTarget)),
   },
   {
     // Writers taking a raw device as an argument: tee/shred (any target),

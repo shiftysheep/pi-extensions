@@ -159,6 +159,20 @@ describe("raw device writes (deny tier)", () => {
     assert.equal(findDangerousRule("shred -- /dev/sdb1")?.disposition, "deny");
     assert.equal(findDangerousRule("cp -- image.img /dev/sda")?.disposition, "deny");
   });
+  it("splits background and escaped-redirect pipelines correctly", () => {
+    // background separator still splits; escaped > is a literal, so the
+    // following | is a real pipeline separator
+    assert.equal(findDangerousRule("sleep 1 & dd of=/dev/sda")?.disposition, "deny");
+    assert.equal(findDangerousRule("echo \\>|dd of=/dev/sda")?.disposition, "deny");
+  });
+  it("parses quoted and concatenated redirect targets", () => {
+    assert.equal(findDangerousRule('cat img >"/dev/sda"')?.disposition, "deny");
+    assert.equal(findDangerousRule("cat img >'tmp'/dev/sda"), undefined);
+  });
+  it("does not exempt dry-run operands after --", () => {
+    assert.equal(findDangerousRule("wipefs -a -- /dev/sda --no-act")?.disposition, "deny");
+    assert.equal(findDangerousRule("lvremove --test vg0/lv0"), undefined);
+  });
   it("matches tee/shred/cp with raw device targets", () => {
     assert.equal(findDangerousRule("tee /dev/sda")?.disposition, "deny");
     assert.equal(findDangerousRule("shred /dev/sdb1")?.disposition, "deny");
