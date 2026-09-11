@@ -133,9 +133,12 @@ export type SandboxState =
       networkEnforced: boolean;
     };
 
-/** Compact identity of a SandboxState, used to detect changes between turns. */
+/** Compact identity of a SandboxState, used to detect changes between turns.
+ * Active states include the writable roots and network enforcement so
+ * policy-only edits are noticed, not just runner changes. */
 export function sandboxStateSignature(state: SandboxState): string {
-  if (state.active) return `active:${state.runner}`;
+  if (state.active)
+    return `active:${state.runner}:${state.policy.writableRoots.join(",")}:net=${state.policy.network}${state.networkEnforced ? "" : "-unenforced"}`;
   if (!state.enabled) return "off";
   return state.failClosed ? "failclosed" : "enabled-unavailable";
 }

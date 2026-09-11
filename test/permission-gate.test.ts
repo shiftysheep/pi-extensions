@@ -27,7 +27,15 @@ describe("recursive rm (always confirmed)", () => {
     assert.equal(m?.disposition, "confirm");
   });
   it("does not match non-recursive rm or other commands", () => {
-    for (const cmd of ["rm file.txt", "rm -f file.txt", "xrm -rf /", "inform -r /"]) {
+    for (const cmd of [
+      "rm file.txt",
+      "rm -f file.txt",
+      "rm --force file.txt",
+      "rm --verbose file.txt",
+      "rm --interactive file.txt",
+      "xrm -rf /",
+      "inform -r /",
+    ]) {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
   });
@@ -86,13 +94,17 @@ describe("privilege escalation", () => {
 });
 
 describe("raw device writes (deny tier)", () => {
-  it("matches dd of=/dev/<raw device>, incl. through sudo", () => {
+  it("matches dd of=/dev/<raw device>, incl. through env/sudo wrappers", () => {
     for (const cmd of [
       "dd if=/dev/zero of=/dev/sda bs=1M",
       "dd of=/dev/sdb1 count=1",
       "cat x | dd of=/dev/nvme0n1",
       "sudo dd if=/dev/zero of=/dev/sda",
       "sudo -u root dd of=/dev/sda",
+      "sudo -g wheel dd of=/dev/sda",
+      "sudo -C 3 dd of=/dev/sda",
+      "env -u FOO dd of=/dev/sda",
+      "env FOO=1 sudo dd of=/dev/sda",
     ]) {
       const m = findDangerousRule(cmd);
       assert.equal(m?.name, "raw device write (dd)", cmd);
@@ -115,13 +127,17 @@ describe("raw device writes (deny tier)", () => {
       assert.equal(m.disposition, "deny", cmd);
     }
   });
-  it("does not match harmless redirects", () => {
+  it("does not match harmless redirects or special files", () => {
     for (const cmd of [
       "echo hi > /dev/null",
+      "cmd > /dev/null 2>&1",
+      "make 2>&1 | tee /dev/null",
       "cmd > /dev/stdout",
       "wc -l x > /dev/fd/3",
       "head /dev/zero > out.bin",
       "echo x > /tmp/out",
+      "tee /dev/fd/3",
+      "cp file /dev/shm/work",
     ]) {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
@@ -134,7 +150,7 @@ describe("raw device writes (deny tier)", () => {
     assert.equal(findDangerousRule("tee /dev/null"), undefined);
     assert.equal(findDangerousRule("cp /dev/zero out.img"), undefined);
   });
-  it("matches device wipes and media erasure", () => {
+  it("matches device wipes and media erasure (dry-run forms excluded)", () => {
     for (const cmd of [
       "wipefs -a /dev/sda",
       "blkdiscard /dev/nvme0n1",
@@ -147,8 +163,10 @@ describe("raw device writes (deny tier)", () => {
     }
     assert.equal(findDangerousRule("parted /dev/sda print"), undefined);
     assert.equal(findDangerousRule("sgdisk /dev/sda"), undefined);
+    assert.equal(findDangerousRule("wipefs --no-act /dev/sda"), undefined);
+    assert.equal(findDangerousRule("blkdiscard --dry-run /dev/nvme0n1"), undefined);
   });
-  it("matches LVM/ZFS destruction", () => {
+  it("matches LVM/ZFS destruction (--test excluded)", () => {
     for (const cmd of [
       "lvremove vg0/lv0",
       "vgremove vg0",
@@ -161,6 +179,7 @@ describe("raw device writes (deny tier)", () => {
     }
     assert.equal(findDangerousRule("zfs get all"), undefined);
     assert.equal(findDangerousRule("zpool status"), undefined);
+    assert.equal(findDangerousRule("lvremove --test vg0/lv0"), undefined);
   });
   it("mkfs is deny", () => {
     for (const cmd of ["mkfs.ext4 /dev/sda1", "mkfs -t xfs /dev/sdb", "sudo mkfs.btrfs /dev/sdc"]) {
@@ -203,8 +222,13 @@ describe("destructive git operations", () => {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
   });
-  it("matches reset --hard and forced clean", () => {
+  it("matches reset --hard and forced clean, incl. global options", () => {
     assert.equal(findDangerousRule("git reset --hard HEAD~1")?.name, "destructive git operation");
+    assert.equal(findDangerousRule("git -C repo reset --hard")?.name, "destructive git operation");
+    assert.equal(
+      findDangerousRule("git --git-dir=/x push --force")?.name,
+      "destructive git operation",
+    );
     assert.equal(findDangerousRule("git clean -fdx")?.name, "destructive git operation");
     assert.equal(findDangerousRule("git clean -f")?.name, "destructive git operation");
     assert.equal(findDangerousRule("git reset --soft HEAD~1"), undefined);
@@ -212,8 +236,13 @@ describe("destructive git operations", () => {
   });
   it("matches force branch deletion and history rewrites", () => {
     assert.equal(findDangerousRule("git branch -D old")?.name, "destructive git operation");
+    assert.equal(findDangerousRule("git branch -d -f old")?.name, "destructive git operation");
     assert.equal(
       findDangerousRule("git branch --delete -f old")?.name,
+      "destructive git operation",
+    );
+    assert.equal(
+      findDangerousRule("git branch --delete --force old")?.name,
       "destructive git operation",
     );
     assert.equal(
@@ -239,17 +268,24 @@ describe("remote destruction (cloud/IaC)", () => {
       "cdk destroy --force",
       "pulumi destroy --yes",
       "vagrant destroy -force",
-      "sam delete-stack my-stack --no-fail-on-empty",
+      "sam delete my-stack",
       "serverless remove -s prod",
       "sls remove -s prod",
       "az group delete -rg prod-rg --yes",
+      "az --output json group delete -g prod-rg --yes",
       "gcloud projects delete old-project",
+      "gcloud --project=x projects delete old-project",
       "docker volume rm data-vol",
-      "docker volume prune -f",
+      "docker --host=tcp://x volume prune -f",
       "kubectl delete namespace prod",
       "kubectl delete ns staging",
+      "kubectl --context prod delete namespace x",
+      "kubectl delete namespaces prod",
+      "kubectl delete namespace/prod",
       "aws s3 rm s3://bucket --recursive",
+      "aws --profile prod s3 rm s3://bucket --recursive",
       "gh repo delete myrepo --yes",
+      "gh --hostname=ghe.corp repo delete myrepo --yes",
       "npm unpublish mypkg --force",
     ]) {
       assert.equal(findDangerousRule(cmd)?.name, "remote destruction (cloud/IaC)", cmd);
@@ -270,6 +306,7 @@ describe("remote destruction (cloud/IaC)", () => {
       "docker volume ls",
       "docker container rm web-1",
       "kubectl delete pod web-1",
+      "kubectl delete pod ns",
       "kubectl get namespaces",
       "aws s3 rm s3://bucket/file.txt",
       "gh repo clone x/y",
@@ -334,7 +371,7 @@ describe("PowerShell rules", () => {
       assert.equal(ps(cmd), undefined, cmd);
     }
   });
-  it("matches disk wipes as deny", () => {
+  it("matches disk wipes as deny (-WhatIf excluded)", () => {
     for (const cmd of [
       "Format-Volume -Number 1",
       "Clear-Disk -Number 1",
@@ -344,6 +381,7 @@ describe("PowerShell rules", () => {
       assert.equal(m?.name, "disk wipe", cmd);
       assert.equal(m?.disposition, "deny", cmd);
     }
+    assert.equal(ps("Clear-Disk -Number 1 -WhatIf"), undefined);
   });
   it("matches power actions", () => {
     assert.equal(ps("Stop-Computer -Force")?.name, "power action");

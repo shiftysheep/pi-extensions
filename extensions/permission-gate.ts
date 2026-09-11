@@ -550,15 +550,22 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event) => {
     const signature = sandboxStateSignature(state);
-    const changed = lastStateSignature !== undefined && signature !== lastStateSignature;
+    const first = lastStateSignature === undefined;
+    const changed = !first && signature !== lastStateSignature;
     lastStateSignature = signature;
-    if (!changed && !state.active) return;
+    // First turn of an extension instance (session start OR /reload): always
+    // state the current sandbox state — including inactive/fail-closed, which
+    // the model most needs to know. Afterwards: announce only real changes
+    // (the signature covers runner, writable roots, and network enforcement)
+    // plus a standing line while active.
+    if (!first && !changed && !state.active) return;
     const notes: string[] = [];
     if (changed)
       notes.push(
         `[sandbox] State changed since your last turn — now ${describeSandboxState(state)}. This is an intentional user action, not a transient error: update your assumptions about which paths are writable and whether commands are restricted.`,
       );
-    if (state.active) notes.push(`[sandbox] Current state: ${describeSandboxState(state)}.`);
+    if (first || state.active)
+      notes.push(`[sandbox] Current state: ${describeSandboxState(state)}.`);
     return { systemPrompt: `${event.systemPrompt}\n\n${notes.join("\n")}` };
   });
 
@@ -785,14 +792,15 @@ export default function (pi: ExtensionAPI) {
     if (option === "homeCaches") {
       const v = await promptSelect(ctx, "Writable $HOME cache dirs", [
         {
-          value: "rw",
-          label: "rw",
-          description: "~/.cache, ~/.npm, ~/.cargo, … are writable (default)",
-        },
-        {
           value: "ro",
           label: "ro",
-          description: "every $HOME subdir stays read-only (stricter)",
+          description: "every $HOME subdir stays read-only (default)",
+        },
+        {
+          value: "rw",
+          label: "rw",
+          description:
+            "~/.cache, ~/.npm, ~/.cargo, … are writable (opt-in; some hold credentials/executables)",
         },
       ]);
       return v === undefined ? undefined : { homeCaches: v as "rw" | "ro" };
@@ -975,7 +983,7 @@ export default function (pi: ExtensionAPI) {
         `Config: ${files.project} (project, wins per-key)${trustNote} / ${files.global} (global)${managedLine}`,
       );
       lines.push(
-        "Gate categories: system rules always gated; filesystem rules gated whenever the sandbox is inactive (disabled or fallback).",
+        "Gate: irreversible-action rules (recursive rm, world-writable chmod, destructive git, remote destruction, …) are ALWAYS gated, sandboxed or not; raw host-disk operations are hard-blocked (human-only).",
       );
       ctx.ui.notify(lines.join("\n"), "info");
     },

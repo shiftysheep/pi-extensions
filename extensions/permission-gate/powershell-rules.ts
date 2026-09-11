@@ -126,12 +126,15 @@ const PS_RULES: PsRule[] = [
   },
   {
     // Volume/disk wiping — destroys data irreversibly. Hard block.
+    // -WhatIf (dry-run) is excluded: it inspects, it does not wipe.
     name: "disk wipe",
     disposition: "deny",
     test: (command) =>
-      psSegments(command).some((seg) =>
-        ["format-volume", "clear-disk", "initialize-disk"].includes(psCommand(seg) ?? ""),
-      ),
+      psSegments(command).some((seg) => {
+        if (!["format-volume", "clear-disk", "initialize-disk"].includes(psCommand(seg) ?? ""))
+          return false;
+        return !hasParam(psArgs(seg), "WhatIf");
+      }),
   },
   {
     // Power / shutdown actions

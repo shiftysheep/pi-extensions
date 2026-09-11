@@ -666,8 +666,24 @@ describe("sandboxStateSignature", () => {
         policy: { writableRoots: ["/w"], network: "allow", loginShell: true },
         networkEnforced: true,
       }),
-      "active:bwrap",
+      "active:bwrap:/w:net=allow",
     );
+  });
+  it("active signature changes when roots or network enforcement change", () => {
+    const base = {
+      active: true as const,
+      enabled: true as const,
+      runner: "landlock" as const,
+      policy: { writableRoots: ["/w"], network: "deny" as const, loginShell: true },
+      networkEnforced: false,
+    };
+    const a = sandboxStateSignature(base);
+    assert.equal(a, "active:landlock:/w:net=deny-unenforced");
+    assert.notEqual(
+      a,
+      sandboxStateSignature({ ...base, policy: { ...base.policy, writableRoots: ["/w", "/x"] } }),
+    );
+    assert.notEqual(a, sandboxStateSignature({ ...base, networkEnforced: true }));
   });
   it("same state yields the same signature (change detection)", () => {
     const a = { active: false, enabled: false } as const;
