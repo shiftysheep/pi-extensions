@@ -46,23 +46,34 @@ function commandOf(segment: string): { cmd: string; args: string[] } | undefined
   if (i >= parts.length) return undefined;
   let cmd = parts[i].split("/").pop() ?? parts[i];
   if (cmd === "env") {
-    // env [FLAGS] [VAR=VALUE]* COMMAND — unwrap to the real command. -u
-    // takes an operand that must not be mistaken for the command word.
+    // env [FLAGS] [VAR=VALUE]* [--] COMMAND — unwrap to the real command.
+    // -u/-C/--unset take an operand that must not be mistaken for the
+    // command word; `--` terminates options.
     i++;
     while (i < parts.length) {
       const p = parts[i];
-      if (p === "-u") i += 2;
+      if (p === "--") {
+        i++;
+        break;
+      }
+      if (p === "-u" || p === "-C" || p === "--unset") i += 2;
       else if (/^--?\w/.test(p) || /^[A-Za-z_]\w*=\S+$/.test(p)) i++;
       else break;
     }
     if (i >= parts.length) return undefined;
     cmd = parts[i].split("/").pop() ?? parts[i];
   }
-  return { cmd, args: parts.slice(i + 1) };
+  // `--` terminates options: everything after it is a literal operand
+  // (e.g. `rm -- -r` deletes a file named "-r", it is not recursive).
+  let rest = parts.slice(i + 1);
+  const dd = rest.indexOf("--");
+  if (dd !== -1) rest = rest.slice(0, dd);
+  return { cmd, args: rest };
 }
 
 // Harmless /dev targets that are NOT raw device writes. Prefix-aware: /dev/fd/3
-// and /dev/shm/file are safe, /dev/sda is not.
+// and /dev/shm/file are safe, /dev/sda is not. Writing to /dev/zero
+// discards data; /dev/urandom is read-only.
 const SAFE_DEV_TARGETS = [
   "/dev/null",
   "/dev/stdout",
@@ -71,6 +82,8 @@ const SAFE_DEV_TARGETS = [
   "/dev/tty",
   "/dev/fd",
   "/dev/shm",
+  "/dev/zero",
+  "/dev/urandom",
 ];
 
 /** True for a /dev/* path that is a real device, not a harmless special file. */
@@ -90,7 +103,30 @@ function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
   if (!parsed) return [];
   const chain = [parsed];
   if (parsed.cmd === "sudo" || parsed.cmd === "doas" || parsed.cmd === "pkexec") {
-    const OPT_WITH_ARG = new Set(["-u", "--user", "-g", "--group", "-C", "--close"]);
+    // Operand-taking options for sudo/doas (pkexec takes none). -h is HOST
+    // for sudo, not help.
+    const OPT_WITH_ARG = new Set([
+      "-u",
+      "--user",
+      "-g",
+      "--group",
+      "-C",
+      "--close",
+      "-D",
+      "--directory",
+      "-h",
+      "--host",
+      "-R",
+      "--chroot",
+      "-a",
+      "--ipv4-addr",
+      "-A",
+      "--ipv6-addr",
+      "-P",
+      "--prompt",
+      "-T",
+      "--timestamp",
+    ]);
     const args = parsed.args;
     let i = 0;
     while (i < args.length && args[i].startsWith("-")) {
@@ -102,8 +138,23 @@ function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
   return chain;
 }
 
-// Redirect targets that are harmless even when written to.
-const SAFE_REDIRECT_TARGETS = /^(?:null|stdout|stderr|full|tty|fd|zero|urandom|shm)(?:\/|$)/;
+/**
+ * Positional arguments: flags dropped, and operands of known operand-taking
+ * options dropped too (a generic flag filter would leave `--prefix /tmp`'s
+ * "/tmp" in a positional slot).
+ */
+function positionalArgs(args: string[], optsWithArg: readonly string[] = []): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("-")) {
+      if (optsWithArg.includes(a)) i++; // skip the option's operand
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
 /**
  * Declarative command-catalog entry. A segment matches when its (possibly
  * privilege-unwrapped) command word is in `cmds` AND every provided argument
@@ -120,6 +171,8 @@ export type CatalogEntry = {
   /** Match sub/sub2 against the first non-flag argument(s) — tolerates
    * global options like `terraform -chdir=prod destroy`. */
   positional?: boolean;
+  /** Options (with separate operands) to skip when computing positionals. */
+  optsWithArg?: readonly string[];
   /** args must contain at least one of these. */
   has?: readonly string[];
   /** args must contain NONE of these (e.g. dry-run/help forms). */
@@ -133,7 +186,7 @@ function catalogMatches(entries: readonly CatalogEntry[], segment: string): bool
   return commandChain(segment).some(({ cmd, args }) =>
     entries.some((e) => {
       if (!e.cmds.includes(cmd)) return false;
-      const a = e.positional ? args.filter((x) => !x.startsWith("-")) : args;
+      const a = e.positional ? positionalArgs(args, e.optsWithArg) : args;
       if (e.sub && !e.sub.includes(a[0] ?? "")) return false;
       if (e.sub2 && !e.sub2.includes(a[1] ?? "")) return false;
       if (e.has && !e.has.some((h) => args.includes(h))) return false;
@@ -151,14 +204,26 @@ const POWER_ACTIONS: readonly CatalogEntry[] = [
 ];
 
 const DEVICE_WIPES: readonly CatalogEntry[] = [
-  { cmds: ["wipefs"], notHas: ["--no-act", "--help"] },
-  { cmds: ["blkdiscard"], notHas: ["--dry-run"] },
+  // -n/--no-act is a dry run: inspect, not wipe.
+  {
+    cmds: ["wipefs"],
+    test: (args) =>
+      !args.some((a) => a === "--no-act" || a === "--help" || /^-(?!-)[A-Za-z]*n/.test(a)),
+  },
+  {
+    cmds: ["blkdiscard"],
+    test: (args) => !args.some((a) => a === "--dry-run" || /^-(?!-)[A-Za-z]*n/.test(a)),
+  },
   { cmds: ["sgdisk"], has: ["--zap-all"] },
   { cmds: ["parted"], has: ["rm"] },
 ];
 
 const VOLUME_DESTROYS: readonly CatalogEntry[] = [
-  { cmds: ["lvremove", "vgremove"], notHas: ["--test"] },
+  // -t/--test is a dry run.
+  {
+    cmds: ["lvremove", "vgremove"],
+    test: (args) => !args.some((a) => a === "--test" || /^-(?!-)[A-Za-z]*t/.test(a)),
+  },
   { cmds: ["zpool", "zfs"], sub: ["destroy"] },
 ];
 
@@ -171,9 +236,15 @@ const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
     cmds: ["terraform", "terragrunt", "cdk", "pulumi", "vagrant"],
     sub: ["destroy"],
     positional: true,
+    optsWithArg: ["-chdir", "--chdir", "--cwd"],
   },
-  { cmds: ["sam"], sub: ["delete"], positional: true },
-  { cmds: ["serverless", "sls"], sub: ["remove"], positional: true },
+  { cmds: ["sam"], sub: ["delete"], positional: true, optsWithArg: ["--region", "-r"] },
+  {
+    cmds: ["serverless", "sls"],
+    sub: ["remove"],
+    positional: true,
+    optsWithArg: ["-s", "--stage", "-r", "--region"],
+  },
   {
     cmds: ["az"],
     test: (args) => {
@@ -181,9 +252,17 @@ const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
       return gi !== -1 && args[gi + 1] === "delete";
     },
   },
-  { cmds: ["gcloud"], sub: ["projects"], sub2: ["delete"], positional: true },
+  {
+    cmds: ["gcloud"],
+    sub: ["projects"],
+    sub2: ["delete"],
+    positional: true,
+    optsWithArg: ["--project"],
+  },
   {
     cmds: ["docker"],
+    positional: true,
+    optsWithArg: ["--host", "-H"],
     test: (args) => {
       const vi = args.indexOf("volume");
       return vi !== -1 && (args[vi + 1] === "rm" || args[vi + 1] === "prune");
@@ -213,7 +292,24 @@ const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
       return ri !== -1 && args[ri + 1] === "delete";
     },
   },
-  { cmds: ["npm"], sub: ["unpublish"], positional: true },
+  {
+    cmds: ["npm"],
+    sub: ["unpublish"],
+    positional: true,
+    optsWithArg: [
+      "--prefix",
+      "-p",
+      "--userconfig",
+      "--globalconfig",
+      "--local-prefix",
+      "--call",
+      "-c",
+      "--loglevel",
+      "-l",
+      "--registry",
+      "-r",
+    ],
+  },
 ];
 
 const DB_DESTRUCTION: readonly CatalogEntry[] = [
@@ -277,12 +373,12 @@ const RULES: GateRule[] = [
     name: "raw device write (redirect)",
     disposition: "deny",
     test: (command) =>
-      segments(command).some((seg) => {
-        // Target must be a clean path at the segment end: `> /dev/null 2>&1`
-        // splits on & and must not be read as a device target.
-        const m = />>?\s*(\/dev\/[A-Za-z0-9._\-/]+)$/.exec(seg.trim());
-        return m !== null && isUnsafeDevTarget(m[1]);
-      }),
+      segments(command).some((seg) =>
+        // Each redirection target is checked independently, so a trailing
+        // `2>&1` or `2>/tmp/err` cannot hide a device write earlier in the
+        // segment (`cat img >/dev/sda 2>&1`).
+        [...seg.matchAll(/>>?\s*(\/dev\/[A-Za-z0-9._\-/]+)/g)].some((m) => isUnsafeDevTarget(m[1])),
+      ),
   },
   {
     // Writers taking a raw device as an argument: tee/shred (any target),
@@ -337,9 +433,9 @@ const RULES: GateRule[] = [
       segments(command).some((seg) => {
         const parsed = commandOf(seg);
         if (parsed?.cmd !== "git") return false;
-        // Skip git GLOBAL options (before the subcommand); -C/-c/-p/
-        // --work-tree/--namespace take an operand.
-        const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "-p", "--work-tree", "--namespace"]);
+        // Skip git GLOBAL options (before the subcommand); -C/-c/
+        // --work-tree/--namespace take an operand. (-p paginates: NO operand.)
+        const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--work-tree", "--namespace"]);
         const args = parsed.args;
         let i = 0;
         while (i < args.length && args[i].startsWith("-")) {
@@ -351,6 +447,7 @@ const RULES: GateRule[] = [
             (a) =>
               a === "--force" ||
               a === "--force-with-lease" ||
+              a.startsWith("--force-with-lease=") ||
               a === "-f" ||
               a === "--delete" ||
               a.startsWith("+"),
@@ -362,6 +459,7 @@ const RULES: GateRule[] = [
           return (
             rest.includes("-D") ||
             (rest.includes("-d") && rest.includes("-f")) ||
+            rest.some((a) => /^-(?!-)[A-Za-z]+$/.test(a) && /[dD]/.test(a) && /f/.test(a)) ||
             (rest.includes("--delete") && (rest.includes("-f") || rest.includes("--force")))
           );
         return sub === "filter-repo" || sub === "filter-branch";

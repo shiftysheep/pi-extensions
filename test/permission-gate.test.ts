@@ -211,6 +211,8 @@ describe("destructive git operations", () => {
       "git push --force origin main",
       "git push -f",
       "git push --force-with-lease origin main",
+      "git push --force-with-lease=main origin main",
+      "git -p push --force",
       "git push --delete origin old-branch",
       "git push origin +HEAD:main",
     ]) {
@@ -245,6 +247,8 @@ describe("destructive git operations", () => {
       findDangerousRule("git branch --delete --force old")?.name,
       "destructive git operation",
     );
+    assert.equal(findDangerousRule("git branch -df old")?.name, "destructive git operation");
+    assert.equal(findDangerousRule("git branch -fd old")?.name, "destructive git operation");
     assert.equal(
       findDangerousRule("git filter-repo --replace-refs delete-no-add")?.name,
       "destructive git operation",
@@ -286,9 +290,21 @@ describe("remote destruction (cloud/IaC)", () => {
       "aws --profile prod s3 rm s3://bucket --recursive",
       "gh repo delete myrepo --yes",
       "gh --hostname=ghe.corp repo delete myrepo --yes",
+      "terraform -chdir=prod destroy",
+      "pulumi --cwd /tmp destroy",
+      "npm --prefix /tmp unpublish pkg",
       "npm unpublish mypkg --force",
     ]) {
       assert.equal(findDangerousRule(cmd)?.name, "remote destruction (cloud/IaC)", cmd);
+    }
+  });
+  it("does not false-positive on option operands or subcommands", () => {
+    for (const cmd of [
+      "npm --prefix unpublish publish",
+      "terraform output destroy",
+      "npm exec unpublish",
+    ]) {
+      assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
   });
   it("does not match non-destructive variants", () => {
