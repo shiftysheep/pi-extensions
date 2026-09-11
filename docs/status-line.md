@@ -12,6 +12,13 @@ implementation details.
 - **After the working indicator disappears:** the most recent measured rate is
   retained as a small widget above the editor and cleared when the next response
   starts.
+- **Async subagent total:** a second widget line, `[ subagents · N tok $C.CCC ]`,
+  shows the session's async subagent run cost. Sync subagent runs are already
+  counted in Pi's built-in footer (pi-subagents sets an aggregated top-level
+  `usage` on the tool result); async runs only leave
+  `{sessionDir}/subagent-artifacts/{runId}_{agent}_meta.json`, so the extension
+  scans that directory (throttled to 2 s, deduped by runId, only runs started
+  after this session's first entry) and shows the total alongside the rate.
 
 The `≈` marker identifies a live estimate. The `*` marker identifies a
 provider-confirmed rate. Text, thinking, and tool-call deltas contribute to the
