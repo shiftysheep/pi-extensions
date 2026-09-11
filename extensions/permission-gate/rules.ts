@@ -28,6 +28,7 @@ export type GateRule = {
 };
 
 /** Split a command line into shell segments (top-level separators only).
+ * Separators inside single/double quotes are literal text, not separators.
  * `>&` and `>|` are REDIRECTION operators, not separators: an unescaped `>`
  * immediately before `&`/`|` keeps it inside the segment (including at the
  * very start of the command). An ESCAPED `>` (`\>`) is a literal, so the
@@ -38,6 +39,7 @@ export function segments(command: string): string[] {
   let cur = "";
   let prev: string | null = null; // previous original character
   let prevEscaped = false; // ...and whether it was backslash-escaped
+  let quote: string | null = null; // active quote character (' or "), if any
   const flush = (): void => {
     const t = cur.trim();
     if (t) out.push(t);
@@ -46,6 +48,27 @@ export function segments(command: string): string[] {
   let i = 0;
   while (i < command.length) {
     const ch = command[i];
+    if (quote !== null) {
+      if (quote === '"' && ch === "\\" && i + 1 < command.length) {
+        cur += ch + command[i + 1]; // backslash escapes only inside double quotes
+        i += 2;
+        continue;
+      }
+      cur += ch;
+      if (ch === quote) quote = null;
+      prev = ch;
+      prevEscaped = false;
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      cur += ch;
+      prev = ch;
+      prevEscaped = false;
+      i++;
+      continue;
+    }
     if (ch === "\\" && i + 1 < command.length) {
       cur += ch + command[i + 1];
       prev = command[i + 1];

@@ -159,6 +159,17 @@ describe("raw device writes (deny tier)", () => {
     assert.equal(findDangerousRule("shred -- /dev/sdb1")?.disposition, "deny");
     assert.equal(findDangerousRule("cp -- image.img /dev/sda")?.disposition, "deny");
   });
+  it("does not split separators inside quotes", () => {
+    // quoted ; | & and newlines are literal text, not separators
+    assert.equal(findDangerousRule("printf '%s\\n' 'safe; dd of=/dev/sda'"), undefined);
+    assert.equal(findDangerousRule('echo "a|b" | dd of=/dev/sda')?.disposition, "deny");
+    assert.equal(findDangerousRule("echo 'a&b' & dd of=/dev/sda")?.disposition, "deny");
+    assert.equal(findDangerousRule('echo "a\ndd of=/dev/sda"'), undefined);
+    assert.equal(
+      findDangerousRule('echo "a; dd of=/dev/sda"; dd of=/dev/sda')?.disposition,
+      "deny",
+    );
+  });
   it("splits background and escaped-redirect pipelines correctly", () => {
     // background separator still splits; escaped > is a literal, so the
     // following | is a real pipeline separator
