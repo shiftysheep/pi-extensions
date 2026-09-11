@@ -7,9 +7,11 @@
  *    - CONFIRM (default): prompts before dangerous commands — recursive
  *      `rm`, world-writable `chmod`, privilege escalation, power actions,
  *      destructive Git ops (force push, reset --hard, clean -f, branch -D,
- *      history rewrites), curated remote destruction (terraform destroy,
- *      kubectl delete namespace, aws s3 rm --recursive, repo delete,
- *      unpublish, DROP/TRUNCATE via known DB clients) — and, via a separate
+ *      history rewrites), curated remote destruction (IaC destroy —
+ *      terraform/cdk/pulumi/vagrant/sam/serverless, az group delete,
+ *      gcloud projects delete, docker volume rm/prune, kubectl delete
+ *      namespace, aws s3 rm --recursive, repo delete, unpublish, DROP/
+ *      TRUNCATE via known DB clients) — and, via a separate
  *      PowerShell rule set, dangerous cmdlets (recursive `Remove-Item`,
  *      elevation, `iex`, ACL changes, machine-wide registry writes).
  *    - DENY (hard block, human-only, NO prompt): raw host-disk destruction

@@ -100,6 +100,85 @@ function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
 // Redirect targets that are harmless even when written to.
 const SAFE_REDIRECT_TARGETS = /^(?:null|stdout|stderr|full|tty|fd|zero|urandom|shm)(?:\/|$)/;
 
+/**
+ * Declarative command-catalog entry. A segment matches when its (possibly
+ * privilege-unwrapped) command word is in `cmds` AND every provided argument
+ * constraint holds. Adding a new catalogued command is a data change, not a
+ * code change. Bespoke logic (flag parsing, regexes) goes in `test`.
+ */
+export type CatalogEntry = {
+  /** Command words to match (basename, after env/sudo unwrapping). */
+  cmds: readonly string[];
+  /** args[0] must be one of these. */
+  sub?: readonly string[];
+  /** args[1] must be one of these. */
+  sub2?: readonly string[];
+  /** args must contain at least one of these. */
+  has?: readonly string[];
+  /** args must contain NONE of these. */
+  notHas?: readonly string[];
+  /** Escape hatch for bespoke argument logic. */
+  test?: (args: string[], segment: string) => boolean;
+};
+
+/** True when any command in the segment's chain satisfies a catalog entry. */
+function catalogMatches(entries: readonly CatalogEntry[], segment: string): boolean {
+  return commandChain(segment).some(({ cmd, args }) =>
+    entries.some((e) => {
+      if (!e.cmds.includes(cmd)) return false;
+      if (e.sub && !e.sub.includes(args[0] ?? "")) return false;
+      if (e.sub2 && !e.sub2.includes(args[1] ?? "")) return false;
+      if (e.has && !e.has.some((h) => args.includes(h))) return false;
+      if (e.notHas && e.notHas.some((h) => args.includes(h))) return false;
+      if (e.test && !e.test(args, segment)) return false;
+      return true;
+    }),
+  );
+}
+
+const PRIVILEGE_ESCALATION: readonly CatalogEntry[] = [{ cmds: ["sudo", "doas", "pkexec"] }];
+
+const POWER_ACTIONS: readonly CatalogEntry[] = [
+  { cmds: ["shutdown", "reboot", "poweroff", "halt"] },
+];
+
+const DEVICE_WIPES: readonly CatalogEntry[] = [
+  { cmds: ["wipefs", "blkdiscard"] },
+  { cmds: ["sgdisk"], has: ["--zap-all"] },
+  { cmds: ["parted"], has: ["rm"] },
+];
+
+const VOLUME_DESTROYS: readonly CatalogEntry[] = [
+  { cmds: ["lvremove", "vgremove"] },
+  { cmds: ["zpool", "zfs"], sub: ["destroy"] },
+];
+
+/**
+ * Curated remote-destruction catalog (best-effort; deliberately narrow —
+ * see the file header). New entries are data, not code.
+ */
+const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
+  { cmds: ["terraform", "terragrunt", "cdk", "pulumi", "vagrant"], sub: ["destroy"] },
+  { cmds: ["sam"], sub: ["delete-stack"] },
+  { cmds: ["serverless", "sls"], sub: ["remove"] },
+  { cmds: ["az"], sub: ["group"], sub2: ["delete"] },
+  { cmds: ["gcloud"], sub: ["projects"], sub2: ["delete"] },
+  { cmds: ["docker"], sub: ["volume"], sub2: ["rm", "prune"] },
+  { cmds: ["kubectl"], sub: ["delete"], has: ["namespace", "ns"] },
+  { cmds: ["aws"], sub: ["s3"], sub2: ["rm"], has: ["--recursive"] },
+  { cmds: ["gh"], sub: ["repo"], sub2: ["delete"] },
+  { cmds: ["npm"], sub: ["unpublish"] },
+];
+
+const DB_DESTRUCTION: readonly CatalogEntry[] = [
+  { cmds: ["mysqladmin"], sub: ["drop"] },
+  { cmds: ["dropdb"] },
+  {
+    cmds: ["mysql", "psql", "sqlite3", "mongosh", "sqlplus"],
+    test: (_args, seg) => /\b(drop\s+(database|table)|truncate\s+table)\b/i.test(seg),
+  },
+];
+
 const RULES: GateRule[] = [
   {
     // rm with a recursive flag: -r, -R, -rf, -fr, -r -f, --recursive.
@@ -128,11 +207,7 @@ const RULES: GateRule[] = [
   {
     // Privilege escalation as the command of any segment
     name: "privilege escalation",
-    test: (command) =>
-      segments(command).some((seg) => {
-        const { cmd } = commandOf(seg) ?? {};
-        return cmd === "sudo" || cmd === "doas" || cmd === "pkexec";
-      }),
+    test: (command) => segments(command).some((seg) => catalogMatches(PRIVILEGE_ESCALATION, seg)),
   },
   {
     // dd writing to a raw device (block devices, disks) — destroys data
@@ -182,28 +257,13 @@ const RULES: GateRule[] = [
     // Filesystem-signature wipes and media erasure.
     name: "device wipe",
     disposition: "deny",
-    test: (command) =>
-      segments(command).some((seg) =>
-        commandChain(seg).some(({ cmd, args }) => {
-          if (cmd === "wipefs" || cmd === "blkdiscard") return true;
-          if (cmd === "sgdisk") return args.includes("--zap-all");
-          if (cmd === "parted") return args.includes("rm");
-          return false;
-        }),
-      ),
+    test: (command) => segments(command).some((seg) => catalogMatches(DEVICE_WIPES, seg)),
   },
   {
     // LVM/ZFS volume and pool destruction.
     name: "volume/pool destroy",
     disposition: "deny",
-    test: (command) =>
-      segments(command).some((seg) =>
-        commandChain(seg).some(({ cmd, args }) => {
-          if (cmd === "lvremove" || cmd === "vgremove") return true;
-          if (cmd === "zpool" || cmd === "zfs") return args[0] === "destroy";
-          return false;
-        }),
-      ),
+    test: (command) => segments(command).some((seg) => catalogMatches(VOLUME_DESTROYS, seg)),
   },
   {
     // mkfs (mkfs.ext4, mkfs -t xfs, ...) — filesystem creation destroys
@@ -218,11 +278,7 @@ const RULES: GateRule[] = [
   {
     // Power / reboot actions
     name: "power action",
-    test: (command) =>
-      segments(command).some((seg) => {
-        const { cmd } = commandOf(seg) ?? {};
-        return cmd === "shutdown" || cmd === "reboot" || cmd === "poweroff" || cmd === "halt";
-      }),
+    test: (command) => segments(command).some((seg) => catalogMatches(POWER_ACTIONS, seg)),
   },
   {
     // Destructive Git operations: force pushes, hard resets, forced cleans,
@@ -255,35 +311,12 @@ const RULES: GateRule[] = [
     // Curated remote-destruction operations (best-effort; the catalog is
     // deliberately narrow — see the file header).
     name: "remote destruction (cloud/IaC)",
-    test: (command) =>
-      segments(command).some((seg) => {
-        const parsed = commandOf(seg);
-        if (!parsed) return false;
-        const { cmd, args } = parsed;
-        if (cmd === "terraform" || cmd === "terragrunt") return args[0] === "destroy";
-        if (cmd === "kubectl")
-          return args[0] === "delete" && (args.includes("namespace") || args.includes("ns"));
-        if (cmd === "aws")
-          return args[0] === "s3" && args[1] === "rm" && args.includes("--recursive");
-        if (cmd === "gh") return args[0] === "repo" && args[1] === "delete";
-        if (cmd === "npm") return args[0] === "unpublish";
-        return false;
-      }),
+    test: (command) => segments(command).some((seg) => catalogMatches(REMOTE_DESTRUCTION, seg)),
   },
   {
     // Destructive SQL issued through a known database client.
     name: "database destruction",
-    test: (command) =>
-      segments(command).some((seg) => {
-        const parsed = commandOf(seg);
-        const cmd = parsed?.cmd;
-        if (!cmd) return false;
-        if (cmd === "mysqladmin") return parsed!.args[0] === "drop";
-        return (
-          ["mysql", "psql", "sqlite3", "mongosh", "sqlplus"].includes(cmd) &&
-          /\b(drop\s+(database|table)|truncate\s+table)\b/i.test(seg)
-        );
-      }),
+    test: (command) => segments(command).some((seg) => catalogMatches(DB_DESTRUCTION, seg)),
   },
 ];
 

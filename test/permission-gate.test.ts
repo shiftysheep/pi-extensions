@@ -236,6 +236,16 @@ describe("remote destruction (cloud/IaC)", () => {
     for (const cmd of [
       "terraform destroy -auto-approve",
       "terragrunt destroy",
+      "cdk destroy --force",
+      "pulumi destroy --yes",
+      "vagrant destroy -force",
+      "sam delete-stack my-stack --no-fail-on-empty",
+      "serverless remove -s prod",
+      "sls remove -s prod",
+      "az group delete -rg prod-rg --yes",
+      "gcloud projects delete old-project",
+      "docker volume rm data-vol",
+      "docker volume prune -f",
       "kubectl delete namespace prod",
       "kubectl delete ns staging",
       "aws s3 rm s3://bucket --recursive",
@@ -249,6 +259,16 @@ describe("remote destruction (cloud/IaC)", () => {
     for (const cmd of [
       "terraform plan",
       "terraform apply",
+      "cdk diff",
+      "cdk deploy",
+      "pulumi up",
+      "vagrant up",
+      "sam deploy",
+      "serverless deploy",
+      "az group show -g prod-rg",
+      "gcloud projects list",
+      "docker volume ls",
+      "docker container rm web-1",
       "kubectl delete pod web-1",
       "kubectl get namespaces",
       "aws s3 rm s3://bucket/file.txt",
@@ -276,6 +296,8 @@ describe("database destruction", () => {
       "database destruction",
     );
     assert.equal(findDangerousRule("mysqladmin drop prod")?.name, "database destruction");
+    assert.equal(findDangerousRule("dropdb prod")?.name, "database destruction");
+    assert.equal(findDangerousRule("createdb prod"), undefined);
   });
   it("does not match obfuscated drop forms (heuristic limit)", () => {
     assert.equal(findDangerousRule('mongosh --eval "db.runCommand({drop: 1})"'), undefined);
