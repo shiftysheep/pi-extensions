@@ -26,6 +26,7 @@ export const SANDBOX_ALLOWED_KEYS = [
   "loginShell",
   "landlockHelper",
   "failIfUnavailable",
+  "blockTerminates",
 ] as const;
 
 /**
@@ -103,6 +104,14 @@ export type SandboxConfig = {
    * For enforced/fleet adoption.
    */
   failIfUnavailable?: boolean;
+  /**
+   * When the gate BLOCKS a call (declined confirm, no UI, hard deny,
+   * fail-closed), set the early-termination hint so the agent's turn stops
+   * after the current tool batch. Default: false — the block reason is
+   * returned to the model as a tool error and the turn CONTINUES, so the
+   * model can read the reason and adapt instead of the turn dying.
+   */
+  blockTerminates?: boolean;
 };
 
 export type SandboxPolicy = {
@@ -255,6 +264,12 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     }
     config.failIfUnavailable = obj.failIfUnavailable;
   }
+  if (obj.blockTerminates !== undefined) {
+    if (typeof obj.blockTerminates !== "boolean") {
+      throw new Error(`${configPath}: "blockTerminates" must be a boolean`);
+    }
+    config.blockTerminates = obj.blockTerminates;
+  }
   return config;
 }
 
@@ -320,8 +335,9 @@ export function managedSandboxConfigPath(platform: string, programData?: string)
 /**
  * Apply the managed (admin) layer on top of a merged user config
  * (mirrors the managed-settings model of other agent CLIs):
- * - scalar keys (`enabled`, `failIfUnavailable`, `runner`, `network`,
- *   `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`):
+ * - scalar keys (`enabled`, `failIfUnavailable`, `blockTerminates`, `runner`,
+ *   `network`, `home`, `homeCaches`, `userCommands`, `loginShell`,
+ *   `landlockHelper`):
  *   the managed value WINS — an admin can pin `enabled: true` and cap
  *   what developers can change;
  * - `writable`: lower scopes can only NARROW, never widen — the effective

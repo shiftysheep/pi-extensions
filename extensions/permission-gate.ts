@@ -53,7 +53,10 @@
  *     "userCommands": false,    // also sandbox user `!` commands
  *     "loginShell": true,        // true: bash -lc (login profile sourced); false: bash -c
  *     "landlockHelper": "~/bin/pi-sandbox-landlock",  // prebuilt helper (skip compilation)
- *     "failIfUnavailable": false // true: block commands when no runner resolves (fail-closed)
+ *     "failIfUnavailable": false, // true: block commands when no runner resolves (fail-closed)
+ *     "blockTerminates": false    // true: a gate block stops the agent's turn (old behavior);
+ *                                 //   default: the block reason is reported to the model as a
+ *                                 //   tool error and the turn continues
  *   }
  *
  * A third, highest-precedence MANAGED scope exists for admin/fleet use:
@@ -405,6 +408,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       description: "block commands instead of running unsandboxed when no runner resolves",
     },
     {
+      value: "blockTerminates",
+      label: `blockTerminates: ${draft.blockTerminates ?? "false"}`,
+      description: "stop the agent's turn on a gate block instead of letting it continue",
+    },
+    {
       value: "writable",
       label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
       description: "extra directories sandboxed commands may write to",
@@ -427,6 +435,15 @@ export default function (pi: ExtensionAPI) {
     helperPath: state.active ? state.helperPath : undefined,
     tmpDir: process.env.TMPDIR,
   });
+
+  /** Block result honoring blockTerminates: by default the reason is fed
+   *  back to the model as a tool error and the turn CONTINUES (the model
+   *  reads the reason and adapts); blockTerminates: true restores the old
+   *  behavior of stopping the turn after the current tool batch. */
+  const blocked = (reason: string): { block: boolean; reason: string; terminate?: boolean } =>
+    config.blockTerminates === true
+      ? { block: true, terminate: true, reason }
+      : { block: true, reason };
 
   /** fs predicates shared by policy building and the write/edit guard. */
   const dirExists = (p: string): boolean => {
@@ -574,11 +591,9 @@ export default function (pi: ExtensionAPI) {
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
       if (!state.active) {
         if (state.enabled && state.failClosed) {
-          return {
-            block: true,
-            terminate: true,
-            reason: `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing unsandboxed writes`,
-          };
+          return blocked(
+            `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing unsandboxed writes`,
+          );
         }
         return undefined;
       }
@@ -589,23 +604,16 @@ export default function (pi: ExtensionAPI) {
       if (isInsideAnyRoot(canonicalizeTarget(target, dirExists, canon), state.policy.writableRoots))
         return undefined;
       if (!ctx.hasUI) {
-        return {
-          block: true,
-          terminate: true,
-          reason: `Sandbox: ${target} is outside the writable roots and there is no UI to confirm`,
-        };
+        return blocked(
+          `Sandbox: ${target} is outside the writable roots and there is no UI to confirm`,
+        );
       }
       const ok = await ctx.ui.confirm(
         `Sandbox: write outside writable roots`,
         `${target}\n\nAllow this write?`,
         { signal: ctx.signal },
       );
-      if (!ok)
-        return {
-          block: true,
-          terminate: true,
-          reason: `Sandbox: write outside writable roots (declined): ${target}`,
-        };
+      if (!ok) return blocked(`Sandbox: write outside writable roots (declined): ${target}`);
       return undefined;
     }
 
@@ -614,11 +622,9 @@ export default function (pi: ExtensionAPI) {
     // Fail-closed: sandbox enabled + failIfUnavailable but no runner
     // resolved — refuse to run unsandboxed (bash and powershell alike).
     if (!state.active && state.enabled && state.failClosed) {
-      return {
-        block: true,
-        terminate: true,
-        reason: `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing to run unsandboxed`,
-      };
+      return blocked(
+        `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing to run unsandboxed`,
+      );
     }
     const command = String(event.input.command ?? "");
 
@@ -628,23 +634,17 @@ export default function (pi: ExtensionAPI) {
     const match = isPowerShell ? findDangerousPowerShellRule(command) : findDangerousRule(command);
     if (match) {
       if (match.disposition === "deny") {
-        return {
-          block: true,
-          terminate: true,
-          reason: `Blocked: "${match.name}" is hard-blocked (human-only). Run it manually outside the agent.`,
-        };
+        return blocked(
+          `Blocked: "${match.name}" is hard-blocked (human-only). Run it manually outside the agent.`,
+        );
       }
       if (!ctx.hasUI) {
-        return {
-          block: true,
-          terminate: true,
-          reason: `Blocked: "${match.name}" heuristic matched and there is no UI to confirm`,
-        };
+        return blocked(`Blocked: "${match.name}" heuristic matched and there is no UI to confirm`);
       }
       const ok = await ctx.ui.confirm(`⚠️ Dangerous command (${match.name})`, command, {
         signal: ctx.signal,
       });
-      if (!ok) return { block: true, terminate: true, reason: "Blocked by user" };
+      if (!ok) return blocked("Blocked by user");
     }
 
     // --- sandbox wrap (bash only: the wrappers build a bash command line) ---
@@ -856,6 +856,26 @@ export default function (pi: ExtensionAPI) {
       ]);
       return v === undefined ? undefined : { failIfUnavailable: v === "true" };
     }
+    if (option === "blockTerminates") {
+      const v = await promptSelect(
+        ctx,
+        "Terminate the agent's turn when the gate blocks a command",
+        [
+          {
+            value: "false",
+            label: "false",
+            description:
+              "report the block reason to the model as a tool error; the turn continues (default)",
+          },
+          {
+            value: "true",
+            label: "true",
+            description: "stop the turn after the current tool batch (previous behavior)",
+          },
+        ],
+      );
+      return v === undefined ? undefined : { blockTerminates: v === "true" };
+    }
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",
       draft.writable?.join(", "),
@@ -984,6 +1004,11 @@ export default function (pi: ExtensionAPI) {
       );
       lines.push(
         "Gate: irreversible-action rules (recursive rm, world-writable chmod, destructive git, remote destruction, …) are ALWAYS gated, sandboxed or not; raw host-disk operations are hard-blocked (human-only).",
+      );
+      lines.push(
+        config.blockTerminates
+          ? "Gate blocks stop the agent's turn (blockTerminates: true)."
+          : "Gate blocks report the reason to the model as a tool error and the turn continues (blockTerminates: true stops the turn instead).",
       );
       ctx.ui.notify(lines.join("\n"), "info");
     },
