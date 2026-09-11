@@ -20,7 +20,7 @@ Six third-party packs (web search/fetch, subagents, question prompts, todo, fuzz
 ## Install
 
 ```bash
-pi install git:github.com/shiftysheep/pi-extensions@v2.8.1
+pi install git:github.com/shiftysheep/pi-extensions@v2.9.0
 pi update --extensions   # reconcile this package to its pinned ref later
 pi -e git:github.com/shiftysheep/pi-extensions    # try without installing (current run only)
 pi config                # enable/disable individual extensions from here or the bundled packages
@@ -34,7 +34,7 @@ The package's `pi` manifest lists each `extensions/*.ts` entry explicitly, so yo
 # from the package's settings object (pi config / settings.json).
 # Empty skills/prompts arrays keep the bundled packs' resources off too:
 {
-  "source": "git:github.com/shiftysheep/pi-extensions@v2.8.1",
+  "source": "git:github.com/shiftysheep/pi-extensions@v2.9.0",
   "extensions": ["extensions/advisor.ts"],
   "skills": [],
   "prompts": []

@@ -1,6 +1,6 @@
 {
   "name": "@shiftysheep/pi-extensions",
-  "version": "2.8.1",
+  "version": "2.9.0",
   "description": "Custom extensions for pi (advisor, cron-tips, permission-gate, status-line); bundles recommended installs: pi-web-access, pi-subagents (skills+prompts), @juicesharp/rpiv-ask-user-question, @juicesharp/rpiv-todo, @ff-labs/pi-fff, @upstash/context7-pi (tools+skills+prompts).",
   "keywords": [
     "pi-package"

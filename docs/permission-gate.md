@@ -12,6 +12,8 @@ Every gate rule is armed **regardless of sandbox state**: the sandbox answers *w
 
 PowerShell commands are never sandboxed (there is no PowerShell sandbox backend) — they are guarded by the heuristic gate only, and `failIfUnavailable` blocks them solely when no runner can be resolved.
 
+**What happens when a call is blocked** (declined confirm, no UI available, hard deny, or fail-closed): by default the block reason is reported to the model as a tool error and the **turn continues**, so the model can read the reason and adapt (e.g. pick a different approach or tell you to run the human-only command manually). Set `"blockTerminates": true` in `sandbox.json` to restore the previous behavior, where a block stops the agent's turn after the current tool batch.
+
 ## The filesystem sandbox (opt-in)
 
 Set `"enabled": true` in a `sandbox.json` (absent file = disabled, behavior identical to the gate alone). Two scopes are supported and merged **per-key, project wins**:
@@ -53,7 +55,7 @@ All take effect immediately, no `/reload` needed:
 - `/sandbox` — live status (runner, writable roots, network policy, fallback reason, config paths).
 - `/sandbox on` — enable, writing the **project** scope; the runner defaults to `"auto"` (an explicit `runner` already set in either scope is kept).
 - `/sandbox off` — disable, writing the **project** scope (overrides a global `"enabled": true`).
-- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`, `failIfUnavailable`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
+- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`, `failIfUnavailable`, `blockTerminates`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
 
 ### Options
 
@@ -66,6 +68,7 @@ All take effect immediately, no `/reload` needed:
 - `loginShell` — `true` (default) or `false`. `true` runs sandboxed commands as `bash -lc` (login shell: sources `/etc/profile` + `~/.bash_profile` inside the sandbox, preserving login-profile env); `false` uses plain `bash -c` (no login profiles; the pi process's exported environment and `BASH_ENV` still apply).
 - `landlockHelper` — explicit path to a prebuilt Landlock helper binary (Linux only). When set, the helper is used as-is and **no compilation happens** — useful in locked-down environments (no `cc`, or a `noexec` cache dir). A missing/unexecutable file fails the probe (no fallback to building). When unset, the helper compiles from `landlock-helper.c` on first use — after a SHA-256 source-integrity check — into `~/.cache/pi-extensions/pi-sandbox-landlock` (a `noexec` cache dir is detected and reported with an actionable message).
 - `failIfUnavailable` — `false` (default) or `true`. When the sandbox is `enabled` but no runner can be resolved, `false` warns and runs commands **unsandboxed** (fail-open — interactive/dev default); `true` **blocks** bash/powershell/write/edit instead (fail-closed — for enforced/fleet adoption, e.g. native Windows or Linux with unprivileged userns disabled).
+- `blockTerminates` — `false` (default) or `true`. Controls what happens after the gate **blocks** a call (declined confirm, no UI, hard deny, fail-closed): `false` reports the reason to the model as a tool error and the turn **continues**; `true` stops the agent's turn after the current tool batch (the pre-`blockTerminates` behavior).
 
 If no runner is available at session start (no bwrap + no Landlock kernel/compiler, or a broken bwrap — e.g. AppArmor `restrict_unprivileged_userns` on some Ubuntu setups), the extension warns and runs commands **unsandboxed** — unless `failIfUnavailable: true`, in which case it **blocks** them (fail-closed).
 
