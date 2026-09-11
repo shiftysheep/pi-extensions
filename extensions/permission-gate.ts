@@ -3,23 +3,31 @@
  *
  * Two cooperating layers:
  *
- * 1. HEURISTIC GATE (always on) — prompts for confirmation before bash
- *    commands that look dangerous (recursive `rm`, privilege escalation,
- *    world-writable `chmod`, raw device writes, mkfs, power actions) and,
- *    via a separate PowerShell rule set, before dangerous PowerShell
- *    cmdlets (recursive `Remove-Item`, disk wipes, elevation, `iex`, ACL
- *    changes, machine-wide registry writes).
+ * 1. HEURISTIC GATE (always on) — two dispositions:
+ *    - CONFIRM (default): prompts before dangerous commands — recursive
+ *      `rm`, world-writable `chmod`, privilege escalation, power actions,
+ *      destructive Git ops (force push, reset --hard, clean -f, branch -D,
+ *      history rewrites), curated remote destruction (terraform destroy,
+ *      kubectl delete namespace, aws s3 rm --recursive, repo delete,
+ *      unpublish, DROP/TRUNCATE via known DB clients) — and, via a separate
+ *      PowerShell rule set, dangerous cmdlets (recursive `Remove-Item`,
+ *      elevation, `iex`, ACL changes, machine-wide registry writes).
+ *    - DENY (hard block, human-only, NO prompt): raw host-disk destruction
+ *      (`dd`/redirect/`tee`/`cp`/`shred` to /dev/*, wipefs, blkdiscard,
+ *      partition wipes, LVM/ZFS destroy, mkfs; PowerShell disk wipes). The
+ *      agent must never perform these; the human runs them manually.
+ *    Every match is gated REGARDLESS of sandbox state: the sandbox answers
+ *    "where may this command write?", the gate answers "does this command
+ *    require human intent?" — confinement to writable roots does not make
+ *    an irreversible action reversible.
  *
  * 2. OS SANDBOX (opt-in via sandbox.json `enabled: true`) — wraps the agent's
  *    bash commands in a filesystem sandbox:
  *      - Linux:   bubblewrap (preferred) or a Landlock helper binary
  *      - macOS:   sandbox-exec (Seatbelt)
  *    Everything outside the writable roots becomes read-only, enforced by
- *    the OS. While the sandbox is active, the filesystem category of gate
- *    rules is suppressed (the kernel enforces it); system-category rules
- *    (sudo, dd to raw devices, mkfs, power) stay armed. When no runner is
- *    available the extension falls back to gate-only mode (all rules armed)
- *    and warns.
+ *    the OS. When no runner is available the extension falls back to
+ *    gate-only mode (all rules armed) and warns.
  *
  * The gate is a heuristic prompt guard, NOT a security boundary: shell
  * expansion, quoting, scripts, and indirect invocation can evade text
@@ -34,9 +42,11 @@
  *   {
  *     "enabled": true,          // default false
  *     "runner": "auto",         // auto | bwrap | landlock | sandbox-exec | none
- *     "writable": ["~/cache"],  // extra writable paths (cwd, /tmp, /dev, /proc are always writable)
+ *     "writable": ["~/cache"],  // extra writable paths (cwd, /tmp, /dev, /proc are always writable;
+ *                               //   MISSING paths are omitted with a warning, never widened to a parent)
  *     "home": "ro",             // ro | rw — access to $HOME (default ro)
- *     "homeCaches": "rw",       // rw | ro — writable $HOME cache dirs (default rw; see HOME_CACHE_ROOTS)
+ *     "homeCaches": "ro",       // ro | rw — writable $HOME cache dirs (default ro; some hold
+ *                               //   credentials/executables — see HOME_CACHE_ROOTS)
  *     "network": "allow",       // allow | deny (deny is a no-op+warning on landlock)
  *     "userCommands": false,    // also sandbox user `!` commands
  *     "loginShell": true,        // true: bash -lc (login profile sourced); false: bash -c
@@ -100,7 +110,7 @@ import {
   wrapCommand,
 } from "./lib/sandbox-utils.js";
 import { findDangerousPowerShellRule } from "./permission-gate/powershell-rules.js";
-import { findDangerousRule, shouldGate } from "./permission-gate/rules.js";
+import { findDangerousRule } from "./permission-gate/rules.js";
 import { resolveRunner } from "./permission-gate/runner.js";
 
 const SANDBOX_CONFIG_FILE = "sandbox.json";
@@ -369,7 +379,7 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
     },
     {
       value: "homeCaches",
-      label: `homeCaches: ${draft.homeCaches ?? "rw"}`,
+      label: `homeCaches: ${draft.homeCaches ?? "ro"}`,
       description: "writable $HOME cache dirs (~/.cache, ~/.npm, ~/.cargo, …); ro = strict",
     },
     {
@@ -450,8 +460,14 @@ export default function (pi: ExtensionAPI) {
         ],
       };
     }
+    const { roots, missingWritable } = buildWritableRoots(
+      cfg,
+      runnerContext(cwd),
+      dirExists,
+      canon,
+    );
     const policy = {
-      writableRoots: buildWritableRoots(cfg, runnerContext(cwd), dirExists, canon),
+      writableRoots: roots,
       network: cfg.network ?? "allow",
       loginShell: cfg.loginShell ?? true,
     };
@@ -465,12 +481,17 @@ export default function (pi: ExtensionAPI) {
         helperPath: probe.helperPath,
         networkEnforced,
       },
-      warnings:
-        policy.network === "deny" && !networkEnforced
+      warnings: [
+        ...missingWritable.map(
+          (p) =>
+            `Sandbox: writable path "${p}" does not exist — OMITTED (create it manually; it is never widened to its parent).`,
+        ),
+        ...(policy.network === "deny" && !networkEnforced
           ? [
               "Sandbox: landlock cannot enforce network policy; network=deny is IGNORED (use bwrap to enforce).",
             ]
-          : [],
+          : []),
+      ],
     };
   }
 
@@ -596,7 +617,14 @@ export default function (pi: ExtensionAPI) {
     // PowerShell has its own rule set: cmdlets/aliases/parameters differ
     // from bash, so it is NEVER routed through the bash tokenizer.
     const match = isPowerShell ? findDangerousPowerShellRule(command) : findDangerousRule(command);
-    if (match && shouldGate(match, !isPowerShell && state.active)) {
+    if (match) {
+      if (match.disposition === "deny") {
+        return {
+          block: true,
+          terminate: true,
+          reason: `Blocked: "${match.name}" is hard-blocked (human-only). Run it manually outside the agent.`,
+        };
+      }
       if (!ctx.hasUI) {
         return {
           block: true,
