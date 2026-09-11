@@ -29,13 +29,53 @@ export type GateRule = {
 
 /** Split a command line into shell segments (top-level separators only).
  * `>&` and `>|` are REDIRECTION operators, not separators: an unescaped `>`
- * immediately before `&`/`|` stays inside the segment. An ESCAPED `>`
- * (`\>`) is a literal, so the following `|`/`&` is a real separator. */
+ * immediately before `&`/`|` keeps it inside the segment (including at the
+ * very start of the command). An ESCAPED `>` (`\>`) is a literal, so the
+ * following `|`/`&` is a real separator; backslash parity is tracked
+ * (`\\>` = escaped backslash + real redirect). */
 export function segments(command: string): string[] {
-  return command
-    .split(/&&|\|\||(?<![^\\]>)[;&|]|\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const out: string[] = [];
+  let cur = "";
+  let prev: string | null = null; // previous original character
+  let prevEscaped = false; // ...and whether it was backslash-escaped
+  const flush = (): void => {
+    const t = cur.trim();
+    if (t) out.push(t);
+    cur = "";
+  };
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+    if (ch === "\\" && i + 1 < command.length) {
+      cur += ch + command[i + 1];
+      prev = command[i + 1];
+      prevEscaped = true;
+      i += 2;
+      continue;
+    }
+    if ((ch === "&" || ch === "|") && command[i + 1] === ch) {
+      flush(); // && / ||
+      prev = ch;
+      prevEscaped = false;
+      i += 2;
+      continue;
+    }
+    if (ch === "\n" || ch === ";" || ch === "&" || ch === "|") {
+      const isRedirectOp = (ch === "&" || ch === "|") && prev === ">" && !prevEscaped;
+      if (isRedirectOp) cur += ch;
+      else flush();
+      prev = ch;
+      prevEscaped = false;
+      i++;
+      continue;
+    }
+    cur += ch;
+    prev = ch;
+    prevEscaped = false;
+    i++;
+  }
+  flush();
+  return out;
 }
 
 /** Extract the command word (minus env-var prefixes, `env` wrappers, and
@@ -100,6 +140,14 @@ function isUnsafeDevTarget(target: string): boolean {
  * concatenated quoting (`>'tmp'/dev/sda`) yields the literal `tmp/dev/sda`
  * and a fully quoted target (`>"/dev/sda"`) yields `/dev/sda`.
  */
+/**
+ * Extract redirection targets from a segment, quote-aware. Handles >, >>,
+ * >&, >|; skips escaped characters and quoted spans (a quoted EXAMPLE of a
+ * redirect is not a redirect; backslash is LITERAL inside single quotes).
+ * Targets are shell words: they end at any whitespace or an unquoted
+ * redirection/separator operator, so `cat >/tmp/out>/dev/sda` yields two
+ * targets and an adjacent operator is reprocessed as the next redirect.
+ */
 function redirectTargets(segment: string): string[] {
   const targets: string[] = [];
   let i = 0;
@@ -113,7 +161,7 @@ function redirectTargets(segment: string): string[] {
       const q = ch;
       i++;
       while (i < segment.length && segment[i] !== q) {
-        if (segment[i] === "\\") i++;
+        if (q === '"' && segment[i] === "\\" && i + 1 < segment.length) i++;
         i++;
       }
       i++;
@@ -123,16 +171,16 @@ function redirectTargets(segment: string): string[] {
       let j = i + 1;
       if (segment[j] === ">") j++;
       if (segment[j] === "&" || segment[j] === "|") j++;
-      while (segment[j] === " ") j++;
+      while (j < segment.length && /\s/.test(segment[j])) j++;
       let target = "";
       while (j < segment.length) {
         const c = segment[j];
-        if (c === " ") break;
+        if (/\s/.test(c) || c === ">" || c === "&" || c === "|" || c === ";") break;
         if (c === "'" || c === '"') {
           const q = c;
           j++;
           while (j < segment.length && segment[j] !== q) {
-            if (segment[j] === "\\") j++;
+            if (q === '"' && segment[j] === "\\" && j + 1 < segment.length) j++;
             target += segment[j] ?? "";
             j++;
           }

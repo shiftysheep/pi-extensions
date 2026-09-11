@@ -165,9 +165,24 @@ describe("raw device writes (deny tier)", () => {
     assert.equal(findDangerousRule("sleep 1 & dd of=/dev/sda")?.disposition, "deny");
     assert.equal(findDangerousRule("echo \\>|dd of=/dev/sda")?.disposition, "deny");
   });
+  it("keeps leading and even-backslash >&/>| redirects in-segment", () => {
+    // leading redirect operator (no preceding char) and even backslash count
+    // (\\> = escaped backslash + REAL redirect) both stay in the segment
+    assert.equal(findDangerousRule(">&/dev/sda echo hi")?.disposition, "deny");
+    assert.equal(findDangerousRule(">|/dev/sda echo hi")?.disposition, "deny");
+    assert.equal(findDangerousRule("echo \\\\>&/dev/sda")?.disposition, "deny");
+  });
   it("parses quoted and concatenated redirect targets", () => {
     assert.equal(findDangerousRule('cat img >"/dev/sda"')?.disposition, "deny");
     assert.equal(findDangerousRule("cat img >'tmp'/dev/sda"), undefined);
+  });
+  it("honors token boundaries and single-quote semantics in targets", () => {
+    // adjacent redirect: the first target ends at the second >
+    assert.equal(findDangerousRule("cat >/tmp/out>/dev/sda")?.disposition, "deny");
+    // tab is a token boundary
+    assert.equal(findDangerousRule("cat >\t/dev/sda")?.disposition, "deny");
+    // backslash is LITERAL inside single quotes: 'x\' ends the quote
+    assert.equal(findDangerousRule("echo 'x\\' >/dev/sda")?.disposition, "deny");
   });
   it("does not exempt dry-run operands after --", () => {
     assert.equal(findDangerousRule("wipefs -a -- /dev/sda --no-act")?.disposition, "deny");
