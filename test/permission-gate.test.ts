@@ -103,6 +103,12 @@ describe("raw device writes (deny tier)", () => {
       "sudo -u root dd of=/dev/sda",
       "sudo -g wheel dd of=/dev/sda",
       "sudo -C 3 dd of=/dev/sda",
+      "sudo -D /tmp dd of=/dev/sda",
+      "sudo -h host dd of=/dev/sda",
+      "sudo -A dd of=/dev/sda",
+      "sudo -P dd of=/dev/sda",
+      "sudo -p prompt dd of=/dev/sda",
+      "sudo -- dd of=/dev/sda",
       "env -u FOO dd of=/dev/sda",
       "env FOO=1 sudo dd of=/dev/sda",
     ]) {
@@ -116,10 +122,14 @@ describe("raw device writes (deny tier)", () => {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
   });
-  it("matches redirections onto raw devices", () => {
+  it("matches redirections onto raw devices, incl. trailing-redirect and >&/>| forms", () => {
     for (const cmd of [
       "cat image.img > /dev/sda",
       "cat image.img >> /dev/nvme0n1",
+      "cat image.img >/dev/sda 2>&1",
+      "cat image.img >/dev/sda 2>/tmp/error",
+      "cat image.img >&/dev/sda",
+      "cat image.img >|/dev/sda",
       "yes | dd bs=1M | tee /dev/sdb >/dev/null",
     ]) {
       const m = findDangerousRule(cmd);
@@ -138,9 +148,16 @@ describe("raw device writes (deny tier)", () => {
       "echo x > /tmp/out",
       "tee /dev/fd/3",
       "cp file /dev/shm/work",
+      "dd if=/dev/urandom of=/dev/zero",
+      "printf '%s\\n' 'cat img >/dev/sda' >/tmp/example",
     ]) {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
+  });
+  it("matches raw device args after a -- terminator", () => {
+    assert.equal(findDangerousRule("tee -- /dev/sda")?.disposition, "deny");
+    assert.equal(findDangerousRule("shred -- /dev/sdb1")?.disposition, "deny");
+    assert.equal(findDangerousRule("cp -- image.img /dev/sda")?.disposition, "deny");
   });
   it("matches tee/shred/cp with raw device targets", () => {
     assert.equal(findDangerousRule("tee /dev/sda")?.disposition, "deny");
@@ -228,6 +245,10 @@ describe("destructive git operations", () => {
     assert.equal(findDangerousRule("git reset --hard HEAD~1")?.name, "destructive git operation");
     assert.equal(findDangerousRule("git -C repo reset --hard")?.name, "destructive git operation");
     assert.equal(
+      findDangerousRule("git --git-dir /tmp push --force")?.name,
+      "destructive git operation",
+    );
+    assert.equal(
       findDangerousRule("git --git-dir=/x push --force")?.name,
       "destructive git operation",
     );
@@ -305,6 +326,15 @@ describe("remote destruction (cloud/IaC)", () => {
       "npm exec unpublish",
     ]) {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
+    }
+  });
+  it("matches npm unpublish with boolean flags and -C prefix", () => {
+    for (const cmd of [
+      "npm -p unpublish pkg",
+      "npm -l unpublish pkg",
+      "npm -C /tmp unpublish pkg",
+    ]) {
+      assert.equal(findDangerousRule(cmd)?.name, "remote destruction (cloud/IaC)", cmd);
     }
   });
   it("does not match non-destructive variants", () => {

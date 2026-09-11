@@ -27,10 +27,12 @@ export type GateRule = {
   test: (command: string) => boolean;
 };
 
-/** Split a command line into shell segments (top-level separators only). */
+/** Split a command line into shell segments (top-level separators only).
+ * `>&` and `>|` are REDIRECTION operators, not separators: a `&`/`|`
+ * immediately after `>` stays inside the segment. */
 export function segments(command: string): string[] {
   return command
-    .split(/&&|\|\||[;&|]|\n/)
+    .split(/&&|\|\||(?<!>)[;&|]|\n/)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -63,12 +65,10 @@ function commandOf(segment: string): { cmd: string; args: string[] } | undefined
     if (i >= parts.length) return undefined;
     cmd = parts[i].split("/").pop() ?? parts[i];
   }
-  // `--` terminates options: everything after it is a literal operand
-  // (e.g. `rm -- -r` deletes a file named "-r", it is not recursive).
-  let rest = parts.slice(i + 1);
-  const dd = rest.indexOf("--");
-  if (dd !== -1) rest = rest.slice(0, dd);
-  return { cmd, args: rest };
+  // Note: operands after a `--` terminator are KEPT (they are real targets,
+  // e.g. `tee -- /dev/sda`); option-sensitive rules like recursive rm stop
+  // interpreting them as flags themselves.
+  return { cmd, args: parts.slice(i + 1) };
 }
 
 // Harmless /dev targets that are NOT raw device writes. Prefix-aware: /dev/fd/3
@@ -104,7 +104,7 @@ function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
   const chain = [parsed];
   if (parsed.cmd === "sudo" || parsed.cmd === "doas" || parsed.cmd === "pkexec") {
     // Operand-taking options for sudo/doas (pkexec takes none). -h is HOST
-    // for sudo, not help.
+    // for sudo, not help. -A (askpass) and -P (preserve-groups) are BOOLEAN.
     const OPT_WITH_ARG = new Set([
       "-u",
       "--user",
@@ -120,9 +120,8 @@ function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
       "--chroot",
       "-a",
       "--ipv4-addr",
-      "-A",
       "--ipv6-addr",
-      "-P",
+      "-p",
       "--prompt",
       "-T",
       "--timestamp",
@@ -298,14 +297,13 @@ const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
     positional: true,
     optsWithArg: [
       "--prefix",
-      "-p",
+      "-C",
       "--userconfig",
       "--globalconfig",
       "--local-prefix",
       "--call",
       "-c",
       "--loglevel",
-      "-l",
       "--registry",
       "-r",
     ],
@@ -330,7 +328,11 @@ const RULES: GateRule[] = [
       segments(command).some((seg) => {
         const parsed = commandOf(seg);
         if (parsed?.cmd !== "rm") return false;
-        return parsed.args.some((a) => a === "--recursive" || /^-(?!-)[A-Za-z]*[rR]/.test(a));
+        // After `--`, args are literal operands (`rm -- -r` deletes a file
+        // named "-r"), not flags.
+        const dd = parsed.args.indexOf("--");
+        const opts = dd === -1 ? parsed.args : parsed.args.slice(0, dd);
+        return opts.some((a) => a === "--recursive" || /^-(?!-)[A-Za-z]*[rR]/.test(a));
       }),
   },
   {
@@ -373,12 +375,17 @@ const RULES: GateRule[] = [
     name: "raw device write (redirect)",
     disposition: "deny",
     test: (command) =>
-      segments(command).some((seg) =>
-        // Each redirection target is checked independently, so a trailing
-        // `2>&1` or `2>/tmp/err` cannot hide a device write earlier in the
-        // segment (`cat img >/dev/sda 2>&1`).
-        [...seg.matchAll(/>>?\s*(\/dev\/[A-Za-z0-9._\-/]+)/g)].some((m) => isUnsafeDevTarget(m[1])),
-      ),
+      segments(command).some((seg) => {
+        // Quoted spans are stripped first: a quoted EXAMPLE of a redirect
+        // (`printf '%s' 'cat img >/dev/sda'`) is not a device write.
+        const unquoted = seg.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, "");
+        // Each redirection target is checked independently (operators >, >>,
+        // >&, >|), so a trailing `2>&1` cannot hide a device write earlier in
+        // the segment (`cat img >/dev/sda 2>&1`).
+        return [...unquoted.matchAll(/>(?:&|\|)?\s*(\/dev\/[A-Za-z0-9._\-/]+)/g)].some((m) =>
+          isUnsafeDevTarget(m[1]),
+        );
+      }),
   },
   {
     // Writers taking a raw device as an argument: tee/shred (any target),
@@ -433,9 +440,9 @@ const RULES: GateRule[] = [
       segments(command).some((seg) => {
         const parsed = commandOf(seg);
         if (parsed?.cmd !== "git") return false;
-        // Skip git GLOBAL options (before the subcommand); -C/-c/
+        // Skip git GLOBAL options (before the subcommand); -C/-c/--git-dir/
         // --work-tree/--namespace take an operand. (-p paginates: NO operand.)
-        const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--work-tree", "--namespace"]);
+        const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
         const args = parsed.args;
         let i = 0;
         while (i < args.length && args[i].startsWith("-")) {
