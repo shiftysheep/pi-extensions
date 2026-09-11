@@ -154,6 +154,24 @@ describe("raw device writes (deny tier)", () => {
       assert.equal(findDangerousRule(cmd), undefined, cmd);
     }
   });
+  it("parses redirect targets inside command substitutions (paren terminates the target)", () => {
+    // The target word ends at `)`: `s=$(cmd 2>/dev/null)` must NOT see the
+    // target as `/dev/null)` (which would defeat the safe-target match).
+    for (const cmd of [
+      "s=$(cmd 2>/dev/null)",
+      "s=$(cmd >> /dev/null)",
+      "a=$(b 2>/dev/null) && c",
+      "out=$(gh run view 1 --json status 2>/dev/null); echo $out",
+    ]) {
+      assert.equal(findDangerousRule(cmd), undefined, cmd);
+    }
+    // ...and a REAL raw-device target inside a substitution still blocks.
+    for (const cmd of ["s=$(cmd > /dev/sda)", "s=$(cmd >> /dev/nvme0n1)"]) {
+      const m = findDangerousRule(cmd);
+      assert.ok(m, cmd);
+      assert.equal(m.disposition, "deny", cmd);
+    }
+  });
   it("matches raw device args after a -- terminator", () => {
     assert.equal(findDangerousRule("tee -- /dev/sda")?.disposition, "deny");
     assert.equal(findDangerousRule("shred -- /dev/sdb1")?.disposition, "deny");

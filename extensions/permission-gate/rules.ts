@@ -168,8 +168,11 @@ function isUnsafeDevTarget(target: string): boolean {
  * >&, >|; skips escaped characters and quoted spans (a quoted EXAMPLE of a
  * redirect is not a redirect; backslash is LITERAL inside single quotes).
  * Targets are shell words: they end at any whitespace or an unquoted
- * redirection/separator operator, so `cat >/tmp/out>/dev/sda` yields two
- * targets and an adjacent operator is reprocessed as the next redirect.
+ * redirection/separator operator or parenthesis, so `cat >/tmp/out>/dev/sda`
+ * yields two targets and an adjacent operator is reprocessed as the next
+ * redirect. Parentheses matter: in `s=$(cmd 2>/dev/null)` the target is
+ * `/dev/null`, NOT `/dev/null)` — a swallowed `)` would defeat the exact
+ * safe-target match and false-positive on the most common idiom.
  */
 function redirectTargets(segment: string): string[] {
   const targets: string[] = [];
@@ -198,7 +201,17 @@ function redirectTargets(segment: string): string[] {
       let target = "";
       while (j < segment.length) {
         const c = segment[j];
-        if (/\s/.test(c) || c === ">" || c === "&" || c === "|" || c === ";") break;
+        if (
+          /\s/.test(c) ||
+          c === ">" ||
+          c === "&" ||
+          c === "|" ||
+          c === ";" ||
+          c === "(" ||
+          c === ")" ||
+          c === "<"
+        )
+          break;
         if (c === "'" || c === '"') {
           const q = c;
           j++;
