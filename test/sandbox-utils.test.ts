@@ -11,6 +11,7 @@ import {
   buildSeatbeltProfile,
   buildWritableRoots,
   canonicalizeTarget,
+  describeSandboxState,
   isInsideAnyRoot,
   isInsideRoot,
   isNoexecPath,
@@ -24,6 +25,7 @@ import {
   resolveExistingRoot,
   type SandboxConfig,
   sandboxConfigPath,
+  sandboxStateSignature,
   sbplQuote,
   shellQuote,
   wrapCommand,
@@ -141,7 +143,7 @@ describe("resolveExistingRoot", () => {
 
 describe("buildWritableRoots", () => {
   it("includes cwd, system roots, and dedupes subsumed paths", () => {
-    const roots = buildWritableRoots({}, CTX, exists);
+    const { roots } = buildWritableRoots({}, CTX, exists);
     assert.ok(roots.includes("/home/u/proj"));
     assert.ok(roots.includes("/tmp"));
     assert.ok(roots.includes("/dev"));
@@ -149,37 +151,55 @@ describe("buildWritableRoots", () => {
     assert.ok(!roots.includes("/home/u")); // home ro by default
   });
   it("adds HOME when rw", () => {
-    const roots = buildWritableRoots({ home: "rw" }, CTX, exists);
+    const { roots } = buildWritableRoots({ home: "rw" }, CTX, exists);
     assert.ok(roots.includes("/home/u"));
     // cwd is subsumed by HOME and dropped
     assert.ok(!roots.includes("/home/u/proj"));
   });
-  it("adds configured writable paths (expanded, ancestor-resolved)", () => {
-    const roots = buildWritableRoots({ writable: ["~/cache", "data/new"] }, CTX, exists);
-    assert.ok(roots.includes("/home/u")); // ~/cache -> ancestor /home/u
-    assert.ok(!roots.includes("/home/u/proj/data/new")); // doesn't exist
-  });
-  it("adds existing $HOME cache dirs by default (homeCaches rw)", () => {
-    const roots = buildWritableRoots({}, CTX, exists);
+  it("adds existing configured writable paths verbatim", () => {
+    const { roots, missingWritable } = buildWritableRoots(
+      { writable: ["/etc", "/home/u/.cache"] },
+      CTX,
+      exists,
+    );
+    assert.ok(roots.includes("/etc"));
     assert.ok(roots.includes("/home/u/.cache"));
-    assert.ok(roots.includes("/home/u/.npm"));
-    assert.ok(roots.includes("/home/u/.cargo"));
-    assert.ok(!roots.includes("/home/u")); // $HOME itself still ro
+    assert.deepEqual(missingWritable, []);
+  });
+  it("OMITS missing configured writable paths instead of widening to an ancestor", () => {
+    const { roots, missingWritable } = buildWritableRoots(
+      { writable: ["~/cache", "data/new", "/nope/way/nope"] },
+      CTX,
+      exists,
+    );
+    assert.deepEqual(missingWritable, ["/home/u/cache", "/home/u/proj/data/new", "/nope/way/nope"]);
+    assert.ok(!roots.includes("/home/u")); // ~/cache must NOT grant all of $HOME
+    assert.ok(!roots.includes("/")); // ...and never /
+    assert.ok(!roots.includes("/home/u/proj/data/new"));
+  });
+  it("adds $HOME cache dirs only when homeCaches is rw (default ro)", () => {
+    const def = buildWritableRoots({}, CTX, exists);
+    assert.ok(!def.roots.includes("/home/u/.cache")); // default is ro
+    const rw = buildWritableRoots({ homeCaches: "rw" }, CTX, exists);
+    assert.ok(rw.roots.includes("/home/u/.cache"));
+    assert.ok(rw.roots.includes("/home/u/.npm"));
+    assert.ok(rw.roots.includes("/home/u/.cargo"));
+    assert.ok(!rw.roots.includes("/home/u")); // $HOME itself still ro
   });
   it("skips a missing cache dir instead of walking up to $HOME", () => {
     // /home/u/.rustup is NOT in FS; it must be skipped, not resolved to /home/u.
-    const roots = buildWritableRoots({}, CTX, exists);
+    const { roots } = buildWritableRoots({ homeCaches: "rw" }, CTX, exists);
     assert.ok(!roots.includes("/home/u/.rustup"));
     assert.ok(!roots.includes("/home/u")); // no silent $HOME write access
   });
   it("omits $HOME cache dirs when homeCaches is ro", () => {
-    const roots = buildWritableRoots({ homeCaches: "ro" }, CTX, exists);
+    const { roots } = buildWritableRoots({ homeCaches: "ro" }, CTX, exists);
     assert.ok(!roots.includes("/home/u/.cache"));
     assert.ok(!roots.includes("/home/u/.npm"));
     assert.ok(!roots.includes("/home/u/.cargo"));
   });
   it("drops cache dirs subsumed by home rw", () => {
-    const roots = buildWritableRoots({ home: "rw" }, CTX, exists);
+    const { roots } = buildWritableRoots({ home: "rw", homeCaches: "rw" }, CTX, exists);
     assert.ok(roots.includes("/home/u"));
     assert.ok(!roots.includes("/home/u/.cache")); // subsumed by /home/u
   });
@@ -192,7 +212,7 @@ describe("buildWritableRoots", () => {
       "/var/folders/xx/T": "/private/var/folders/xx/T",
     };
     const fs2 = new Set(FS).add("/tmp/scratch").add("/var/scratch").add("/var/folders/xx/T");
-    const roots = buildWritableRoots(
+    const { roots } = buildWritableRoots(
       { writable: ["/tmp/scratch", "/var/scratch"] },
       { ...CTX, tmpDir: "/var/folders/xx/T" },
       (p) => fs2.has(p),
@@ -210,7 +230,7 @@ describe("buildWritableRoots", () => {
     assert.ok(!roots.includes("/some/dev"));
   });
   it("skips a $TMPDIR that canonicalizes to /", () => {
-    const roots = buildWritableRoots(
+    const { roots } = buildWritableRoots(
       {},
       { ...CTX, tmpDir: "/var/folders/root" },
       (p) => FS.has(p) || p === "/var/folders/root",
@@ -219,11 +239,11 @@ describe("buildWritableRoots", () => {
     assert.ok(!roots.includes("/"));
   });
   it("omits $TMPDIR when ctx.tmpDir is unset", () => {
-    const roots = buildWritableRoots({}, CTX, exists);
+    const { roots } = buildWritableRoots({}, CTX, exists);
     assert.ok(!roots.some((r) => r.includes("/var/folders")));
   });
   it("skips a missing $TMPDIR instead of walking up to /", () => {
-    const roots = buildWritableRoots({}, { ...CTX, tmpDir: "/var/folders/gone" }, exists);
+    const { roots } = buildWritableRoots({}, { ...CTX, tmpDir: "/var/folders/gone" }, exists);
     assert.ok(!roots.includes("/"));
     assert.ok(!roots.some((r) => r.includes("/var/folders")));
   });
@@ -624,5 +644,93 @@ describe("parseWritableList", () => {
   });
   it("single unquoted path", () => {
     assert.deepEqual(parseWritableList("/tmp/x"), ["/tmp/x"]);
+  });
+});
+
+describe("sandboxStateSignature", () => {
+  it("distinguishes the four effective states", () => {
+    assert.equal(sandboxStateSignature({ active: false, enabled: false }), "off");
+    assert.equal(
+      sandboxStateSignature({ active: false, enabled: true, reason: "no bwrap" }),
+      "enabled-unavailable",
+    );
+    assert.equal(
+      sandboxStateSignature({ active: false, enabled: true, reason: "no bwrap", failClosed: true }),
+      "failclosed",
+    );
+    assert.equal(
+      sandboxStateSignature({
+        active: true,
+        enabled: true,
+        runner: "bwrap",
+        policy: { writableRoots: ["/w"], network: "allow", loginShell: true },
+        networkEnforced: true,
+      }),
+      "active:bwrap:/w:net=allow",
+    );
+  });
+  it("active signature changes when roots or network enforcement change", () => {
+    const base = {
+      active: true as const,
+      enabled: true as const,
+      runner: "landlock" as const,
+      policy: { writableRoots: ["/w"], network: "deny" as const, loginShell: true },
+      networkEnforced: false,
+    };
+    const a = sandboxStateSignature(base);
+    assert.equal(a, "active:landlock:/w:net=deny-unenforced");
+    assert.notEqual(
+      a,
+      sandboxStateSignature({ ...base, policy: { ...base.policy, writableRoots: ["/w", "/x"] } }),
+    );
+    assert.notEqual(a, sandboxStateSignature({ ...base, networkEnforced: true }));
+  });
+  it("same state yields the same signature (change detection)", () => {
+    const a = { active: false, enabled: false } as const;
+    assert.equal(
+      sandboxStateSignature(a),
+      sandboxStateSignature({ active: false, enabled: false }),
+    );
+  });
+});
+
+describe("describeSandboxState", () => {
+  it("describes an active sandbox with roots and network policy", () => {
+    assert.equal(
+      describeSandboxState({
+        active: true,
+        enabled: true,
+        runner: "landlock",
+        policy: { writableRoots: ["/w/a", "/w/b"], network: "deny", loginShell: false },
+        networkEnforced: false,
+      }),
+      "ACTIVE (landlock): writes only inside /w/a, /w/b; network deny requested but NOT enforced",
+    );
+  });
+  it("reports network denied only when actually enforced", () => {
+    assert.equal(
+      describeSandboxState({
+        active: true,
+        enabled: true,
+        runner: "bwrap",
+        policy: { writableRoots: ["/w"], network: "deny", loginShell: true },
+        networkEnforced: true,
+      }),
+      "ACTIVE (bwrap): writes only inside /w; network denied",
+    );
+  });
+  it("describes disabled and unavailable states", () => {
+    assert.equal(
+      describeSandboxState({ active: false, enabled: false }),
+      "DISABLED: no filesystem restrictions",
+    );
+    assert.equal(
+      describeSandboxState({ active: false, enabled: true, reason: "no runner" }),
+      "enabled but no runner available; commands run UNSANDBOXED",
+    );
+    assert.equal(
+      describeSandboxState({ active: false, enabled: true, reason: "no runner", failClosed: true }),
+      "enabled but no runner available; affected commands are BLOCKED",
+    );
   });
 });

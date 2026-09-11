@@ -6,11 +6,11 @@
  * are bash-syntax-centric and must NOT be reused for PowerShell —
  * cmdlets/aliases/parameters differ).
  *
- * Categories mirror rules.ts: "filesystem" (suppressed while a sandbox is
- * active — never active on Windows, where this matters) and "system"
- * (always gated). Like the bash gate, this is a HEURISTIC prompt guard, not
- * a security boundary: string manipulation, encoding tricks, and indirect
- * invocation can evade text matching.
+ * Dispositions mirror rules.ts: "confirm" (default) asks before running;
+ * "deny" hard-blocks raw disk destruction (human-only). Every match is
+ * gated regardless of sandbox state. Like the bash gate, this is a
+ * HEURISTIC prompt guard, not a security boundary: string manipulation,
+ * encoding tricks, and indirect invocation can evade text matching.
  *
  * PowerShell quirks handled: alias→cmdlet resolution (rm/del/ri/…),
  * case-insensitivity, parameter PREFIX matching (-Rec == -Recurse),
@@ -18,11 +18,12 @@
  * pipeline separators, and the `&`/`.` call operators.
  */
 
-import type { GateMatch, RuleCategory } from "./rules.js";
+import type { GateMatch, RuleDisposition } from "./rules.js";
 
 type PsRule = {
   name: string;
-  category: RuleCategory;
+  /** "deny" = hard block (human-only, no prompt). Default: "confirm". */
+  disposition?: RuleDisposition;
   test: (command: string) => boolean;
 };
 
@@ -110,9 +111,9 @@ function isRegistryPath(token: string): boolean {
 
 const PS_RULES: PsRule[] = [
   {
-    // Remove-Item (and aliases rm/del/erase/ri/rd/rmdir/r) with -Recurse
+    // Remove-Item (and aliases rm/del/erase/ri/rd/rmdir/r) with -Recurse.
+    // Irreversible even inside writable roots — always confirmed.
     name: "recursive Remove-Item",
-    category: "filesystem",
     test: (command) =>
       psSegments(command).some(
         (seg) => psCommand(seg) === "remove-item" && hasParam(psArgs(seg), "Recurse"),
@@ -121,22 +122,23 @@ const PS_RULES: PsRule[] = [
   {
     // Clear-Content (alias clc)
     name: "Clear-Content",
-    category: "filesystem",
     test: (command) => psSegments(command).some((seg) => psCommand(seg) === "clear-content"),
   },
   {
-    // Volume/disk wiping
+    // Volume/disk wiping — destroys data irreversibly. Hard block.
+    // -WhatIf (dry-run) is excluded: it inspects, it does not wipe.
     name: "disk wipe",
-    category: "system",
+    disposition: "deny",
     test: (command) =>
-      psSegments(command).some((seg) =>
-        ["format-volume", "clear-disk", "initialize-disk"].includes(psCommand(seg) ?? ""),
-      ),
+      psSegments(command).some((seg) => {
+        if (!["format-volume", "clear-disk", "initialize-disk"].includes(psCommand(seg) ?? ""))
+          return false;
+        return !hasParam(psArgs(seg), "WhatIf");
+      }),
   },
   {
     // Power / shutdown actions
     name: "power action",
-    category: "system",
     test: (command) =>
       psSegments(command).some((seg) =>
         ["stop-computer", "restart-computer"].includes(psCommand(seg) ?? ""),
@@ -145,7 +147,6 @@ const PS_RULES: PsRule[] = [
   {
     // Elevation: Start-Process -Verb RunAs (incl. the -Verb:RunAs form)
     name: "privilege escalation",
-    category: "system",
     test: (command) =>
       psSegments(command).some((seg) => {
         if (psCommand(seg) !== "start-process") return false;
@@ -160,13 +161,11 @@ const PS_RULES: PsRule[] = [
     // covers the classic `iwr … | iex` download-and-run (the iex segment
     // matches on its own).
     name: "Invoke-Expression",
-    category: "system",
     test: (command) => psSegments(command).some((seg) => psCommand(seg) === "invoke-expression"),
   },
   {
     // ACL / ownership changes (icacls /grant incl. /grant:r, .exe suffixes)
     name: "ACL/ownership change",
-    category: "system",
     test: (command) =>
       psSegments(command).some((seg) => {
         const cmd = psCommand(seg);
@@ -178,7 +177,6 @@ const PS_RULES: PsRule[] = [
     // Machine-wide registry modification (HKLM/HKCR; HKCU is user-scoped
     // and left ungated)
     name: "registry modification",
-    category: "system",
     test: (command) =>
       psSegments(command).some((seg) => {
         const cmd = psCommand(seg);
@@ -197,12 +195,12 @@ const PS_RULES: PsRule[] = [
 ];
 
 /**
- * Returns the matching PowerShell rule to surface: a SYSTEM-category match
- * wins over a filesystem one (same precedence as findDangerousRule).
- * Undefined when nothing matches.
+ * Returns the matching PowerShell rule to surface: a DENY match wins over a
+ * confirm one (same precedence as findDangerousRule). Undefined when nothing
+ * matches.
  */
 export function findDangerousPowerShellRule(command: string): GateMatch | undefined {
   const matches = PS_RULES.filter((r) => r.test(command));
-  const rule = matches.find((r) => r.category === "system") ?? matches[0];
-  return rule ? { name: rule.name, category: rule.category } : undefined;
+  const rule = matches.find((r) => r.disposition === "deny") ?? matches[0];
+  return rule ? { name: rule.name, disposition: rule.disposition ?? "confirm" } : undefined;
 }

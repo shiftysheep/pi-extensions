@@ -23,6 +23,8 @@
     }
   },
   "dependencies": {
+    "@earendil-works/pi-client": "^0.85.1",
+    "@earendil-works/pi-server": "^0.85.1",
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
     "@juicesharp/rpiv-todo": "^2.9.0",
@@ -31,6 +33,8 @@
     "pi-web-access": "^0.28.0"
   },
   "bundledDependencies": [
+    "@earendil-works/pi-client",
+    "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
@@ -78,6 +82,8 @@
     "typescript": "^7.0.2"
   },
   "bundleDependencies": [
+    "@earendil-works/pi-client",
+    "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
     "@juicesharp/rpiv-todo",
