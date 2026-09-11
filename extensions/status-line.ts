@@ -87,10 +87,7 @@ export function formatTokensPerSecond(
   return `${providerConfirmed ? "" : "≈"}${Math.round(rate)} tok/s${providerConfirmed ? "*" : ""}`;
 }
 
-export function formatWorkingMessage(
-  rate: number | null,
-  providerConfirmed = false,
-): string {
+export function formatWorkingMessage(rate: number | null, providerConfirmed = false): string {
   const formattedRate = formatTokensPerSecond(rate, providerConfirmed);
   return formattedRate ? `${DEFAULT_WORKING_MESSAGE} ${formattedRate}` : DEFAULT_WORKING_MESSAGE;
 }
@@ -187,9 +184,10 @@ export default function statusLine(pi: ExtensionAPI): void {
       lastDisplayedRate = { rate: stream.liveTokensPerSecond, providerConfirmed: false };
       setWorkingRate(ctx, stream.liveTokensPerSecond);
     } else {
-      lastDisplayedRate = lastTokensPerSecond === null
-        ? null
-        : { rate: lastTokensPerSecond, providerConfirmed: true };
+      lastDisplayedRate =
+        lastTokensPerSecond === null
+          ? null
+          : { rate: lastTokensPerSecond, providerConfirmed: true };
       setWorkingRate(ctx, lastTokensPerSecond, true);
     }
     stream = createStreamState();
@@ -199,10 +197,8 @@ export default function statusLine(pi: ExtensionAPI): void {
     if (lastDisplayedRate !== null) {
       setRateWidget(
         ctx,
-        formatTokensPerSecond(
-          lastDisplayedRate.rate,
-          lastDisplayedRate.providerConfirmed,
-        ) ?? undefined,
+        formatTokensPerSecond(lastDisplayedRate.rate, lastDisplayedRate.providerConfirmed) ??
+          undefined,
       );
     }
   });
