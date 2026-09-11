@@ -11,7 +11,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 | `advisor.ts` (+ `advisor/` modules) | Consults a separate configured model as an independent second opinion (review, debugging, design). | [docs/advisor.md](docs/advisor.md) |
 | `cron.ts` | In-session scheduled wakes: one-shot delays/timestamps and repeating intervals. Survives `/reload`, not process exit. | [docs/cron.md](docs/cron.md) |
 | `permission-gate.ts` (+ `permission-gate/` modules) | Heuristic guard that prompts before dangerous bash/PowerShell commands (hard-blocks raw disk operations), plus an opt-in OS filesystem sandbox (bubblewrap / Landlock / `sandbox-exec`). | [docs/permission-gate.md](docs/permission-gate.md) |
-| `status-line.ts` | Custom footer with a tok/s estimate while streaming. | [docs/status-line.md](docs/status-line.md) |
+| `status-line.ts` | Future-proof working indicator with live and provider-confirmed tok/s rates, plus an async subagent cost footer status line. | [docs/status-line.md](docs/status-line.md) |
 
 ### Bundled recommended installs
 
