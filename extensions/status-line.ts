@@ -6,12 +6,19 @@
  * replacing the footer. This keeps the extension independent of footer
  * internals as Pi's UI evolves.
  *
- * Subagent costs: SYNC subagent runs are already counted in the built-in
- * footer (pi-subagents sets an aggregated top-level `usage` on the tool
- * result, which the footer sums). ASYNC runs are not: their usage only lands
- * in {sessionDir}/subagent-artifacts/{runId}_{agent}_meta.json. We scan those
- * (throttled, deduped by runId, only runs started after this session) and
- * show the total as a second widget line, mirroring the rate badge.
+ * Subagent costs: SYNC subagent runs and runs awaited via `bg_wait` are
+ * already counted in the built-in footer (pi-subagents sets an aggregated
+ * top-level `usage` on those tool results, which the footer sums). ASYNC
+ * runs that complete WITHOUT a `bg_wait` are not: their usage only lands in
+ * {sessionDir}/subagent-artifacts/{runId}_{agent}[_{step}]_meta.json. We
+ * scan those (TUI only, on agent_end, throttled to 2 s, deduped by meta
+ * file name so multi-step runs sum every step, only runs COMPLETED after
+ * this session's first entry — the meta timestamp is a completion time)
+ * and show the total as a footer status line (`ctx.ui.setStatus`), which
+ * the built-in footer appends below itself — keeping this extension's own
+ * surface (working indicator + rate widget) lightweight. Note the status
+ * line intentionally overlaps the footer's $ total for bg_wait-ed runs:
+ * it is the session's TOTAL async subagent cost, not a delta.
  */
 
 import * as fs from "node:fs";
@@ -21,6 +28,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 export const MIN_STREAM_MS = 250;
 export const DEFAULT_WORKING_MESSAGE = "Working...";
 const WIDGET_KEY = "status-line";
+const SUBAGENT_STATUS_KEY = "subagents";
 const SUBAGENT_SCAN_MS = 2000; // artifacts dir is rescanned at most this often
 const RUN_ID_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_/i;
 const UTF8_ENCODER = new TextEncoder();
@@ -118,13 +126,15 @@ export function createSubagentTotals(): SubagentTotals {
 
 /**
  * Parse one artifact meta file: the run id comes from the file name
- * ({runId}_{agent}_meta.json), the start time and usage from the JSON body.
- * Malformed names/bodies yield null (skipped, never thrown).
+ * ({runId}_{agent}[_{step}]_meta.json), the completion time and usage from
+ * the JSON body. The producer (pi-subagents) writes `usage.cost` as a
+ * NUMBER; a `{ total }` object is also accepted for tolerance. Malformed
+ * names/bodies yield null (skipped, never thrown).
  */
 export function extractSubagentMeta(
   fileName: string,
   meta: unknown,
-): { runId: string; startedAt: number | null; totals: SubagentTotals } | null {
+): { runId: string; completedAt: number | null; totals: SubagentTotals } | null {
   if (!fileName.endsWith("_meta.json")) return null;
   const m = fileName.match(RUN_ID_RE);
   if (!m) return null;
@@ -132,19 +142,23 @@ export function extractSubagentMeta(
   const usage = (meta as { usage?: unknown }).usage;
   const u = typeof usage === "object" && usage !== null ? (usage as Record<string, unknown>) : {};
   const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-  const costObj = (u.cost ?? {}) as Record<string, unknown>;
+  const rawCost = u.cost;
+  const cost =
+    typeof rawCost === "number" && Number.isFinite(rawCost)
+      ? rawCost
+      : typeof rawCost === "object" && rawCost !== null
+        ? num((rawCost as { total?: unknown }).total)
+        : 0;
+  const stamp = (meta as { timestamp?: unknown }).timestamp;
   return {
     runId: m[1],
-    startedAt:
-      typeof (meta as { timestamp?: unknown }).timestamp === "number"
-        ? ((meta as { timestamp: number }).timestamp as number)
-        : null,
+    completedAt: typeof stamp === "number" && Number.isFinite(stamp) ? stamp : null,
     totals: {
       input: num(u.input),
       output: num(u.output),
       cacheRead: num(u.cacheRead),
       cacheWrite: num(u.cacheWrite),
-      cost: num(costObj.total),
+      cost,
     },
   };
 }
@@ -185,37 +199,41 @@ export default function statusLine(pi: ExtensionAPI): void {
 
   // Async subagent cost accumulation (artifact meta scan).
   let subagentTotals = createSubagentTotals();
-  const countedRunIds = new Set<string>();
+  const countedMetaFiles = new Set<string>();
   let subagentScanAt = 0;
-  let sessionStartMs: number | null = null;
   let sessionDir: string | undefined;
 
   function resetSubagentTracking(): void {
     subagentTotals = createSubagentTotals();
-    countedRunIds.clear();
+    countedMetaFiles.clear();
     subagentScanAt = 0;
-    sessionStartMs = null;
     sessionDir = undefined;
   }
 
-  /** Rescan the per-cwd subagent-artifacts dir (throttled) and fold in any
-   *  completed async runs started after this session, deduped by runId. */
+  /** Rescan the per-cwd subagent-artifacts dir (throttled, TUI only) and
+   *  fold in completed async runs finished after this session's first
+   *  entry. Deduped by meta FILE NAME (multi-step runs write one meta per
+   *  step sharing the runId — every step counts); meta files are the only
+   *  files read (input/output/transcript artifacts are never touched). */
   function refreshSubagentTotals(ctx: ExtensionContext): void {
+    if (!tuiEnabled || ctx.mode !== "tui") return;
     const now = Date.now();
     if (now - subagentScanAt < SUBAGENT_SCAN_MS) return;
     subagentScanAt = now;
     try {
       const sm = ctx.sessionManager;
       sessionDir ??= sm.getSessionDir();
-      if (sessionStartMs === null) {
-        // The artifacts dir is shared by all sessions in this cwd, so only
-        // count runs started at or after this session's first entry.
-        const first = sm.getEntries()[0];
-        const t = first?.timestamp;
-        sessionStartMs = typeof t === "string" && !Number.isNaN(Date.parse(t)) ? Date.parse(t) : 0;
-      }
+      // The artifacts dir is shared by all sessions in this cwd, so only
+      // count runs completed at or after this session's first entry. The
+      // cutoff is recomputed each scan (cheap) and an unknown first entry
+      // skips the scan rather than attributing stale runs.
+      const first = sm.getEntries()[0];
+      const t = first?.timestamp;
+      if (typeof t !== "string" || Number.isNaN(Date.parse(t))) return;
+      const sessionStartMs = Date.parse(t);
       const artDir = join(sessionDir, "subagent-artifacts");
       for (const name of fs.readdirSync(artDir)) {
+        if (!name.endsWith("_meta.json") || countedMetaFiles.has(name)) continue;
         let parsed: unknown;
         try {
           parsed = JSON.parse(fs.readFileSync(join(artDir, name), "utf8"));
@@ -223,9 +241,9 @@ export default function statusLine(pi: ExtensionAPI): void {
           continue; // unreadable/partial meta: skip
         }
         const meta = extractSubagentMeta(name, parsed);
-        if (!meta || countedRunIds.has(meta.runId)) continue;
-        if (meta.startedAt !== null && meta.startedAt < sessionStartMs) continue;
-        countedRunIds.add(meta.runId);
+        if (!meta) continue;
+        if (meta.completedAt === null || meta.completedAt < sessionStartMs) continue;
+        countedMetaFiles.add(name);
         addSubagentTotals(subagentTotals, meta.totals);
       }
     } catch {
@@ -260,24 +278,23 @@ export default function statusLine(pi: ExtensionAPI): void {
     );
   }
 
-  /** Widget lines: the most recent rate badge plus the async subagent total
-   *  (when non-zero). undefined clears the widget. */
-  function setWidgetLines(ctx: ExtensionContext, lines: string[] | undefined): void {
+  /** Widget: the most recent rate badge only. undefined clears it. */
+  function setRateWidget(ctx: ExtensionContext, text: string | undefined): void {
     if (tuiEnabled && ctx.mode === "tui") {
-      ctx.ui.setWidget(WIDGET_KEY, lines && lines.length > 0 ? lines : undefined);
+      const widgetText = text === undefined ? undefined : formatBadge(ctx, "response speed", text);
+      ctx.ui.setWidget(WIDGET_KEY, widgetText === undefined ? undefined : [widgetText]);
     }
   }
 
-  function currentWidgetLines(ctx: ExtensionContext): string[] {
-    const lines: string[] = [];
-    const rateText =
-      lastDisplayedRate === null
-        ? null
-        : formatTokensPerSecond(lastDisplayedRate.rate, lastDisplayedRate.providerConfirmed);
-    if (rateText !== null) lines.push(formatBadge(ctx, "response speed", rateText));
-    const subText = formatSubagentCost(subagentTotals);
-    if (subText !== null) lines.push(formatBadge(ctx, "subagents", subText));
-    return lines;
+  /** Footer status line (appended below the built-in footer): the session's
+   *  total async subagent cost, or cleared when zero. */
+  function setSubagentStatus(ctx: ExtensionContext): void {
+    if (!tuiEnabled || ctx.mode !== "tui") return;
+    const text = formatSubagentCost(subagentTotals);
+    ctx.ui.setStatus(
+      SUBAGENT_STATUS_KEY,
+      text === null ? undefined : formatBadge(ctx, "subagents", text),
+    );
   }
 
   pi.on("session_start", (_event, ctx) => {
@@ -287,16 +304,17 @@ export default function statusLine(pi: ExtensionAPI): void {
     tuiEnabled = ctx.mode === "tui";
     resetSubagentTracking();
     setWorkingMessage(ctx);
-    setWidgetLines(ctx, undefined);
+    setRateWidget(ctx, undefined);
+    setSubagentStatus(ctx);
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    setWidgetLines(ctx, undefined);
+    setRateWidget(ctx, undefined);
   });
 
   pi.on("message_start", (event, ctx) => {
     if (event.message.role !== "assistant") return;
-    setWidgetLines(ctx, undefined);
+    setRateWidget(ctx, undefined);
     stream = createStreamState();
     stream.messageStartTime = Date.now();
     setWorkingRate(ctx, lastTokensPerSecond, true);
@@ -347,16 +365,24 @@ export default function statusLine(pi: ExtensionAPI): void {
 
   pi.on("agent_end", (_event, ctx) => {
     refreshSubagentTotals(ctx);
-    setWidgetLines(ctx, currentWidgetLines(ctx));
+    setSubagentStatus(ctx);
+    if (lastDisplayedRate !== null) {
+      setRateWidget(
+        ctx,
+        formatTokensPerSecond(lastDisplayedRate.rate, lastDisplayedRate.providerConfirmed) ??
+          undefined,
+      );
+    }
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     setWorkingMessage(ctx);
-    setWidgetLines(ctx, undefined);
-    tuiEnabled = false;
+    setRateWidget(ctx, undefined);
     stream = createStreamState();
     lastTokensPerSecond = null;
     lastDisplayedRate = null;
     resetSubagentTracking();
+    setSubagentStatus(ctx); // totals are zero now → clears the status line
+    tuiEnabled = false;
   });
 }

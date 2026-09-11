@@ -63,20 +63,27 @@ test("formats live and provider-confirmed rates distinctly", () => {
 
 test("extractSubagentMeta parses names and bodies, rejecting malformed input", () => {
   const runId = "11111111-2222-3333-4444-555555555555";
+  // Producer-shaped fixture: pi-subagents writes usage.cost as a NUMBER.
   const ok = extractSubagentMeta(`${runId}_worker_meta.json`, {
     timestamp: 123,
-    usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } },
+    usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, turns: 2 },
   });
   assert.deepEqual(ok, {
     runId,
-    startedAt: 123,
+    completedAt: 123,
     totals: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 },
   });
+  // A { total } object cost is tolerated.
+  const objectCost = extractSubagentMeta(`${runId}_worker_meta.json`, {
+    usage: { input: 0, output: 0, cost: { total: 1.5 } },
+  });
+  assert.equal(objectCost?.totals.cost, 1.5);
+  assert.equal(objectCost?.completedAt, null);
   assert.equal(extractSubagentMeta("no-run-id_meta.json", {}), null);
   assert.equal(extractSubagentMeta(`${runId}_worker.json`, {}), null);
   assert.equal(extractSubagentMeta(`${runId}_worker_meta.json`, "nope"), null);
   const partial = extractSubagentMeta(`${runId}_worker_meta.json`, { usage: { output: "x" } });
-  assert.equal(partial?.startedAt, null);
+  assert.equal(partial?.completedAt, null);
   assert.equal(partial?.totals.output, 0);
   assert.equal(partial?.totals.cost, 0);
 });
@@ -107,30 +114,51 @@ test("formatSubagentCost and formatTokenCount", () => {
   assert.equal(formatTokenCount(2_345_678), "2.3M");
 });
 
-test("shows the async subagent total from artifact meta files in the widget", () => {
+test("shows the async subagent total from artifact meta files in the footer status", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-status-line-"));
   const artDir = join(dir, "subagent-artifacts");
   mkdirSync(artDir, { recursive: true });
   const runId = "11111111-2222-3333-4444-555555555555";
+  const afterSession = Date.parse("2026-01-02T00:00:00Z");
+  const beforeSession = Date.parse("2025-12-31T12:00:00Z");
   try {
+    // Multi-step run: two meta files share the runId; BOTH steps count.
     writeFileSync(
-      join(artDir, `${runId}_worker_meta.json`),
+      join(artDir, `${runId}_worker_0_meta.json`),
       JSON.stringify({
-        timestamp: Date.parse("2026-01-02T00:00:00Z"),
-        usage: { input: 100, output: 200, cacheRead: 0, cacheWrite: 0, cost: { total: 0.1234 } },
+        timestamp: afterSession,
+        usage: { input: 100, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.1, turns: 1 },
       }),
     );
-    // A run started before this session must not be counted.
+    writeFileSync(
+      join(artDir, `${runId}_worker_1_meta.json`),
+      JSON.stringify({
+        timestamp: afterSession,
+        usage: { input: 50, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.0234, turns: 1 },
+      }),
+    );
+    // A run completed before this session must not be counted.
     writeFileSync(
       join(artDir, "99999999-2222-3333-4444-555555555555_worker_meta.json"),
       JSON.stringify({
-        timestamp: Date.parse("2025-12-31T12:00:00Z"),
-        usage: { input: 5, output: 5, cost: { total: 1 } },
+        timestamp: beforeSession,
+        usage: { input: 5, output: 5, cost: 1, turns: 1 },
       }),
     );
+    // A meta without a timestamp must not be counted (unknown completion).
+    writeFileSync(
+      join(artDir, "88888888-2222-3333-4444-555555555555_worker_meta.json"),
+      JSON.stringify({ usage: { input: 7, output: 7, cost: 1, turns: 1 } }),
+    );
+    // Malformed meta and non-meta artifacts are skipped without crashing.
+    writeFileSync(
+      join(artDir, "77777777-2222-3333-4444-555555555555_worker_meta.json"),
+      "not json",
+    );
+    writeFileSync(join(artDir, `${runId}_worker_0_transcript.jsonl`), "not json either");
 
     const handlers = new Map<string, (event: any, ctx: any) => void>();
-    const widgets: Array<[string, string[] | undefined]> = [];
+    const statuses: Array<[string, string | undefined]> = [];
     statusLine({
       on(name: string, handler: (event: any, ctx: any) => void) {
         handlers.set(name, handler);
@@ -153,19 +181,26 @@ test("shows the async subagent total from artifact meta files in the widget", ()
           },
         },
         setWorkingMessage() {},
-        setWidget(key: string, content: string[] | undefined) {
-          widgets.push([key, content]);
+        setWidget() {},
+        setStatus(key: string, text: string | undefined) {
+          statuses.push([key, text]);
         },
       },
     };
 
     handlers.get("session_start")?.({}, ctx);
+    assert.deepEqual(statuses.at(-1), ["subagents", undefined]);
+
     handlers.get("agent_end")?.({}, ctx);
-    assert.deepEqual(widgets.at(-1), ["status-line", ["[ subagents · 300 tok $0.123 ]"]]);
+    // 100+200+50+50 = 400 tok; 0.1 + 0.0234 = $0.123 (both steps counted).
+    assert.deepEqual(statuses.at(-1), ["subagents", "[ subagents · 400 tok $0.123 ]"]);
 
     // Throttled: a second scan within the window adds nothing new.
     handlers.get("agent_end")?.({}, ctx);
-    assert.deepEqual(widgets.at(-1), ["status-line", ["[ subagents · 300 tok $0.123 ]"]]);
+    assert.deepEqual(statuses.at(-1), ["subagents", "[ subagents · 400 tok $0.123 ]"]);
+
+    handlers.get("session_shutdown")?.({}, ctx);
+    assert.deepEqual(statuses.at(-1), ["subagents", undefined]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -198,6 +233,7 @@ test("updates the animated working message in the TUI and leaves other modes ine
       setWidget(key: string, content: string[] | undefined) {
         widgets.push([key, content]);
       },
+      setStatus() {},
     },
   });
   const assistantStart = { message: { role: "assistant" } };
