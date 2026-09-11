@@ -1,10 +1,28 @@
 # status-line
 
-Custom footer with a tok/s estimate while streaming. It mirrors pi's built-in footer layout (cwd/branch/session, token/cost/context line, extension status texts) and adds a trailing rate slot:
+A lightweight status extension that adds response throughput to Pi's built-in
+animated working indicator without replacing the footer or depending on footer
+implementation details.
 
-- **While streaming:** `≈N tok/s`, estimated from cumulative UTF-8 bytes/4 since first output.
-- **After the stream completes:** dimmed `N tok/s*` using provider-reported output tokens over the complete assistant stream (streams shorter than 250 ms are considered too short to be meaningful).
+- **While streaming:** `[ response speed · ≈N tok/s ]`, estimated from cumulative
+  UTF-8 output bytes divided by four.
+- **After the stream completes:** `[ response speed · N tok/s* ]`, using the
+  provider-reported output token count over the complete assistant message
+  duration.
+- **After the working indicator disappears:** the most recent measured rate is
+  retained as a small widget above the editor and cleared when the next response
+  starts.
 
-Token/cost totals also include subagent runs: sync runs from the subagent tool result's `details.results[].usage`, async runs from `{sessionDir}/subagent-artifacts/{runId}_{agent}_meta.json` (deduped by runId, rescanned at most every 2 s).
+The `≈` marker identifies a live estimate. The `*` marker identifies a
+provider-confirmed rate. Text, thinking, and tool-call deltas contribute to the
+live estimate. Responses shorter than 250 ms are omitted as too short to measure
+reliably.
 
-Pass `undefined` to pi's `setFooter()` to restore the original footer.
+The extension intentionally leaves Pi's built-in footer responsible for the
+working directory, token, cost, context, provider, subscription, compaction,
+model, and extension-status information. It does not replace the footer, make
+network requests, persist metrics, access credentials, or change provider
+behavior.
+
+The extension only updates the working indicator and widget in Pi's interactive
+TUI. In RPC, JSON, and print modes it remains inert.
