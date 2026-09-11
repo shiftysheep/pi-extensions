@@ -8,6 +8,10 @@
  *           └─ our addition in the trailing slot when available: "≈N tok/s" while a response
  *              is streaming (estimated from cumulative UTF-8 bytes/4 since first output), or dimmed
  *              "N tok/s*" using provider-reported output tokens over the complete assistant stream.
+ *              Token/cost totals also include subagent runs: sync runs from the subagent
+ *              toolResult's details.results[].usage, async runs from
+ *              {sessionDir}/subagent-artifacts/{runId}_{agent}_meta.json (deduped by runId,
+ *              rescanned at most every 2s).
  *   line 3: other extensions' ctx.ui.setStatus() texts (sorted by key, space-joined), only if any exist
  *
  * Live rate starts at the first streamed output. Final provider-reported rate starts at Pi's
@@ -17,7 +21,7 @@
 
 import * as fs from "node:fs";
 import { homedir } from "node:os";
-import { relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -314,7 +318,117 @@ export default function (pi: ExtensionAPI) {
         cost += u.cost?.total ?? 0;
       }
     }
+    // Subagent runs live in separate pi processes: their usage is NOT in the
+    // host session's assistant messages. Synchronous runs carry it in the
+    // subagent toolResult's details.results[].usage; async runs only leave
+    // {sessionDir}/subagent-artifacts/{runId}_{agent}_meta.json. Sum both,
+    // deduplicated by runId.
+    const sub = subagentTotals(sm);
+    input += sub.input;
+    output += sub.output;
+    cacheRead += sub.cacheRead;
+    cacheWrite += sub.cacheWrite;
+    cost += sub.cost;
     return { input, output, cacheRead, cacheWrite, cost, latestCacheHitRate };
+  }
+
+  const SUBAGENT_SCAN_MS = 2000; // artifacts dir is rescanned at most this often
+  let subagentScanAt = 0;
+  let subagentCache: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: number;
+  } = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+
+  const RUN_ID_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_/i;
+
+  function addUsageInto(
+    acc: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number },
+    u: any,
+  ): void {
+    if (!u || typeof u !== "object") return;
+    acc.input += u.input ?? 0;
+    acc.output += u.output ?? 0;
+    acc.cacheRead += u.cacheRead ?? 0;
+    acc.cacheWrite += u.cacheWrite ?? 0;
+    acc.cost += u.cost ?? 0;
+  }
+
+  function subagentTotals(sm: any): {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: number;
+  } {
+    const now = Date.now();
+    if (now - subagentScanAt < SUBAGENT_SCAN_MS) return subagentCache;
+    subagentScanAt = now;
+    const acc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const countedRunIds = new Set<string>();
+
+    // 1) toolResult details.results[].usage (sync runs + completed runs whose
+    //    results were populated). Collect runIds from transcriptPath basenames
+    //    ({runId}_{agent}_transcript.jsonl) so the artifact scan can dedupe.
+    try {
+      for (const entry of sm.getEntries()) {
+        const msg: any = entry.message ?? {};
+        if (entry.type !== "message" || msg.role !== "toolResult" || msg.toolName !== "subagent")
+          continue;
+        const results: any = msg.details?.results;
+        if (!Array.isArray(results)) continue;
+        for (const r of results) {
+          if (!r || typeof r !== "object") continue;
+          addUsageInto(acc, r.usage);
+          const tp: string | undefined =
+            typeof r.transcriptPath === "string" ? r.transcriptPath : undefined;
+          if (tp) {
+            const m = (tp.split(sep).pop() ?? "").match(RUN_ID_RE);
+            if (m) countedRunIds.add(m[1]);
+          }
+        }
+      }
+    } catch {
+      /* details shape varies; fall through to the artifact scan */
+    }
+
+    // 2) artifact meta files for runs not already counted (async runs). The
+    //    artifacts dir is per-cwd (shared by sessions in the same cwd), so
+    //    only count runs started at or after this session's first entry.
+    try {
+      const sessionDir: string | undefined = sm.getSessionDir?.();
+      if (sessionDir) {
+        let startMs = 0;
+        try {
+          const first: any = sm.getEntries()[0];
+          const t = first?.timestamp;
+          if (typeof t === "string" && !Number.isNaN(Date.parse(t))) startMs = Date.parse(t);
+        } catch {
+          /* default: count everything */
+        }
+        const artDir = join(sessionDir, "subagent-artifacts");
+        for (const name of fs.readdirSync(artDir)) {
+          if (!name.endsWith("_meta.json")) continue;
+          const m = name.match(RUN_ID_RE);
+          if (!m || countedRunIds.has(m[1])) continue;
+          try {
+            const meta: any = JSON.parse(fs.readFileSync(join(artDir, name), "utf8"));
+            if (typeof meta.timestamp === "number" && meta.timestamp < startMs) continue;
+            addUsageInto(acc, meta.usage);
+            countedRunIds.add(m[1]);
+          } catch {
+            /* unreadable/partial meta: skip */
+          }
+        }
+      }
+    } catch {
+      /* no artifacts dir (or unreadable): toolResult-only totals stand */
+    }
+
+    subagentCache = acc;
+    return acc;
   }
 
   function tpsLabel(theme: any): string | null {
