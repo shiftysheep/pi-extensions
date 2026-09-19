@@ -130,3 +130,17 @@ pre-commit install && pre-commit install -t commit-msg   # or: npm run precommit
   `git switch -c <type>/<short-desc>` and commit there instead.
 - CI runs `npm run check` (biome + tsc) on every PR and push to `main` via
   `.github/workflows/ci.yml`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in the repo's GitHub Issues, managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root + `docs/adr/` for ADRs. See `docs/agents/domain.md`.
