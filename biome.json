@@ -6,7 +6,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!package-lock.json"]
+    "includes": ["**", "!package-lock.json", "!.agents/**"]
   },
   "formatter": {
     "enabled": true,
