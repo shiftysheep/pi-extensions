@@ -29,25 +29,21 @@
  */
 import { parseArgs } from "node:util";
 import {
-  buildClassifierRequest,
   DEFAULT_CONFIRM_THRESHOLD,
   DEFAULT_DENY_THRESHOLD,
   DEFAULT_JEV_MODEL,
-  decideClassifier,
   effectiveThresholds,
-  parseClassifierProbs,
   TYPESAFE_API_KEY_ENV,
 } from "../extensions/permission-gate/classifier.js";
 import { callJev } from "../extensions/permission-gate/jev-client.js";
-import { findStaticMatch } from "../extensions/permission-gate/rules.js";
 import {
-  type BenchConfig,
   type BenchmarkSummary,
   type ComposedRow,
   type ComposedSummary,
   composedDecision,
   expectedPass,
   type Row,
+  runBenchmarkCases,
   summarizeComposedRows,
   summarizeRows,
   truncate,
@@ -71,79 +67,6 @@ function printHelp(): void {
       "Requires TYPESAFE_API_KEY and network access.",
     ].join("\n"),
   );
-}
-
-/**
- * Run the cases through the classifier with a bounded concurrency pool.
- * In the composed view, cases a static rule preempts are marked "skipped"
- * WITHOUT calling Jev — mirroring production, where the classifier only runs
- * on a static miss. The classifier/both views call every case.
- */
-async function runCases(
-  apiKey: string,
-  config: BenchConfig,
-  thresholds: { confirm: number; deny: number },
-  view: View,
-): Promise<Row[]> {
-  const rows: Row[] = new Array(CASES.length);
-  let next = 0;
-  async function worker(): Promise<void> {
-    while (next < CASES.length) {
-      const i = next++;
-      const c = CASES[i];
-      if (view === "composed" && findStaticMatch(c.shell, c.command)) {
-        rows[i] = {
-          command: c.command,
-          expect: c.expect,
-          malicious: null,
-          dangerous: null,
-          verdict: "skipped",
-          pass: false,
-        };
-        continue;
-      }
-      const result = await callJev(buildClassifierRequest(c.command, config.model, c.shell), {
-        apiKey,
-        timeoutMs: config.timeoutMs,
-      });
-      if (!result.ok) {
-        rows[i] = {
-          command: c.command,
-          expect: c.expect,
-          malicious: null,
-          dangerous: null,
-          verdict: "unavailable",
-          pass: false,
-        };
-        continue;
-      }
-      const probs = parseClassifierProbs(result.body);
-      if (!probs) {
-        rows[i] = {
-          command: c.command,
-          expect: c.expect,
-          malicious: null,
-          dangerous: null,
-          verdict: "malformed",
-          pass: false,
-        };
-        continue;
-      }
-      const verdict = decideClassifier(probs, thresholds).action;
-      rows[i] = {
-        command: c.command,
-        expect: c.expect,
-        malicious: probs.malicious,
-        dangerous: probs.dangerous,
-        verdict,
-        pass: expectedPass(c.expect, verdict),
-      };
-    }
-  }
-  await Promise.all(
-    Array.from({ length: Math.min(config.concurrency, CASES.length) }, () => worker()),
-  );
-  return rows;
 }
 
 function reportText(
@@ -284,7 +207,9 @@ async function main(): Promise<void> {
     classifierConfirmThreshold: config.confirm,
     classifierDenyThreshold: config.deny,
   });
-  const rows = await runCases(apiKey, config, thresholds, view);
+  const rows = await runBenchmarkCases(CASES, config, thresholds, view, (request, timeoutMs) =>
+    callJev(request, { apiKey, timeoutMs }),
+  );
   const summary = summarizeRows(rows);
 
   // Composed (real-usage) view: static rules first, classifier only on a miss.
