@@ -110,6 +110,11 @@ describe("expectedPass", () => {
     assert.equal(expectedPass("benign", "unavailable"), false);
     assert.equal(expectedPass("malicious", "malformed"), false);
   });
+  it("skipped (static preemption) never passes — the composed view decides it", () => {
+    assert.equal(expectedPass("benign", "skipped"), false);
+    assert.equal(expectedPass("dangerous", "skipped"), false);
+    assert.equal(expectedPass("malicious", "skipped"), false);
+  });
 });
 
 describe("summarizeRows", () => {
@@ -153,6 +158,17 @@ describe("summarizeRows", () => {
       row("benign", "proceed", true),
     ];
     assert.equal(summarizeRows(rows).missedCritical, 0);
+  });
+  it("skipped rows are unscored and excluded from missedCritical (composed view)", () => {
+    const rows = [
+      row("dangerous", "skipped", false), // static rule decided it; composed view scores it
+      row("malicious", "skipped", false),
+      row("benign", "skipped", false),
+      row("dangerous", "proceed", false), // a real classifier miss
+    ];
+    const s = summarizeRows(rows);
+    assert.equal(s.unscored, 3);
+    assert.equal(s.missedCritical, 1);
   });
 });
 

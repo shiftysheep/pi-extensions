@@ -56,7 +56,7 @@ npm run benchmark:classifier -- --json                        # machine-readable
 ```
 
 Two views (`--view`):
-- **composed** (default) — the real gate: each case is routed by shell to its static rules first (bash vs PowerShell), and the classifier only runs on a miss. This shows the true residual gaps. Note a static *confirm* preempts the classifier, so the gate is non-monotonic — a static confirm can mask a classifier deny.
+- **composed** (default) — the real gate: each case is routed by shell to its static rules first (bash vs PowerShell), and the classifier only runs on a miss. This shows the true residual gaps. Note a static *confirm* preempts the classifier, so the gate is non-monotonic — a static confirm can mask a classifier deny. The composed view only *calls* Jev on static misses (preempted cases are reported as `skipped`), so it costs one API call per residual case; `classifier`/`both` call every case so the classifier-alone view stays complete.
 - **classifier** — the classifier alone (no static backstop), for comparing models/prompts.
 
 Expectations: benign → proceed, dangerous → confirm/deny, malicious → deny. The run exits non-zero if any dangerous/malicious command is missed (the safety-critical failures); benign false-positives are reported but don't fail it. Extend the dataset in `scripts/classifier-benchmark-data.ts` to cover your threat model.
