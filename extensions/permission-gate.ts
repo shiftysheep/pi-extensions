@@ -81,6 +81,7 @@ import path from "node:path";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
   ExtensionUIContext,
   Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -99,6 +100,7 @@ import {
   canonicalizeTarget,
   describeSandboxState,
   isInsideAnyRoot,
+  MAX_CLASSIFIER_TIMEOUT_MS,
   managedSandboxConfigPath,
   mergeSandboxConfigs,
   parseSandboxConfig,
@@ -114,6 +116,18 @@ import {
   sandboxStateSignature,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
+import {
+  buildClassifierRequest,
+  type ClassifierShell,
+  DEFAULT_CONFIRM_THRESHOLD,
+  DEFAULT_DENY_THRESHOLD,
+  DEFAULT_JEV_MODEL,
+  decideClassifier,
+  effectiveThresholds,
+  parseClassifierProbs,
+  TYPESAFE_API_KEY_ENV,
+} from "./permission-gate/classifier.js";
+import { callJev } from "./permission-gate/jev-client.js";
 import { findDangerousPowerShellRule } from "./permission-gate/powershell-rules.js";
 import { findDangerousRule } from "./permission-gate/rules.js";
 import { resolveRunner } from "./permission-gate/runner.js";
@@ -417,6 +431,32 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
       description: "extra directories sandboxed commands may write to",
     },
+    {
+      value: "classifier",
+      label: `classifier: ${draft.classifier ?? "off"}`,
+      description:
+        "optional Jev danger classifier for commands the static rules miss (needs TYPESAFE_API_KEY)",
+    },
+    {
+      value: "classifierConfirmThreshold",
+      label: `classifierConfirmThreshold: ${draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD}`,
+      description: `Jev probability at/above which a command prompts for confirmation (default ${DEFAULT_CONFIRM_THRESHOLD})`,
+    },
+    {
+      value: "classifierDenyThreshold",
+      label: `classifierDenyThreshold: ${draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD}`,
+      description: `Jev probability at/above which a command is hard-blocked (default ${DEFAULT_DENY_THRESHOLD})`,
+    },
+    {
+      value: "classifierModel",
+      label: `classifierModel: ${draft.classifierModel ?? DEFAULT_JEV_MODEL}`,
+      description: "Jev model id (default jev-latest)",
+    },
+    {
+      value: "classifierTimeoutMs",
+      label: `classifierTimeoutMs: ${draft.classifierTimeoutMs ?? 8000}`,
+      description: "per-call Jev request timeout in ms (default 8000)",
+    },
     { value: "save", label: "— save —", description: "write the config file and re-apply" },
     { value: "cancel", label: "— cancel —", description: "discard changes" },
   ];
@@ -427,6 +467,10 @@ export default function (pi: ExtensionAPI) {
   let managedConfig: SandboxConfig = {};
   let state: SandboxState = { active: false, enabled: false };
   let localBashOps: ReturnType<typeof createLocalBashOperations> | undefined;
+  // Warn-once flags for the optional Jev classifier (reset on /reload, which
+  // recreates the extension instance — an acceptable re-warn).
+  let classifierNoKeyWarned = false;
+  let classifierApiWarned = false;
 
   const runnerContext = (cwd: string): RunnerContext => ({
     cwd,
@@ -444,6 +488,89 @@ export default function (pi: ExtensionAPI) {
     config.blockTerminates === true
       ? { block: true, terminate: true, reason }
       : { block: true, reason };
+
+  /** One-time classifier warning: TUI/RPC get a notify; headless (print/JSON)
+   *  gets a stderr line so stdout stays clean. */
+  function warnClassifier(ctx: ExtensionContext, msg: string): void {
+    if (ctx.hasUI) {
+      ctx.ui.notify(msg, "warning");
+    } else {
+      process.stderr.write(`[permission-gate] ${msg}\n`);
+    }
+  }
+
+  /**
+   * Optional Jev classifier (third gate tier). Runs only when the static rules
+   * did NOT match — it is the semantic safety net for obscured/novel commands,
+   * not a re-run of the deterministic rules. Returns a block result when the
+   * verdict is deny, a confirm is declined, or there is no UI; undefined to
+   * proceed. Fails OPEN (proceed + one-time warning) when the key is missing or
+   * the call errors — the static tier still guards the hard cases.
+   */
+  async function runJevClassifier(
+    command: string,
+    ctx: ExtensionContext,
+    shell: ClassifierShell,
+  ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
+    if (config.classifier !== "jev" || !command) return undefined;
+    const apiKey = process.env[TYPESAFE_API_KEY_ENV];
+    if (!apiKey) {
+      if (!classifierNoKeyWarned) {
+        classifierNoKeyWarned = true;
+        warnClassifier(
+          ctx,
+          `Classifier enabled (classifier: jev) but ${TYPESAFE_API_KEY_ENV} is not set — Jev classification is skipped.`,
+        );
+      }
+      return undefined;
+    }
+    const model = config.classifierModel ?? DEFAULT_JEV_MODEL;
+    const result = await callJev(buildClassifierRequest(command, model, shell), {
+      apiKey,
+      timeoutMs: config.classifierTimeoutMs,
+      signal: ctx.signal,
+    });
+    if (!result.ok) {
+      // A user cancellation aborts the whole turn; nothing to warn about.
+      if (result.cancelled) return undefined;
+      if (!classifierApiWarned) {
+        classifierApiWarned = true;
+        warnClassifier(
+          ctx,
+          `Jev classifier unavailable (${result.error}) — failing open; static rules still apply.`,
+        );
+      }
+      return undefined;
+    }
+    const probs = parseClassifierProbs(result.body);
+    if (!probs) {
+      if (!classifierApiWarned) {
+        classifierApiWarned = true;
+        warnClassifier(
+          ctx,
+          "Jev classifier returned a malformed response — failing open; static rules still apply.",
+        );
+      }
+      return undefined;
+    }
+    const verdict = decideClassifier(probs, effectiveThresholds(config));
+    if (verdict.action === "deny") {
+      return blocked(
+        `Blocked: Jev classified this command as high-risk (${verdict.label}). This is a model judgment, not a static rule — review before running it manually.`,
+      );
+    }
+    if (verdict.action === "confirm") {
+      if (!ctx.hasUI)
+        return blocked(
+          `Blocked: Jev flagged this command (${verdict.label}) and there is no UI to confirm`,
+        );
+      const ok = await ctx.ui.confirm(`⚠️ Jev flagged this command (${verdict.label})`, command, {
+        signal: ctx.signal,
+      });
+      if (!ok) return blocked("Blocked by user");
+    }
+    return undefined;
+  }
 
   /** fs predicates shared by policy building and the write/edit guard. */
   const dirExists = (p: string): boolean => {
@@ -647,6 +774,13 @@ export default function (pi: ExtensionAPI) {
       if (!ok) return blocked("Blocked by user");
     }
 
+    // --- optional Jev classifier (third tier; only when the static rules
+    //     did NOT match — it is the semantic safety net, not a re-run) ---
+    if (!match) {
+      const jevBlock = await runJevClassifier(command, ctx, isPowerShell ? "powershell" : "bash");
+      if (jevBlock) return jevBlock;
+    }
+
     // --- sandbox wrap (bash only: the wrappers build a bash command line) ---
     if (!isPowerShell && state.active && command) {
       // Mutate the shared input object IN PLACE: the agent executes the tool with its own
@@ -748,6 +882,73 @@ export default function (pi: ExtensionAPI) {
     // When no runner is available, applySandbox already warned (announcements
     // are suppressed here, capability warnings are not).
     if (next.active) ctx.ui.notify(`Sandbox on (${next.runner})`, "info");
+  }
+
+  /** Edit one classifier option; undefined = the user bailed. Kept separate so
+   *  editSandboxOption stays under the cognitive-complexity cap. */
+  async function editClassifierOption(
+    ctx: ExtensionCommandContext,
+    option: string,
+    draft: SandboxConfig,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    if (option === "classifier") {
+      const v = await promptSelect(ctx, "Danger classifier", [
+        { value: "off", label: "off", description: "static rules only (default)" },
+        {
+          value: "jev",
+          label: "jev",
+          description: "ask TypeSafe Jev when the static rules miss (needs TYPESAFE_API_KEY)",
+        },
+      ]);
+      return v === undefined ? undefined : { classifier: v as "off" | "jev" };
+    }
+    if (option === "classifierConfirmThreshold") {
+      const v = await ctx.ui.input(
+        "Classifier confirm threshold (0-1)",
+        String(draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD),
+        { signal: ctx.signal },
+      );
+      if (v === undefined) return undefined;
+      if (v.trim() === "") throw new Error("enter a number between 0 and 1");
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0 || n > 1)
+        throw new Error("confirm threshold must be a number between 0 and 1");
+      return { classifierConfirmThreshold: n };
+    }
+    if (option === "classifierDenyThreshold") {
+      const v = await ctx.ui.input(
+        "Classifier deny threshold (0-1)",
+        String(draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD),
+        { signal: ctx.signal },
+      );
+      if (v === undefined) return undefined;
+      if (v.trim() === "") throw new Error("enter a number between 0 and 1");
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0 || n > 1)
+        throw new Error("deny threshold must be a number between 0 and 1");
+      return { classifierDenyThreshold: n };
+    }
+    if (option === "classifierModel") {
+      const v = await ctx.ui.input(
+        "Classifier model id (empty = default jev-latest)",
+        draft.classifierModel ?? DEFAULT_JEV_MODEL,
+        { signal: ctx.signal },
+      );
+      if (v === undefined) return undefined;
+      const t = v.trim();
+      return t === "" ? { classifierModel: undefined } : { classifierModel: t };
+    }
+    const v = await ctx.ui.input(
+      "Classifier timeout in ms",
+      String(draft.classifierTimeoutMs ?? 8000),
+      { signal: ctx.signal },
+    );
+    if (v === undefined) return undefined;
+    if (v.trim() === "") throw new Error("enter a positive number of ms");
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 1 || n > MAX_CLASSIFIER_TIMEOUT_MS)
+      throw new Error(`timeout must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS} ms`);
+    return { classifierTimeoutMs: Math.round(n) };
   }
 
   // --- one option edit in the config UI; undefined = the user bailed ---
@@ -875,6 +1076,9 @@ export default function (pi: ExtensionAPI) {
         ],
       );
       return v === undefined ? undefined : { blockTerminates: v === "true" };
+    }
+    if (option.startsWith("classifier")) {
+      return editClassifierOption(ctx, option, draft);
     }
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",
@@ -1004,6 +1208,12 @@ export default function (pi: ExtensionAPI) {
       );
       lines.push(
         "Gate: irreversible-action rules (recursive rm, world-writable chmod, destructive git, remote destruction, …) are ALWAYS gated, sandboxed or not; raw host-disk operations are hard-blocked (human-only).",
+      );
+      const ct = effectiveThresholds(config);
+      lines.push(
+        config.classifier === "jev"
+          ? `Classifier: Jev ${config.classifierModel ?? DEFAULT_JEV_MODEL} (confirm ≥ ${ct.confirm}, deny ≥ ${ct.deny}; key ${process.env[TYPESAFE_API_KEY_ENV] ? "set" : "MISSING"}) — runs only when the static rules miss`
+          : "Classifier: off (static rules only)",
       );
       lines.push(
         config.blockTerminates
