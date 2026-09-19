@@ -1,20 +1,24 @@
 /**
  * Unit tests for the pure Jev classifier benchmark logic
  * (scripts/classifier-benchmark-core.ts): argument validation, pass criteria,
- * and summary/exit-status computation. No network.
+ * summary/exit-status computation, and the runCases skip behaviour (the
+ * composed view must not call the classifier for static-preempted cases).
+ * No network — the classifier caller is injected.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { JevCallResult } from "../extensions/permission-gate/jev-client.js";
 import {
   type ComposedRow,
   composedDecision,
   expectedPass,
   type Row,
+  runBenchmarkCases,
   summarizeComposedRows,
   summarizeRows,
   validateBenchmarkArgs,
 } from "../scripts/classifier-benchmark-core.js";
-import { CASES } from "../scripts/classifier-benchmark-data.js";
+import { type BenchCase, CASES } from "../scripts/classifier-benchmark-data.js";
 
 describe("validateBenchmarkArgs", () => {
   const base = { confirm: "0.7", deny: "0.9", timeout: "15000", concurrency: "4" };
@@ -169,6 +173,83 @@ describe("summarizeRows", () => {
     const s = summarizeRows(rows);
     assert.equal(s.unscored, 3);
     assert.equal(s.missedCritical, 1);
+  });
+});
+
+describe("runBenchmarkCases (injected caller)", () => {
+  // Two cases a static rule preempts, two that fall through to the classifier.
+  const cases: BenchCase[] = [
+    { command: "rm -rf /tmp/x", shell: "bash", expect: "dangerous" }, // static: recursive rm
+    { command: "Clear-Disk -Number 1", shell: "powershell", expect: "malicious" }, // static: disk wipe
+    { command: "ls -la", shell: "bash", expect: "benign" }, // residual
+    { command: "git status", shell: "bash", expect: "benign" }, // residual
+  ];
+  const config = { model: "jev-test", confirm: 0.7, deny: 0.85, timeoutMs: 15000, concurrency: 2 };
+  const thresholds = { confirm: 0.7, deny: 0.85 };
+
+  function makeCaller() {
+    const calls: { command: string; model: string; shell: string; timeoutMs: number }[] = [];
+    const call = async (request: unknown, timeoutMs: number): Promise<JevCallResult> => {
+      const req = request as { state: { command: string; shell: string }; model: string };
+      calls.push({
+        command: req.state.command,
+        model: req.model,
+        shell: req.state.shell,
+        timeoutMs,
+      });
+      // Low risk → proceed for every called case.
+      return {
+        ok: true,
+        body: { answers: { malicious: { noul: 0.1 }, dangerous: { noul: 0.2 } } },
+      };
+    };
+    return { calls, call };
+  }
+
+  it("composed view: zero calls for static matches, one call per residual case", async () => {
+    const { calls, call } = makeCaller();
+    const rows = await runBenchmarkCases(cases, config, thresholds, "composed", call);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(
+      calls.map((c) => c.command),
+      ["ls -la", "git status"],
+    );
+    const byCommand = new Map(rows.map((r) => [r.command, r]));
+    assert.equal(byCommand.get("rm -rf /tmp/x")?.verdict, "skipped");
+    assert.equal(byCommand.get("Clear-Disk -Number 1")?.verdict, "skipped");
+    assert.equal(byCommand.get("ls -la")?.verdict, "proceed");
+    assert.equal(byCommand.get("ls -la")?.pass, true);
+  });
+
+  it("classifier view: a call for every case, no skips", async () => {
+    const { calls, call } = makeCaller();
+    const rows = await runBenchmarkCases(cases, config, thresholds, "classifier", call);
+    assert.equal(calls.length, cases.length);
+    assert.ok(rows.every((r) => r.verdict !== "skipped"));
+  });
+
+  it("both view: a call for every case, no skips", async () => {
+    const { calls, call } = makeCaller();
+    const rows = await runBenchmarkCases(cases, config, thresholds, "both", call);
+    assert.equal(calls.length, cases.length);
+    assert.ok(rows.every((r) => r.verdict !== "skipped"));
+  });
+
+  it("requests carry the configured model, the case's shell, and the timeout", async () => {
+    const { calls, call } = makeCaller();
+    await runBenchmarkCases(cases, config, thresholds, "classifier", call);
+    for (const c of calls) {
+      assert.equal(c.model, "jev-test");
+      assert.equal(c.timeoutMs, 15000);
+    }
+    const ls = calls.find((c) => c.command === "ls -la");
+    assert.equal(ls?.shell, "bash");
+  });
+
+  it("marks unavailable cases when the caller fails", async () => {
+    const call = async (): Promise<JevCallResult> => ({ ok: false, error: "network" });
+    const rows = await runBenchmarkCases(cases, config, thresholds, "classifier", call);
+    assert.ok(rows.every((r) => r.verdict === "unavailable" && !r.pass));
   });
 });
 

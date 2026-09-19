@@ -4,9 +4,15 @@
  * `classifier-benchmark.ts`.
  */
 import { MAX_CLASSIFIER_TIMEOUT_MS } from "../extensions/lib/sandbox-utils.js";
-import { DEFAULT_JEV_MODEL } from "../extensions/permission-gate/classifier.js";
+import {
+  buildClassifierRequest,
+  DEFAULT_JEV_MODEL,
+  decideClassifier,
+  parseClassifierProbs,
+} from "../extensions/permission-gate/classifier.js";
+import type { JevCallResult } from "../extensions/permission-gate/jev-client.js";
 import { findStaticMatch } from "../extensions/permission-gate/rules.js";
-import type { Expectation } from "./classifier-benchmark-data.js";
+import type { BenchCase, Expectation } from "./classifier-benchmark-data.js";
 
 /**
  * The classifier's verdict for a case, an operational failure, or "skipped"
@@ -40,6 +46,88 @@ export type BenchConfig = {
   timeoutMs: number;
   concurrency: number;
 };
+
+/**
+ * Injectable classifier caller — the shape of `callJev` in
+ * `extensions/permission-gate/jev-client.ts`, minus the API key (the real
+ * client's key is captured by the CLI's wrapper). Tests inject a recorder/stub.
+ */
+export type ClassifierCaller = (request: unknown, timeoutMs: number) => Promise<JevCallResult>;
+
+/**
+ * Run the cases through the classifier with a bounded concurrency pool.
+ * In the composed view, cases a static rule preempts are marked "skipped"
+ * WITHOUT calling the classifier — mirroring production, where the classifier
+ * only runs on a static miss. The classifier/both views call every case.
+ * Pure apart from the injected `call`.
+ */
+export async function runBenchmarkCases(
+  cases: BenchCase[],
+  config: BenchConfig,
+  thresholds: { confirm: number; deny: number },
+  view: View,
+  call: ClassifierCaller,
+): Promise<Row[]> {
+  const rows: Row[] = new Array(cases.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < cases.length) {
+      const i = next++;
+      const c = cases[i];
+      if (view === "composed" && findStaticMatch(c.shell, c.command)) {
+        rows[i] = {
+          command: c.command,
+          expect: c.expect,
+          malicious: null,
+          dangerous: null,
+          verdict: "skipped",
+          pass: false,
+        };
+        continue;
+      }
+      const result = await call(
+        buildClassifierRequest(c.command, config.model, c.shell),
+        config.timeoutMs,
+      );
+      if (!result.ok) {
+        rows[i] = {
+          command: c.command,
+          expect: c.expect,
+          malicious: null,
+          dangerous: null,
+          verdict: "unavailable",
+          pass: false,
+        };
+        continue;
+      }
+      const probs = parseClassifierProbs(result.body);
+      if (!probs) {
+        rows[i] = {
+          command: c.command,
+          expect: c.expect,
+          malicious: null,
+          dangerous: null,
+          verdict: "malformed",
+          pass: false,
+        };
+        continue;
+      }
+      const verdict = decideClassifier(probs, thresholds).action;
+      rows[i] = {
+        command: c.command,
+        expect: c.expect,
+        malicious: probs.malicious,
+        dangerous: probs.dangerous,
+        verdict,
+        pass: expectedPass(c.expect, verdict),
+      };
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(config.concurrency, cases.length) }, () => worker()),
+  );
+  return rows;
+}
 
 export type ValidateResult = { ok: true; config: BenchConfig } | { ok: false; error: string };
 
