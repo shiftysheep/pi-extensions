@@ -11,9 +11,12 @@
  *      terraform/cdk/pulumi/vagrant/sam/serverless, az group delete,
  *      gcloud projects delete, docker volume rm/prune, kubectl delete
  *      namespace, aws s3 rm --recursive, repo delete, unpublish, DROP/
- *      TRUNCATE via known DB clients) — and, via a separate
+ *      TRUNCATE via known DB clients), download-to-shell pipes, and shell
+ *      payloads (`bash -c`/`eval` seen through: literal payloads re-gated
+ *      recursively, dynamic ones confirmed) — and, via a separate
  *      PowerShell rule set, dangerous cmdlets (recursive `Remove-Item`,
- *      elevation, `iex`, ACL changes, machine-wide registry writes).
+ *      elevation, `iex`, ACL changes, machine-wide registry writes,
+ *      `-EncodedCommand` decoded and re-gated).
  *    - DENY (hard block, human-only, NO prompt): raw host-disk destruction
  *      (`dd`/redirect/`tee`/`cp`/`shred` to /dev/*, wipefs, blkdiscard,
  *      partition wipes, LVM/ZFS destroy, mkfs; PowerShell disk wipes). The

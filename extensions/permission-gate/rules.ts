@@ -104,9 +104,11 @@ export function segments(command: string): string[] {
 }
 
 /** Extract the command word (minus env-var prefixes, `env` wrappers, and
- * path) and its args. Known limitation: other wrappers (nice/nohup/time,
- * scripts, quoting) still evade this — the gate is a heuristic, not a
- * security boundary. */
+ * path) and its args. Known limitation: scripts, quoting tricks, and
+ * interpreter one-liners still evade this — the gate is a heuristic, not a
+ * security boundary. (Benign wrappers nohup/nice/time/exec/command are
+ * unwrapped by commandChain, and shell -c/eval payloads by the payload
+ * tier in findDangerousRule.) */
 function commandOf(segment: string): { cmd: string; args: string[] } | undefined {
   const parts = segment.match(/\S+/g) ?? [];
   let i = 0;
@@ -249,47 +251,63 @@ function optionsBeforeTerminator(args: string[]): string[] {
   return dd === -1 ? args : args.slice(0, dd);
 }
 
+/** Operand-taking options for sudo/doas (pkexec takes none). -h is HOST for
+ * sudo, not help. -A (askpass) and -P (preserve-groups) are BOOLEAN. */
+const PRIV_OPTS_WITH_ARG = new Set([
+  "-u",
+  "--user",
+  "-g",
+  "--group",
+  "-C",
+  "--close",
+  "-D",
+  "--directory",
+  "-h",
+  "--host",
+  "-R",
+  "--chroot",
+  "-a",
+  "--ipv4-addr",
+  "--ipv6-addr",
+  "-p",
+  "--prompt",
+  "-T",
+  "--timestamp",
+]);
+
+/** Operand-taking options for the benign execution wrappers (nice/time). */
+const WRAP_OPTS_WITH_ARG = new Set(["-n", "--adjust-cpu-priority", "-p", "--pid", "-g", "--group"]);
+
+/** Benign execution wrappers the rules see through: the inner command is
+ * the real subject. `time`/`exec`/`command` are shell keywords as often as
+ * binaries; treating them as wrappers is safe either way. */
+const BENIGN_WRAPPERS = ["nohup", "nice", "time", "exec", "command"];
+
 /**
- * The command chain of a segment: the outer command plus, when it is a
- * privilege wrapper (sudo/doas/pkexec), the wrapped inner command. Lets the
- * deny tier see through `sudo dd of=/dev/sda` and friends. Unwraps from the
- * already env-normalized args; handles the common operand-taking options.
+ * The command chain of a segment: the outer command plus wrapped inner
+ * commands, through privilege wrappers (sudo/doas/pkexec) and benign
+ * execution wrappers (nohup/nice/time/exec/command). Lets the deny tier see
+ * through `sudo dd of=/dev/sda` and `nohup rm -rf /` and friends. Unwraps
+ * from the already env-normalized args; handles the common operand-taking
+ * options. Bounded to 3 hops.
  */
 function commandChain(segment: string): Array<{ cmd: string; args: string[] }> {
   const parsed = commandOf(segment);
   if (!parsed) return [];
   const chain = [parsed];
-  if (parsed.cmd === "sudo" || parsed.cmd === "doas" || parsed.cmd === "pkexec") {
-    // Operand-taking options for sudo/doas (pkexec takes none). -h is HOST
-    // for sudo, not help. -A (askpass) and -P (preserve-groups) are BOOLEAN.
-    const OPT_WITH_ARG = new Set([
-      "-u",
-      "--user",
-      "-g",
-      "--group",
-      "-C",
-      "--close",
-      "-D",
-      "--directory",
-      "-h",
-      "--host",
-      "-R",
-      "--chroot",
-      "-a",
-      "--ipv4-addr",
-      "--ipv6-addr",
-      "-p",
-      "--prompt",
-      "-T",
-      "--timestamp",
-    ]);
-    const args = parsed.args;
+  let current = parsed;
+  for (let hops = 0; hops < 3; hops++) {
+    const { cmd, args } = current;
+    const priv = cmd === "sudo" || cmd === "doas" || cmd === "pkexec";
+    if (!priv && !BENIGN_WRAPPERS.includes(cmd)) break;
+    const optWithArg = priv ? PRIV_OPTS_WITH_ARG : WRAP_OPTS_WITH_ARG;
     let i = 0;
     while (i < args.length && args[i].startsWith("-")) {
-      i += OPT_WITH_ARG.has(args[i]) ? 2 : 1;
+      i += optWithArg.has(args[i]) ? 2 : 1;
     }
-    if (i < args.length)
-      chain.push({ cmd: args[i].split("/").pop() ?? args[i], args: args.slice(i + 1) });
+    if (i >= args.length) break;
+    current = { cmd: args[i].split("/").pop() ?? args[i], args: args.slice(i + 1) };
+    chain.push(current);
   }
   return chain;
 }
@@ -472,6 +490,64 @@ const REMOTE_DESTRUCTION: readonly CatalogEntry[] = [
   },
 ];
 
+/** Shells whose `-c` payload (or bare stdin) is a new command surface. */
+const SHELL_CMDS = new Set(["bash", "sh", "dash", "zsh", "ksh"]);
+/** Downloaders whose piped output is code when it feeds a shell. */
+const DOWNLOADER_CMDS = new Set(["curl", "wget", "fetch", "axel", "aria2c"]);
+/** Recursion budget for the shell-payload tier (guards nested `bash -c`). */
+const MAX_PAYLOAD_DEPTH = 3;
+
+/**
+ * Drop the first `words` whitespace-delimited words of a segment and return
+ * the remainder, minus one layer of matching surrounding quotes. The payload
+ * is sliced from the RAW segment (not re-joined tokens) so nested quoting
+ * survives for the recursive re-gate.
+ */
+function payloadAfterWord(segment: string, words: number): string {
+  let rest = segment.trimStart();
+  for (let i = 0; i < words; i++) {
+    const m = /^\S+\s+/.exec(rest);
+    if (!m) return "";
+    rest = rest.slice(m[0].length);
+  }
+  const payload = rest.trim();
+  if (payload.length >= 2) {
+    const q = payload[0];
+    if ((q === "'" || q === '"') && payload.endsWith(q)) return payload.slice(1, -1);
+  }
+  return payload;
+}
+
+/**
+ * The literal payload of a shell-invocation segment, if any:
+ * `bash -c '…'` / `sh -c` / `zsh -lc` (payload = everything after the -c
+ * word) or `eval '…'`. commandOf identifies the command (env/path/
+ * wrapper-normalized); the payload offset is located on the raw tokens so
+ * env prefixes and extra flags are skipped correctly and the payload keeps
+ * its internal quoting for the recursive re-gate.
+ */
+function shellPayloadOf(segment: string): string | undefined {
+  const parsed = commandOf(segment);
+  if (!parsed) return undefined;
+  const { cmd, args } = parsed;
+  const parts = segment.match(/\S+/g) ?? [];
+  if (cmd === "eval") {
+    const wi = parts.findIndex((p) => p === "eval");
+    return wi === -1 ? undefined : payloadAfterWord(segment, wi + 1);
+  }
+  if (!SHELL_CMDS.has(cmd)) return undefined;
+  if (!args.some((a) => a === "-c" || a === "-lc")) return undefined;
+  const ci = parts.findIndex((p) => p === "-c" || p === "-lc");
+  if (ci === -1) return undefined;
+  return payloadAfterWord(segment, ci + 1);
+}
+
+/** True when a payload contains command substitution or process
+ * substitution — its effects cannot be judged from the literal text. */
+function payloadIsDynamic(payload: string): boolean {
+  return /\$\(|`|<\(/.test(payload);
+}
+
 const DB_DESTRUCTION: readonly CatalogEntry[] = [
   { cmds: ["mysqladmin"], sub: ["drop"] },
   { cmds: ["dropdb"] },
@@ -487,28 +563,32 @@ const RULES: GateRule[] = [
     // Irreversible even inside writable roots — always confirmed.
     name: "recursive rm",
     test: (command) =>
-      segments(command).some((seg) => {
-        const parsed = commandOf(seg);
-        if (parsed?.cmd !== "rm") return false;
-        // After `--`, args are literal operands (`rm -- -r` deletes a file
-        // named "-r"), not flags.
-        const dd = parsed.args.indexOf("--");
-        const opts = dd === -1 ? parsed.args : parsed.args.slice(0, dd);
-        return opts.some((a) => a === "--recursive" || /^-(?!-)[A-Za-z]*[rR]/.test(a));
-      }),
+      segments(command).some((seg) =>
+        commandChain(seg).some(({ cmd, args }) => {
+          if (cmd !== "rm") return false;
+          // After `--`, args are literal operands (`rm -- -r` deletes a file
+          // named "-r"), not flags.
+          const dd = args.indexOf("--");
+          const opts = dd === -1 ? args : args.slice(0, dd);
+          return opts.some((a) => a === "--recursive" || /^-(?!-)[A-Za-z]*[rR]/.test(a));
+        }),
+      ),
   },
   {
     // chmod making a file world-writable: 777/0777/000777 or a+/o+ ...w.
     // Irreversible-ish (permissions are hard to reconstruct) — always confirmed.
     name: "world-writable chmod",
     test: (command) =>
-      segments(command).some((seg) => {
-        const parsed = commandOf(seg);
-        if (parsed?.cmd !== "chmod") return false;
-        return parsed.args.some(
-          (a) => (Number.isInteger(Number(a)) && Number(a) % 1000 === 777) || /^(a|o)\+.*w/.test(a),
-        );
-      }),
+      segments(command).some((seg) =>
+        commandChain(seg).some(
+          ({ cmd, args }) =>
+            cmd === "chmod" &&
+            args.some(
+              (a) =>
+                (Number.isInteger(Number(a)) && Number(a) % 1000 === 777) || /^(a|o)\+.*w/.test(a),
+            ),
+        ),
+      ),
   },
   {
     // Privilege escalation as the command of any segment
@@ -589,40 +669,41 @@ const RULES: GateRule[] = [
     // confined by any sandbox — always confirmed.
     name: "destructive git operation",
     test: (command) =>
-      segments(command).some((seg) => {
-        const parsed = commandOf(seg);
-        if (parsed?.cmd !== "git") return false;
-        // Skip git GLOBAL options (before the subcommand); -C/-c/--git-dir/
-        // --work-tree/--namespace take an operand. (-p paginates: NO operand.)
-        const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
-        const args = parsed.args;
-        let i = 0;
-        while (i < args.length && args[i].startsWith("-")) {
-          i += GIT_OPT_WITH_ARG.has(args[i]) ? 2 : 1;
-        }
-        const [sub, ...rest] = args.slice(i);
-        if (sub === "push")
-          return rest.some(
-            (a) =>
-              a === "--force" ||
-              a === "--force-with-lease" ||
-              a.startsWith("--force-with-lease=") ||
-              a === "-f" ||
-              a === "--delete" ||
-              a.startsWith("+"),
-          );
-        if (sub === "reset") return rest.includes("--hard");
-        if (sub === "clean")
-          return rest.some((a) => a === "-f" || a === "--force" || /^-[a-z]*f/.test(a));
-        if (sub === "branch")
-          return (
-            rest.includes("-D") ||
-            (rest.includes("-d") && rest.includes("-f")) ||
-            rest.some((a) => /^-(?!-)[A-Za-z]+$/.test(a) && /[dD]/.test(a) && /f/.test(a)) ||
-            (rest.includes("--delete") && (rest.includes("-f") || rest.includes("--force")))
-          );
-        return sub === "filter-repo" || sub === "filter-branch";
-      }),
+      segments(command).some((seg) =>
+        commandChain(seg).some(({ cmd, args: parsedArgs }) => {
+          if (cmd !== "git") return false;
+          // Skip git GLOBAL options (before the subcommand); -C/-c/--git-dir/
+          // --work-tree/--namespace take an operand. (-p paginates: NO operand.)
+          const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+          const args = parsedArgs;
+          let i = 0;
+          while (i < args.length && args[i].startsWith("-")) {
+            i += GIT_OPT_WITH_ARG.has(args[i]) ? 2 : 1;
+          }
+          const [sub, ...rest] = args.slice(i);
+          if (sub === "push")
+            return rest.some(
+              (a) =>
+                a === "--force" ||
+                a === "--force-with-lease" ||
+                a.startsWith("--force-with-lease=") ||
+                a === "-f" ||
+                a === "--delete" ||
+                a.startsWith("+"),
+            );
+          if (sub === "reset") return rest.includes("--hard");
+          if (sub === "clean")
+            return rest.some((a) => a === "-f" || a === "--force" || /^-[a-z]*f/.test(a));
+          if (sub === "branch")
+            return (
+              rest.includes("-D") ||
+              (rest.includes("-d") && rest.includes("-f")) ||
+              rest.some((a) => /^-(?!-)[A-Za-z]+$/.test(a) && /[dD]/.test(a) && /f/.test(a)) ||
+              (rest.includes("--delete") && (rest.includes("-f") || rest.includes("--force")))
+            );
+          return sub === "filter-repo" || sub === "filter-branch";
+        }),
+      ),
   },
   {
     // Curated remote-destruction operations (best-effort; the catalog is
@@ -635,6 +716,25 @@ const RULES: GateRule[] = [
     name: "database destruction",
     test: (command) => segments(command).some((seg) => catalogMatches(DB_DESTRUCTION, seg)),
   },
+  {
+    // Download-and-execute: a downloader's output piped into a shell reading
+    // stdin (`curl … | bash`, `wget -qO- … | sh -s`). The payload is remote
+    // and unreadable — always confirmed.
+    name: "download to shell",
+    test: (command) => {
+      const segs = segments(command);
+      return segs.some((seg, i) => {
+        const parsed = commandOf(seg);
+        if (!parsed || !SHELL_CMDS.has(parsed.cmd)) return false;
+        const stdinOnly = parsed.args.length === 0 || parsed.args.every((a) => a === "-s");
+        if (!stdinOnly) return false;
+        return segs.slice(0, i).some((prev) => {
+          const p = commandOf(prev);
+          return p !== undefined && DOWNLOADER_CMDS.has(p.cmd);
+        });
+      });
+    },
+  },
 ];
 
 export type GateMatch = { name: string; disposition: RuleDisposition };
@@ -644,11 +744,27 @@ export type GateMatch = { name: string; disposition: RuleDisposition };
  * one, so the hardest rule is surfaced (e.g. `rm -rf build; dd of=/dev/sda`
  * is blocked as a raw device write, not merely confirmed as a recursive rm).
  * First match otherwise; undefined when nothing matches.
+ *
+ * When the static rules miss, a SHELL-PAYLOAD TIER sees through
+ * `bash -c '…'` / `eval '…'` into the payload: a literal payload is re-gated
+ * recursively (an inner deny stays a deny, a harmless payload stays silent),
+ * while a dynamic payload (command/process substitution) or an exhausted
+ * nesting budget is confirmed. `depth` is the recursion budget, not part of
+ * the public contract — callers gate the original command with depth 0.
  */
-export function findDangerousRule(command: string): GateMatch | undefined {
+export function findDangerousRule(command: string, depth = 0): GateMatch | undefined {
   const matches = RULES.filter((r) => r.test(command));
   const rule = matches.find((r) => r.disposition === "deny") ?? matches[0];
-  return rule ? { name: rule.name, disposition: rule.disposition ?? "confirm" } : undefined;
+  if (rule) return { name: rule.name, disposition: rule.disposition ?? "confirm" };
+  for (const seg of segments(command)) {
+    const payload = shellPayloadOf(seg);
+    if (payload === undefined || payload === "") continue;
+    if (depth >= MAX_PAYLOAD_DEPTH) return { name: "nested shell payload", disposition: "confirm" };
+    if (payloadIsDynamic(payload)) return { name: "dynamic shell payload", disposition: "confirm" };
+    const inner = findDangerousRule(payload, depth + 1);
+    if (inner) return inner;
+  }
+  return undefined;
 }
 
 /**
