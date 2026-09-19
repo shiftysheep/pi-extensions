@@ -124,7 +124,7 @@ If no runner is available at session start (no bwrap + no Landlock kernel/compil
 
 ### Managed (admin) scope
 
-A third, highest-precedence config file exists for fleet/corporate enforcement: `/etc/pi/agent/sandbox.json` (Windows: `%ProgramData%\pi\agent\sandbox.json`). Scalar keys there win outright — an admin can pin `"enabled": true` (and `failIfUnavailable`) so developers cannot turn the sandbox off or fail open; `"writable"` can only be **narrowed** (the effective list is the intersection with the lower scopes), never widened. A malformed managed file **fails closed** (commands are blocked until it is fixed); a malformed user-scope file does not defeat the managed policy — the managed policy is enforced alone, with a warning.
+A third, highest-precedence config file exists for fleet/corporate enforcement: `/etc/pi/agent/sandbox.json` (Windows: `%ProgramData%\pi\agent\sandbox.json`). Scalar keys there win outright — an admin can pin `"enabled": true` (and `failIfUnavailable`) so developers cannot turn the sandbox off or fail open; `"writable"` can only be **narrowed** (the effective list is the intersection with the lower scopes), never widened. A malformed managed file **fails closed** (commands are blocked until it is fixed). Scopes are read independently: a malformed user-scope file neither defeats the managed policy (managed keys still win outright) nor discards the other valid scopes — e.g. a broken project file cannot drop a global `failIfUnavailable: true`. The remaining valid scopes are applied, with a warning.
 
 ### Scope and limitations
 

@@ -98,6 +98,7 @@ import {
   applySandboxToggle,
   buildWritableRoots,
   canonicalizeTarget,
+  danglingSymlinkTarget,
   describeSandboxState,
   isInsideAnyRoot,
   MAX_CLASSIFIER_TIMEOUT_MS,
@@ -160,11 +161,11 @@ export type LoadedSandboxConfigs = {
   files: Record<SandboxScope, string>;
   /** Managed config file path (highest precedence). */
   managedFile: string;
-  /** Set when any scope file failed to parse/validate. */
+  /** Set when any scope file failed to parse/validate. `config` still holds
+   * the merge of the scopes that DID validate (scopes are read
+   * independently, so a broken project file cannot discard a valid global
+   * failIfUnavailable/enabled policy). Only {} when managed failed closed. */
   error?: string;
-  /** Advisory warning (e.g. a lower scope was invalid but the managed
-   * policy is enforced anyway). */
-  warning?: string;
   /** A malformed MANAGED file: fail closed — refuse to run without a
    * verified admin policy. */
   managedFailClosed?: boolean;
@@ -183,8 +184,10 @@ function readScopeConfig(file: string): SandboxConfig {
 function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandboxConfigs {
   const files = sandboxConfigFiles(cwd);
   const managedFile = managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA);
-  // The managed layer is read INDEPENDENTLY: a malformed user file must not
-  // drop the admin policy, and vice versa.
+  // Every scope is read INDEPENDENTLY: a malformed file must not discard the
+  // other scopes' validated policy (a broken project file must not drop a
+  // valid global failIfUnavailable, and a broken user file must not drop the
+  // admin policy).
   let managedConfig: SandboxConfig | undefined;
   let managedError: string | undefined;
   try {
@@ -192,47 +195,20 @@ function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandbox
   } catch (err) {
     managedError = String(err instanceof Error ? err.message : err);
   }
-  let globalConfig: SandboxConfig;
-  let projectConfig: SandboxConfig;
+  let globalConfig: SandboxConfig = {};
+  let projectConfig: SandboxConfig = {};
+  const lowerErrors: string[] = [];
   try {
     globalConfig = readScopeConfig(files.global);
-    projectConfig = projectTrusted ? readScopeConfig(files.project) : {};
   } catch (err) {
-    const lowerError = String(err instanceof Error ? err.message : err);
-    if (managedError) {
-      return {
-        config: {},
-        globalConfig: {},
-        projectConfig: {},
-        managedConfig: {},
-        files,
-        managedFile,
-        error: `${lowerError}; managed: ${managedError}`,
-        managedFailClosed: true,
-      };
+    lowerErrors.push(`global: ${String(err instanceof Error ? err.message : err)}`);
+  }
+  if (projectTrusted) {
+    try {
+      projectConfig = readScopeConfig(files.project);
+    } catch (err) {
+      lowerErrors.push(`project: ${String(err instanceof Error ? err.message : err)}`);
     }
-    if (managedConfig && Object.keys(managedConfig).length > 0) {
-      // A lower-scope error must not defeat managed enforcement: run the
-      // managed policy alone (fail-closed if it says so).
-      return {
-        config: applyManagedSandboxConfig({}, managedConfig),
-        globalConfig: {},
-        projectConfig: {},
-        managedConfig,
-        files,
-        managedFile,
-        warning: `${lowerError} — managed policy enforced instead`,
-      };
-    }
-    return {
-      config: {},
-      globalConfig: {},
-      projectConfig: {},
-      managedConfig: {},
-      files,
-      managedFile,
-      error: lowerError,
-    };
   }
   if (managedError) {
     // A malformed managed file fails closed: refuse to run without a
@@ -248,6 +224,9 @@ function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandbox
       managedFailClosed: true,
     };
   }
+  // Managed keys still win outright over the surviving lower scopes
+  // (applyManagedSandboxConfig), so a lower-scope error cannot defeat managed
+  // enforcement; the valid lower scopes simply fill the keys managed omits.
   return {
     config: applyManagedSandboxConfig(
       mergeSandboxConfigs(globalConfig, projectConfig),
@@ -258,6 +237,7 @@ function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandbox
     managedConfig: managedConfig ?? {},
     files,
     managedFile,
+    error: lowerErrors.length > 0 ? lowerErrors.join("; ") : undefined,
   };
 }
 
@@ -602,6 +582,45 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  /** Write-guard target predicates: a path "exists" for canonicalization if
+   * it stats OR is a dangling symlink (lstat sees the link even when its
+   * target is gone). canon resolves a dangling link LEXICALLY via readlink
+   * (realpathSync throws on it), so a link inside a writable root pointing
+   * outside is judged by its TARGET, not its link path. */
+  const targetExists = (p: string): boolean => {
+    try {
+      fs.statSync(p);
+      return true;
+    } catch {
+      try {
+        return fs.lstatSync(p).isSymbolicLink();
+      } catch {
+        return false;
+      }
+    }
+  };
+  const targetCanon = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      // realpathSync throws on a dangling symlink: resolve its target
+      // lexically instead (danglingSymlinkTarget), or keep the input.
+      return (
+        danglingSymlinkTarget(
+          p,
+          (q) => {
+            try {
+              return fs.lstatSync(q).isSymbolicLink();
+            } catch {
+              return false;
+            }
+          },
+          (q) => fs.readlinkSync(q),
+        ) ?? p
+      );
+    }
+  };
+
   /** Probe runners and build the policy for a merged config. */
   function computeState(
     cwd: string,
@@ -681,22 +700,26 @@ export default function (pi: ExtensionAPI) {
     // directory than the process started in, and the project config + writable
     // workspace root must key off the session's cwd.
     const loaded = loadSandboxConfigs(ctx.cwd, ctx.isProjectTrusted());
-    if (loaded.error) {
+    if (loaded.managedFailClosed) {
       state = {
         active: false,
         enabled: true,
         reason: `invalid config: ${loaded.error}`,
-        failClosed: loaded.managedFailClosed,
+        failClosed: true,
       };
       ctx.ui.notify(
-        loaded.managedFailClosed
-          ? `Sandbox config invalid (${loaded.error}) — fail-closed: commands are BLOCKED until the config is fixed`
-          : `Sandbox disabled: ${loaded.error}`,
+        `Sandbox config invalid (${loaded.error}) — fail-closed: commands are BLOCKED until the config is fixed`,
         "warning",
       );
       return;
     }
-    if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
+    // A malformed lower-scope file no longer disables the sandbox: the valid
+    // scopes (incl. any managed policy) are applied, with a warning.
+    if (loaded.error)
+      ctx.ui.notify(
+        `Sandbox config error: ${loaded.error} — applying the remaining valid scopes`,
+        "warning",
+      );
     applySandbox(loaded.config, ctx.ui, ctx.cwd, true, loaded.managedConfig);
   });
 
@@ -742,7 +765,15 @@ export default function (pi: ExtensionAPI) {
       // Containment must compare like-with-like: roots are canonicalized in
       // buildWritableRoots, so canonicalize the target the same way (deepest
       // existing ancestor + missing tail) or /tmp/file would miss /private/tmp.
-      if (isInsideAnyRoot(canonicalizeTarget(target, dirExists, canon), state.policy.writableRoots))
+      // targetExists/targetCanon (not dirExists/canon): a symlink to a file
+      // must resolve to its TARGET — a directory-only predicate would judge
+      // the link by its own name and approve links pointing outside.
+      if (
+        isInsideAnyRoot(
+          canonicalizeTarget(target, targetExists, targetCanon),
+          state.policy.writableRoots,
+        )
+      )
         return undefined;
       if (!ctx.hasUI) {
         return blocked(
@@ -1176,12 +1207,14 @@ export default function (pi: ExtensionAPI) {
     writeScopeConfig(file, draft);
     ctx.ui.notify(`sandbox config saved: ${file}`, "info");
     const reloaded = loadSandboxConfigs(ctx.cwd, trusted);
-    if (reloaded.error) {
-      // The save succeeded, but the OTHER scope file is invalid; keep the live
-      // state as-is rather than falling back to an empty config.
-      ctx.ui.notify(`Sandbox state unchanged: ${reloaded.error}`, "error");
-      return;
-    }
+    if (reloaded.error)
+      // The save succeeded, but the OTHER scope file is invalid; apply the
+      // merge of the valid scopes (managed still wins) rather than the
+      // broken file's absence defeating them.
+      ctx.ui.notify(
+        `Sandbox config error: ${reloaded.error} — applying the remaining valid scopes`,
+        "warning",
+      );
     applySandbox(reloaded.config, ctx.ui, ctx.cwd, true, reloaded.managedConfig);
   }
 
