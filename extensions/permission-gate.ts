@@ -18,7 +18,7 @@
  *      elevation, `iex`, ACL changes, machine-wide registry writes,
  *      `-EncodedCommand` decoded and re-gated).
  *    - DENY (hard block, human-only, NO prompt): raw host-disk destruction
- *      (`dd`/redirect/`tee`/`cp`/`shred` to /dev/*, wipefs, blkdiscard,
+ *      (`dd`/redirect/`tee`/`cp`/`mv`/`shred` to /dev/*, wipefs, blkdiscard,
  *      partition wipes, LVM/ZFS destroy, mkfs; PowerShell disk wipes). The
  *      agent must never perform these; the human runs them manually.
  *    Every match is gated REGARDLESS of sandbox state: the sandbox answers

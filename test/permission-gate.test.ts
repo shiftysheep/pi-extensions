@@ -587,6 +587,49 @@ describe("findStaticMatch (shell dispatch)", () => {
   });
 });
 
+describe("catalog additions (service stops, broad chown, mv to device)", () => {
+  it("confirms service lifecycle stops", () => {
+    for (const cmd of [
+      "systemctl stop postgres",
+      "systemctl --now disable x.service",
+      "systemctl mask sshd",
+      "systemctl kill docker",
+      "service nginx stop",
+      "service mysql shutdown",
+    ]) {
+      assert.equal(findDangerousRule(cmd)?.name, "service stop", cmd);
+      assert.equal(findDangerousRule(cmd)?.disposition, "confirm", cmd);
+    }
+  });
+  it("leaves non-stopping service commands ungated", () => {
+    for (const cmd of [
+      "systemctl status nginx",
+      "systemctl restart nginx",
+      "systemctl enable nginx",
+      "service nginx start",
+    ]) {
+      assert.equal(findDangerousRule(cmd), undefined, cmd);
+    }
+  });
+  it("confirms recursive chown on broad paths only", () => {
+    for (const cmd of ["chown -R root /", "chown -R user /etc", "chown --recursive u ~"])
+      assert.equal(findDangerousRule(cmd)?.name, "broad recursive chown", cmd);
+    for (const cmd of [
+      "chown -R root /tmp/build",
+      "chown root /etc/hosts",
+      "chown -R root /home/u/proj",
+    ]) {
+      assert.equal(findDangerousRule(cmd), undefined, cmd);
+    }
+  });
+  it("hard-blocks mv to a raw device", () => {
+    const m = findDangerousRule("mv image.bin /dev/sda");
+    assert.equal(m?.name, "raw device write (argument)");
+    assert.equal(m?.disposition, "deny");
+    assert.equal(findDangerousRule("mv a.txt /tmp/b.txt"), undefined);
+  });
+});
+
 describe("shell payload tier (bash -c / eval)", () => {
   it("re-gates a literal -c payload recursively", () => {
     assert.deepEqual(findDangerousRule("bash -c 'rm -rf /'"), {

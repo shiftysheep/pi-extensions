@@ -557,6 +557,38 @@ const DB_DESTRUCTION: readonly CatalogEntry[] = [
   },
 ];
 
+/**
+ * Service lifecycle stops: stopping/disabling/masking a service is a
+ * human-intent operation (outage risk); restarting is left ungated.
+ * `service` takes the unit FIRST and the action last (`service nginx stop`).
+ */
+const SERVICE_STOPS: readonly CatalogEntry[] = [
+  {
+    cmds: ["systemctl"],
+    sub: ["stop", "disable", "mask", "kill"],
+    positional: true,
+    optsWithArg: ["--root", "-H", "--host", "-M", "--machine"],
+  },
+  {
+    cmds: ["service"],
+    test: (args) => ["stop", "shutdown"].includes(args[args.length - 1] ?? ""),
+  },
+];
+
+/** Paths where a recursive ownership change is a system-wide act. */
+const BROAD_OWNERSHIP_PATHS = [
+  "/",
+  "/etc",
+  "/usr",
+  "/var",
+  "/boot",
+  "/home",
+  "/root",
+  "/opt",
+  "~",
+  "$HOME",
+];
+
 const RULES: GateRule[] = [
   {
     // rm with a recursive flag: -r, -R, -rf, -fr, -r -f, --recursive.
@@ -621,14 +653,14 @@ const RULES: GateRule[] = [
   },
   {
     // Writers taking a raw device as an argument: tee/shred (any target),
-    // cp (destination = last arg).
+    // cp/mv (destination = last arg).
     name: "raw device write (argument)",
     disposition: "deny",
     test: (command) =>
       segments(command).some((seg) =>
         commandChain(seg).some(({ cmd, args }) => {
           if (cmd === "tee" || cmd === "shred") return args.some(isUnsafeDevTarget);
-          if (cmd === "cp") {
+          if (cmd === "cp" || cmd === "mv") {
             const last = args[args.length - 1];
             return last !== undefined && isUnsafeDevTarget(last);
           }
@@ -715,6 +747,27 @@ const RULES: GateRule[] = [
     // Destructive SQL issued through a known database client.
     name: "database destruction",
     test: (command) => segments(command).some((seg) => catalogMatches(DB_DESTRUCTION, seg)),
+  },
+  {
+    // Service lifecycle stops (outage risk — human intent).
+    name: "service stop",
+    test: (command) => segments(command).some((seg) => catalogMatches(SERVICE_STOPS, seg)),
+  },
+  {
+    // Recursive ownership change on a system-wide path.
+    name: "broad recursive chown",
+    test: (command) =>
+      segments(command).some((seg) =>
+        commandChain(seg).some(({ cmd, args }) => {
+          if (cmd !== "chown") return false;
+          const dd = args.indexOf("--");
+          const opts = dd === -1 ? args : args.slice(0, dd);
+          const recursive = opts.some(
+            (a) => a === "-R" || a === "--recursive" || /^-(?!-)[A-Za-z]*R/.test(a),
+          );
+          return recursive && args.some((a) => BROAD_OWNERSHIP_PATHS.includes(a));
+        }),
+      ),
   },
   {
     // Download-and-execute: a downloader's output piped into a shell reading
