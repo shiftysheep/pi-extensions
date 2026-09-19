@@ -11,8 +11,9 @@
     "lint": "biome check",
     "format": "biome check --write",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/status-line.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
+    "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/permission-gate-classifier.test.ts test/classifier-benchmark.test.ts test/status-line.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
     "check": "biome check && tsc --noEmit && npm test",
+    "benchmark:classifier": "node --import tsx scripts/classifier-benchmark.ts",
     "commit": "cz",
     "commit:msg": "commitlint --edit",
     "precommit:install": "pre-commit install && pre-commit install -t commit-msg"

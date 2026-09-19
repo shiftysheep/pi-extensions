@@ -109,6 +109,49 @@ describe("parseSandboxConfig", () => {
   });
 });
 
+describe("parseSandboxConfig: classifier keys", () => {
+  const P = "/agent/sandbox.json";
+  it("accepts valid classifier settings", () => {
+    const cfg = parseSandboxConfig(
+      {
+        classifier: "jev",
+        classifierConfirmThreshold: 0.6,
+        classifierDenyThreshold: 0.95,
+        classifierModel: "jev-2",
+        classifierTimeoutMs: 5000,
+      },
+      P,
+    );
+    assert.equal(cfg.classifier, "jev");
+    assert.equal(cfg.classifierConfirmThreshold, 0.6);
+    assert.equal(cfg.classifierDenyThreshold, 0.95);
+    assert.equal(cfg.classifierModel, "jev-2");
+    assert.equal(cfg.classifierTimeoutMs, 5000);
+  });
+  it("rejects a non-finite or out-of-bounds timeout", () => {
+    assert.throws(
+      () => parseSandboxConfig({ classifierTimeoutMs: Infinity }, P),
+      /classifierTimeoutMs/,
+    );
+    assert.throws(() => parseSandboxConfig({ classifierTimeoutMs: 1e9 }, P), /classifierTimeoutMs/);
+    assert.throws(() => parseSandboxConfig({ classifierTimeoutMs: 0 }, P), /classifierTimeoutMs/);
+    assert.throws(() => parseSandboxConfig({ classifierTimeoutMs: 0.5 }, P), /classifierTimeoutMs/);
+  });
+  it("rejects out-of-range thresholds", () => {
+    assert.throws(
+      () => parseSandboxConfig({ classifierConfirmThreshold: 1.5 }, P),
+      /classifierConfirmThreshold/,
+    );
+    assert.throws(
+      () => parseSandboxConfig({ classifierDenyThreshold: -1 }, P),
+      /classifierDenyThreshold/,
+    );
+  });
+  it("rejects a bad classifier value", () => {
+    assert.throws(() => parseSandboxConfig({ classifier: "gpt" }, P), /classifier/);
+  });
+});
+
 describe("shellQuote", () => {
   it("wraps in single quotes", () => {
     assert.equal(shellQuote("ls -la"), "'ls -la'");

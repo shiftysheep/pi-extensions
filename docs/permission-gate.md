@@ -4,7 +4,7 @@ Heuristic guard: prompts for confirmation before potentially dangerous bash comm
 
 Optionally adds an **OS filesystem sandbox** (bubblewrap / Landlock on Linux, `sandbox-exec` on macOS) that makes the agent's bash commands read-only outside writable roots — opt-in via `sandbox.json` (global `~/.pi/agent/` or project `.pi/`). Toggle with `/sandbox on|off`, edit with `/sandbox config`.
 
-The gate alone is not a security boundary; the sandbox is an OS-level boundary.
+The gate alone is not a security boundary; the sandbox is an OS-level boundary. An optional **Jev danger classifier** (TypeSafe) can additionally screen commands the static rules miss — see [The Jev danger classifier](#the-jev-danger-classifier-opt-in).
 
 ## The gate (always on)
 
@@ -13,6 +13,53 @@ Every gate rule is armed **regardless of sandbox state**: the sandbox answers *w
 PowerShell commands are never sandboxed (there is no PowerShell sandbox backend) — they are guarded by the heuristic gate only, and `failIfUnavailable` blocks them solely when no runner can be resolved.
 
 **What happens when a call is blocked** (declined confirm, no UI available, hard deny, or fail-closed): by default the block reason is reported to the model as a tool error and the **turn continues**, so the model can read the reason and adapt (e.g. pick a different approach or tell you to run the human-only command manually). Set `"blockTerminates": true` in `sandbox.json` to restore the previous behavior, where a block stops the agent's turn after the current tool batch.
+
+## The Jev danger classifier (opt-in)
+
+A third, **optional** gate tier. When the static rules above do **not** match a command, the classifier asks TypeSafe's **Jev** model (a "System One" decision model) two yes/no questions — *is this command malicious?* and *is this command dangerous?* — in a single API call, and acts on the higher probability. It is the semantic safety net for commands the deterministic text rules miss (obscured or novel: `curl … | bash`, encoded payloads, data exfiltration, unusual privilege escalation). Like the static rules it is a **heuristic, not a security boundary** — it can be evaded, and its verdicts are probabilistic.
+
+The request gives Jev a named state containing both the original command and its shell (`bash` or `powershell`). The questions explicitly separate malicious intent from legitimate-but-dangerous administration and ask whether an autonomous agent should require human confirmation, including shell expansion and indirect targets.
+
+Off by default; enabling it makes **every** non-static-matched bash/PowerShell command pay a Jev round-trip (latency + API cost), so treat it as an opt-in for high-stakes sessions.
+
+> **Privacy:** when enabled, each screened command's text is sent to TypeSafe's API (`api.typesafe.ai`) for classification. Enable it only where that is acceptable.
+
+### Behavior
+
+- `risk = max(malicious, dangerous)`.
+- `risk ≥ classifierDenyThreshold` (default `0.85`) → **hard-block** (a model judgment, not a static rule — the message says so).
+- `risk ≥ classifierConfirmThreshold` (default `0.7`) → **confirm** prompt naming the concern(s) and probabilities.
+- otherwise → proceed.
+- **Fails open**: if `TYPESAFE_API_KEY` is unset, or the call errors / times out / returns a malformed body, the command proceeds (with a one-time warning) — the static tier still guards the hard cases. Pressing Esc during the call aborts it (no warning); in headless/print/JSON modes the one-time warning goes to stderr so stdout stays clean.
+
+### Config (`sandbox.json`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `classifier` | `"off"` | `"off"` = static rules only; `"jev"` = enable the Jev classifier. |
+| `classifierConfirmThreshold` | `0.7` | Probability at/above which a command prompts for confirmation. Clamped to never exceed the deny threshold. |
+| `classifierDenyThreshold` | `0.85` | Probability at/above which a command is hard-blocked. |
+| `classifierModel` | `"jev-latest"` | Jev model id. |
+| `classifierTimeoutMs` | `8000` | Per-call request timeout (ms), capped at `60000`. |
+
+The API key is read from the **`TYPESAFE_API_KEY` environment variable** — it is never stored in `sandbox.json`. All keys are editable in `/sandbox config` and shown in `/sandbox` status.
+
+### Benchmarking
+
+A dev/eval harness scores the gate against a labeled set of benign / dangerous / malicious commands (`scripts/classifier-benchmark-data.ts`) and reports per-command verdicts plus aggregate recall/false-positive rates. The corpus includes 124 duplicate-free Bash and PowerShell cases spanning routine development, repository history, services, local security/configuration, containers/orchestration, cloud/IaC, databases, disks, exfiltration, persistence, evasion, and encoded/reverse-shell execution. It needs a real `TYPESAFE_API_KEY` and network, so it is **not** part of `npm test` / `npm run check`:
+
+```bash
+npm run benchmark:classifier                                  # composed view (default): the real gate
+npm run benchmark:classifier -- --view classifier             # classifier alone (no static backstop)
+npm run benchmark:classifier -- --confirm 0.6 --deny 0.85     # tune thresholds
+npm run benchmark:classifier -- --json                        # machine-readable
+```
+
+Two views (`--view`):
+- **composed** (default) — the real gate: each case is routed by shell to its static rules first (bash vs PowerShell), and the classifier only runs on a miss. This shows the true residual gaps. Note a static *confirm* preempts the classifier, so the gate is non-monotonic — a static confirm can mask a classifier deny.
+- **classifier** — the classifier alone (no static backstop), for comparing models/prompts.
+
+Expectations: benign → proceed, dangerous → confirm/deny, malicious → deny. The run exits non-zero if any dangerous/malicious command is missed (the safety-critical failures); benign false-positives are reported but don't fail it. Extend the dataset in `scripts/classifier-benchmark-data.ts` to cover your threat model.
 
 ## The filesystem sandbox (opt-in)
 
@@ -55,7 +102,7 @@ All take effect immediately, no `/reload` needed:
 - `/sandbox` — live status (runner, writable roots, network policy, fallback reason, config paths).
 - `/sandbox on` — enable, writing the **project** scope; the runner defaults to `"auto"` (an explicit `runner` already set in either scope is kept).
 - `/sandbox off` — disable, writing the **project** scope (overrides a global `"enabled": true`).
-- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`, `failIfUnavailable`, `blockTerminates`, `writable`) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
+- `/sandbox config` — interactive editor: pick the scope (project or global), then edit any option (`enabled`, `runner`, `network`, `home`, `homeCaches`, `userCommands`, `loginShell`, `landlockHelper`, `failIfUnavailable`, `blockTerminates`, `writable`, and the classifier options) and save. For `writable`, an empty value stores `[]` — "no extra writable paths in this scope"; because the project scope wins per-key, a project `[]` overrides a non-empty global list (a global `[]` never overrides a project one). cwd, /tmp, /dev, /proc stay writable either way.
 
 ### Options
 
@@ -69,6 +116,9 @@ All take effect immediately, no `/reload` needed:
 - `landlockHelper` — explicit path to a prebuilt Landlock helper binary (Linux only). When set, the helper is used as-is and **no compilation happens** — useful in locked-down environments (no `cc`, or a `noexec` cache dir). A missing/unexecutable file fails the probe (no fallback to building). When unset, the helper compiles from `landlock-helper.c` on first use — after a SHA-256 source-integrity check — into `~/.cache/pi-extensions/pi-sandbox-landlock` (a `noexec` cache dir is detected and reported with an actionable message).
 - `failIfUnavailable` — `false` (default) or `true`. When the sandbox is `enabled` but no runner can be resolved, `false` warns and runs commands **unsandboxed** (fail-open — interactive/dev default); `true` **blocks** bash/powershell/write/edit instead (fail-closed — for enforced/fleet adoption, e.g. native Windows or Linux with unprivileged userns disabled).
 - `blockTerminates` — `false` (default) or `true`. Controls what happens after the gate **blocks** a call (declined confirm, no UI, hard deny, fail-closed): `false` reports the reason to the model as a tool error and the turn **continues**; `true` stops the agent's turn after the current tool batch (the pre-`blockTerminates` behavior).
+- `classifier` — `"off"` (default) or `"jev"`. Enables the optional Jev danger classifier (see [The Jev danger classifier](#the-jev-danger-classifier-opt-in)).
+- `classifierConfirmThreshold` / `classifierDenyThreshold` — Jev probability thresholds (defaults `0.7` / `0.85`) for confirm vs hard-block; confirm is clamped to never exceed deny.
+- `classifierModel` / `classifierTimeoutMs` — Jev model id (default `jev-latest`) and per-call request timeout in ms (default `8000`, capped at `60000`).
 
 If no runner is available at session start (no bwrap + no Landlock kernel/compiler, or a broken bwrap — e.g. AppArmor `restrict_unprivileged_userns` on some Ubuntu setups), the extension warns and runs commands **unsandboxed** — unless `failIfUnavailable: true`, in which case it **blocks** them (fail-closed).
 

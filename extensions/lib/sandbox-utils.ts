@@ -12,6 +12,9 @@ export type SandboxRunner = (typeof SANDBOX_RUNNERS)[number];
 export type SandboxRunnerChoice = "auto" | SandboxRunner | "none";
 export const SANDBOX_RUNNER_CHOICES = ["auto", "none", ...SANDBOX_RUNNERS] as const;
 
+/** Upper bound for the Jev classifier timeout (ms); guards against huge/overflowing delays. */
+export const MAX_CLASSIFIER_TIMEOUT_MS = 60_000;
+
 /** Config file scopes: global (~/.pi/agent) or project (<cwd>/.pi). */
 export type SandboxScope = "global" | "project";
 
@@ -27,6 +30,11 @@ export const SANDBOX_ALLOWED_KEYS = [
   "landlockHelper",
   "failIfUnavailable",
   "blockTerminates",
+  "classifier",
+  "classifierConfirmThreshold",
+  "classifierDenyThreshold",
+  "classifierModel",
+  "classifierTimeoutMs",
 ] as const;
 
 /**
@@ -112,6 +120,24 @@ export type SandboxConfig = {
    * model can read the reason and adapt instead of the turn dying.
    */
   blockTerminates?: boolean;
+  /**
+   * Optional LLM danger classifier (third gate tier). "off" (default) = static
+   * rules only. "jev" = when the static rules do NOT match, ask TypeSafe's Jev
+   * model whether the command is malicious/dangerous and confirm (or hard-block
+   * at a higher threshold) accordingly. Needs the TYPESAFE_API_KEY env var;
+   * without it the classifier is a no-op. Heuristic, not a security boundary.
+   */
+  classifier?: "off" | "jev";
+  /** Jev probability at/above which a command prompts for confirmation.
+   * Default 0.7. Clamped to never exceed classifierDenyThreshold. */
+  classifierConfirmThreshold?: number;
+  /** Jev probability at/above which a command is hard-blocked (a model
+   * judgment, not a static rule). Default 0.85. */
+  classifierDenyThreshold?: number;
+  /** Jev model id. Default "jev-latest". */
+  classifierModel?: string;
+  /** Per-call Jev request timeout, ms. Default 8000. */
+  classifierTimeoutMs?: number;
 };
 
 export type SandboxPolicy = {
@@ -269,6 +295,53 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
       throw new Error(`${configPath}: "blockTerminates" must be a boolean`);
     }
     config.blockTerminates = obj.blockTerminates;
+  }
+  if (obj.classifier !== undefined) {
+    if (obj.classifier !== "off" && obj.classifier !== "jev") {
+      throw new Error(`${configPath}: "classifier" must be "off" or "jev"`);
+    }
+    config.classifier = obj.classifier;
+  }
+  if (obj.classifierConfirmThreshold !== undefined) {
+    if (
+      typeof obj.classifierConfirmThreshold !== "number" ||
+      obj.classifierConfirmThreshold < 0 ||
+      obj.classifierConfirmThreshold > 1
+    ) {
+      throw new Error(
+        `${configPath}: "classifierConfirmThreshold" must be a number between 0 and 1`,
+      );
+    }
+    config.classifierConfirmThreshold = obj.classifierConfirmThreshold;
+  }
+  if (obj.classifierDenyThreshold !== undefined) {
+    if (
+      typeof obj.classifierDenyThreshold !== "number" ||
+      obj.classifierDenyThreshold < 0 ||
+      obj.classifierDenyThreshold > 1
+    ) {
+      throw new Error(`${configPath}: "classifierDenyThreshold" must be a number between 0 and 1`);
+    }
+    config.classifierDenyThreshold = obj.classifierDenyThreshold;
+  }
+  if (obj.classifierModel !== undefined) {
+    if (typeof obj.classifierModel !== "string" || obj.classifierModel.length === 0) {
+      throw new Error(`${configPath}: "classifierModel" must be a non-empty string`);
+    }
+    config.classifierModel = obj.classifierModel;
+  }
+  if (obj.classifierTimeoutMs !== undefined) {
+    if (
+      typeof obj.classifierTimeoutMs !== "number" ||
+      !Number.isFinite(obj.classifierTimeoutMs) ||
+      obj.classifierTimeoutMs < 1 ||
+      obj.classifierTimeoutMs > MAX_CLASSIFIER_TIMEOUT_MS
+    ) {
+      throw new Error(
+        `${configPath}: "classifierTimeoutMs" must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS}`,
+      );
+    }
+    config.classifierTimeoutMs = Math.round(obj.classifierTimeoutMs);
   }
   return config;
 }
