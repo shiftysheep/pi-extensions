@@ -16,8 +16,11 @@
  *
  * Views (--view): "composed" (default) = the real gate (static rules first,
  * classifier on a miss — shows the true residual gaps; a static confirm
- * preempts the classifier, so the gate is non-monotonic); "classifier" = the
- * classifier alone (for model/prompt comparison); "both" = both.
+ * preempts the classifier, so the gate is non-monotonic). The composed view
+ * only CALLS Jev on static misses (preempted cases are marked "skipped"), so
+ * it costs one API call per residual case; "classifier" = the classifier
+ * alone (every case is called, for model/prompt comparison); "both" = both
+ * (every case is called, so the classifier view is complete).
  *
  * Expectations: benign → proceed, dangerous → confirm/deny, malicious → deny.
  * The run exits non-zero if any dangerous/malicious command is not handled as
@@ -36,6 +39,7 @@ import {
   TYPESAFE_API_KEY_ENV,
 } from "../extensions/permission-gate/classifier.js";
 import { callJev } from "../extensions/permission-gate/jev-client.js";
+import { findStaticMatch } from "../extensions/permission-gate/rules.js";
 import {
   type BenchConfig,
   type BenchmarkSummary,
@@ -46,6 +50,8 @@ import {
   type Row,
   summarizeComposedRows,
   summarizeRows,
+  truncate,
+  type View,
   validateBenchmarkArgs,
 } from "./classifier-benchmark-core.js";
 import { CASES } from "./classifier-benchmark-data.js";
@@ -67,11 +73,17 @@ function printHelp(): void {
   );
 }
 
-/** Run every case through the classifier with a bounded concurrency pool. */
+/**
+ * Run the cases through the classifier with a bounded concurrency pool.
+ * In the composed view, cases a static rule preempts are marked "skipped"
+ * WITHOUT calling Jev — mirroring production, where the classifier only runs
+ * on a static miss. The classifier/both views call every case.
+ */
 async function runCases(
   apiKey: string,
   config: BenchConfig,
   thresholds: { confirm: number; deny: number },
+  view: View,
 ): Promise<Row[]> {
   const rows: Row[] = new Array(CASES.length);
   let next = 0;
@@ -79,6 +91,17 @@ async function runCases(
     while (next < CASES.length) {
       const i = next++;
       const c = CASES[i];
+      if (view === "composed" && findStaticMatch(c.shell, c.command)) {
+        rows[i] = {
+          command: c.command,
+          expect: c.expect,
+          malicious: null,
+          dangerous: null,
+          verdict: "skipped",
+          pass: false,
+        };
+        continue;
+      }
       const result = await callJev(buildClassifierRequest(c.command, config.model, c.shell), {
         apiKey,
         timeoutMs: config.timeoutMs,
@@ -129,7 +152,6 @@ function reportText(
   model: string,
   thresholds: { confirm: number; deny: number },
 ): void {
-  const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
   console.log(
     `\nJev classifier benchmark — model=${model} confirm≥${thresholds.confirm} deny≥${thresholds.deny}\n`,
   );
@@ -140,7 +162,7 @@ function reportText(
     const mal = r.malicious === null ? "-" : r.malicious.toFixed(2);
     const dang = r.dangerous === null ? "-" : r.dangerous.toFixed(2);
     console.log(
-      `${trunc(r.command, 52).padEnd(52)} ${r.expect.padEnd(10)} ${mal.padStart(5)} ${dang.padStart(5)} ${r.verdict.padEnd(11)} ${r.pass ? "ok" : "XX"}`,
+      `${truncate(r.command, 52).padEnd(52)} ${r.expect.padEnd(10)} ${mal.padStart(5)} ${dang.padStart(5)} ${r.verdict.padEnd(11)} ${r.pass ? "ok" : "XX"}`,
     );
   }
 
@@ -177,7 +199,6 @@ function reportComposed(
   model: string,
   thresholds: { confirm: number; deny: number },
 ): void {
-  const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
   console.log(
     `\nComposed gate benchmark (static rules first, classifier on misses) — model=${model} confirm≥${thresholds.confirm} deny≥${thresholds.deny}\n`,
   );
@@ -186,9 +207,9 @@ function reportComposed(
   console.log("-".repeat(header.length));
   for (const r of rows) {
     const src = r.source === "static" ? "static" : "classifier";
-    const rule = r.rule ? trunc(r.rule, 24) : "-";
+    const rule = r.rule ? truncate(r.rule, 24) : "-";
     console.log(
-      `${trunc(r.command, 52).padEnd(52)} ${r.shell.padEnd(11)} ${r.expect.padEnd(10)} ${src.padEnd(11)} ${rule.padEnd(24)} ${r.action.padEnd(11)} ${r.pass ? "ok" : "XX"}`,
+      `${truncate(r.command, 52).padEnd(52)} ${r.shell.padEnd(11)} ${r.expect.padEnd(10)} ${src.padEnd(11)} ${rule.padEnd(24)} ${r.action.padEnd(11)} ${r.pass ? "ok" : "XX"}`,
     );
   }
 
@@ -245,11 +266,12 @@ async function main(): Promise<void> {
   }
   const config = validation.config;
 
-  const view = values.view;
-  if (view !== "composed" && view !== "classifier" && view !== "both") {
-    console.error(`--view must be one of: composed, classifier, both (got "${view}")`);
+  const rawView = values.view;
+  if (rawView !== "composed" && rawView !== "classifier" && rawView !== "both") {
+    console.error(`--view must be one of: composed, classifier, both (got "${rawView}")`);
     process.exit(2);
   }
+  const view: View = rawView as View;
 
   const rawKey = process.env[TYPESAFE_API_KEY_ENV];
   if (!rawKey) {
@@ -262,7 +284,7 @@ async function main(): Promise<void> {
     classifierConfirmThreshold: config.confirm,
     classifierDenyThreshold: config.deny,
   });
-  const rows = await runCases(apiKey, config, thresholds);
+  const rows = await runCases(apiKey, config, thresholds, view);
   const summary = summarizeRows(rows);
 
   // Composed (real-usage) view: static rules first, classifier only on a miss.

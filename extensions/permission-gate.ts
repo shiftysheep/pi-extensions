@@ -127,9 +127,8 @@ import {
   parseClassifierProbs,
   TYPESAFE_API_KEY_ENV,
 } from "./permission-gate/classifier.js";
-import { callJev } from "./permission-gate/jev-client.js";
-import { findDangerousPowerShellRule } from "./permission-gate/powershell-rules.js";
-import { findDangerousRule } from "./permission-gate/rules.js";
+import { callJev, DEFAULT_CLASSIFIER_TIMEOUT_MS } from "./permission-gate/jev-client.js";
+import { findStaticMatch } from "./permission-gate/rules.js";
 import { resolveRunner } from "./permission-gate/runner.js";
 
 const SANDBOX_CONFIG_FILE = "sandbox.json";
@@ -373,6 +372,21 @@ const RUNNER_DESCRIPTIONS: Record<SandboxRunnerChoice, string> = {
   "sandbox-exec": "force macOS Seatbelt",
 };
 
+/** The classifier config keys, editable from the config menu. */
+const CLASSIFIER_OPTIONS = [
+  "classifier",
+  "classifierConfirmThreshold",
+  "classifierDenyThreshold",
+  "classifierModel",
+  "classifierTimeoutMs",
+] as const;
+type ClassifierOption = (typeof CLASSIFIER_OPTIONS)[number];
+
+/** Membership guard so the menu dispatch can't route a typo into the editor. */
+function isClassifierOption(option: string): option is ClassifierOption {
+  return (CLASSIFIER_OPTIONS as readonly string[]).includes(option);
+}
+
 /** The config menu rows: label = current value, description = dim hint. */
 function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
   return [
@@ -454,8 +468,8 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
     },
     {
       value: "classifierTimeoutMs",
-      label: `classifierTimeoutMs: ${draft.classifierTimeoutMs ?? 8000}`,
-      description: "per-call Jev request timeout in ms (default 8000)",
+      label: `classifierTimeoutMs: ${draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS}`,
+      description: `per-call Jev request timeout in ms (default ${DEFAULT_CLASSIFIER_TIMEOUT_MS})`,
     },
     { value: "save", label: "— save —", description: "write the config file and re-apply" },
     { value: "cancel", label: "— cancel —", description: "discard changes" },
@@ -758,7 +772,7 @@ export default function (pi: ExtensionAPI) {
     // --- heuristic gate (checked on the ORIGINAL command, before wrapping) ---
     // PowerShell has its own rule set: cmdlets/aliases/parameters differ
     // from bash, so it is NEVER routed through the bash tokenizer.
-    const match = isPowerShell ? findDangerousPowerShellRule(command) : findDangerousRule(command);
+    const match = findStaticMatch(isPowerShell ? "powershell" : "bash", command);
     if (match) {
       if (match.disposition === "deny") {
         return blocked(
@@ -885,70 +899,78 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Edit one classifier option; undefined = the user bailed. Kept separate so
-   *  editSandboxOption stays under the cognitive-complexity cap. */
+   *  editSandboxOption stays under the cognitive-complexity cap. Exhaustive:
+   *  a new ClassifierOption member is a compile error until handled here. */
   async function editClassifierOption(
     ctx: ExtensionCommandContext,
-    option: string,
+    option: ClassifierOption,
     draft: SandboxConfig,
   ): Promise<Partial<SandboxConfig> | undefined> {
-    if (option === "classifier") {
-      const v = await promptSelect(ctx, "Danger classifier", [
-        { value: "off", label: "off", description: "static rules only (default)" },
-        {
-          value: "jev",
-          label: "jev",
-          description: "ask TypeSafe Jev when the static rules miss (needs TYPESAFE_API_KEY)",
-        },
-      ]);
-      return v === undefined ? undefined : { classifier: v as "off" | "jev" };
+    switch (option) {
+      case "classifier": {
+        const v = await promptSelect(ctx, "Danger classifier", [
+          { value: "off", label: "off", description: "static rules only (default)" },
+          {
+            value: "jev",
+            label: "jev",
+            description: "ask TypeSafe Jev when the static rules miss (needs TYPESAFE_API_KEY)",
+          },
+        ]);
+        return v === undefined ? undefined : { classifier: v as "off" | "jev" };
+      }
+      case "classifierConfirmThreshold": {
+        const v = await ctx.ui.input(
+          "Classifier confirm threshold (0-1)",
+          String(draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD),
+          { signal: ctx.signal },
+        );
+        if (v === undefined) return undefined;
+        if (v.trim() === "") throw new Error("enter a number between 0 and 1");
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0 || n > 1)
+          throw new Error("confirm threshold must be a number between 0 and 1");
+        return { classifierConfirmThreshold: n };
+      }
+      case "classifierDenyThreshold": {
+        const v = await ctx.ui.input(
+          "Classifier deny threshold (0-1)",
+          String(draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD),
+          { signal: ctx.signal },
+        );
+        if (v === undefined) return undefined;
+        if (v.trim() === "") throw new Error("enter a number between 0 and 1");
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0 || n > 1)
+          throw new Error("deny threshold must be a number between 0 and 1");
+        return { classifierDenyThreshold: n };
+      }
+      case "classifierModel": {
+        const v = await ctx.ui.input(
+          "Classifier model id (empty = default jev-latest)",
+          draft.classifierModel ?? DEFAULT_JEV_MODEL,
+          { signal: ctx.signal },
+        );
+        if (v === undefined) return undefined;
+        const t = v.trim();
+        return t === "" ? { classifierModel: undefined } : { classifierModel: t };
+      }
+      case "classifierTimeoutMs": {
+        const v = await ctx.ui.input(
+          "Classifier timeout in ms",
+          String(draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS),
+          { signal: ctx.signal },
+        );
+        if (v === undefined) return undefined;
+        if (v.trim() === "") throw new Error("enter a positive number of ms");
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 1 || n > MAX_CLASSIFIER_TIMEOUT_MS)
+          throw new Error(`timeout must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS} ms`);
+        return { classifierTimeoutMs: Math.round(n) };
+      }
     }
-    if (option === "classifierConfirmThreshold") {
-      const v = await ctx.ui.input(
-        "Classifier confirm threshold (0-1)",
-        String(draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD),
-        { signal: ctx.signal },
-      );
-      if (v === undefined) return undefined;
-      if (v.trim() === "") throw new Error("enter a number between 0 and 1");
-      const n = Number(v);
-      if (!Number.isFinite(n) || n < 0 || n > 1)
-        throw new Error("confirm threshold must be a number between 0 and 1");
-      return { classifierConfirmThreshold: n };
-    }
-    if (option === "classifierDenyThreshold") {
-      const v = await ctx.ui.input(
-        "Classifier deny threshold (0-1)",
-        String(draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD),
-        { signal: ctx.signal },
-      );
-      if (v === undefined) return undefined;
-      if (v.trim() === "") throw new Error("enter a number between 0 and 1");
-      const n = Number(v);
-      if (!Number.isFinite(n) || n < 0 || n > 1)
-        throw new Error("deny threshold must be a number between 0 and 1");
-      return { classifierDenyThreshold: n };
-    }
-    if (option === "classifierModel") {
-      const v = await ctx.ui.input(
-        "Classifier model id (empty = default jev-latest)",
-        draft.classifierModel ?? DEFAULT_JEV_MODEL,
-        { signal: ctx.signal },
-      );
-      if (v === undefined) return undefined;
-      const t = v.trim();
-      return t === "" ? { classifierModel: undefined } : { classifierModel: t };
-    }
-    const v = await ctx.ui.input(
-      "Classifier timeout in ms",
-      String(draft.classifierTimeoutMs ?? 8000),
-      { signal: ctx.signal },
-    );
-    if (v === undefined) return undefined;
-    if (v.trim() === "") throw new Error("enter a positive number of ms");
-    const n = Number(v);
-    if (!Number.isFinite(n) || n < 1 || n > MAX_CLASSIFIER_TIMEOUT_MS)
-      throw new Error(`timeout must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS} ms`);
-    return { classifierTimeoutMs: Math.round(n) };
+    // Unreachable: the switch above is exhaustive over ClassifierOption.
+    const exhaustive: never = option;
+    return exhaustive;
   }
 
   // --- one option edit in the config UI; undefined = the user bailed ---
@@ -1077,7 +1099,7 @@ export default function (pi: ExtensionAPI) {
       );
       return v === undefined ? undefined : { blockTerminates: v === "true" };
     }
-    if (option.startsWith("classifier")) {
+    if (isClassifierOption(option)) {
       return editClassifierOption(ctx, option, draft);
     }
     const v = await ctx.ui.input(

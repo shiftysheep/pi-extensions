@@ -30,13 +30,14 @@ export type JevCallResult =
   | { ok: false; error: string; cancelled?: boolean };
 
 const DEFAULT_BASE_URL = "https://api.typesafe.ai";
-const DEFAULT_TIMEOUT_MS = 8000;
+/** Default per-call Jev timeout in ms — the single source of truth. */
+export const DEFAULT_CLASSIFIER_TIMEOUT_MS = 8000;
 
 /** POST a System One request to the Jev endpoint. Never throws. */
 export async function callJev(request: unknown, opts: JevCallOptions): Promise<JevCallResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   // Combine our timeout with any caller cancellation signal.

@@ -18,6 +18,8 @@
  * protections.
  */
 
+import { findDangerousPowerShellRule } from "./powershell-rules.js";
+
 export type RuleDisposition = "confirm" | "deny";
 
 export type GateRule = {
@@ -647,4 +649,17 @@ export function findDangerousRule(command: string): GateMatch | undefined {
   const matches = RULES.filter((r) => r.test(command));
   const rule = matches.find((r) => r.disposition === "deny") ?? matches[0];
   return rule ? { name: rule.name, disposition: rule.disposition ?? "confirm" } : undefined;
+}
+
+/**
+ * Static dispatch by shell: PowerShell has its own rule set (cmdlets/aliases
+ * differ from bash), so it is NEVER routed through the bash tokenizer.
+ * Single source of truth shared by the production gate and the benchmark,
+ * so the two cannot drift apart.
+ */
+export function findStaticMatch(
+  shell: "bash" | "powershell",
+  command: string,
+): GateMatch | undefined {
+  return shell === "powershell" ? findDangerousPowerShellRule(command) : findDangerousRule(command);
 }

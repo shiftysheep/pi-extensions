@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { findDangerousPowerShellRule } from "../extensions/permission-gate/powershell-rules.js";
-import { findDangerousRule } from "../extensions/permission-gate/rules.js";
+import { findDangerousRule, findStaticMatch } from "../extensions/permission-gate/rules.js";
 
 describe("recursive rm (always confirmed)", () => {
   it("matches recursive forms", () => {
@@ -556,5 +556,31 @@ describe("PowerShell rules", () => {
       "registry modification",
     );
     assert.equal(ps("Set-ItemProperty HKCU:\\Software\\X -Name Y -Value 1"), undefined);
+  });
+});
+
+describe("findStaticMatch (shell dispatch)", () => {
+  it("routes bash to the bash rules", () => {
+    assert.equal(findStaticMatch("bash", "rm -rf build")?.name, "recursive rm");
+    assert.equal(findStaticMatch("bash", "ls"), undefined);
+  });
+  it("routes powershell to the PowerShell rules, never the bash tokenizer", () => {
+    assert.equal(
+      findStaticMatch("powershell", "Remove-Item -Recurse -Force C:\\x")?.name,
+      "recursive Remove-Item",
+    );
+    assert.equal(findStaticMatch("powershell", "Get-ChildItem"), undefined);
+  });
+  it("mirrors the per-shell direct lookups", () => {
+    for (const cmd of [
+      "rm -rf build",
+      "sudo reboot",
+      "ls",
+      "Remove-Item -Recurse -Force C:\\x",
+      "Get-ChildItem",
+    ]) {
+      assert.deepEqual(findStaticMatch("bash", cmd), findDangerousRule(cmd), cmd);
+      assert.deepEqual(findStaticMatch("powershell", cmd), findDangerousPowerShellRule(cmd), cmd);
+    }
   });
 });
