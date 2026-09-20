@@ -9,8 +9,10 @@
  * Dispositions mirror rules.ts: "confirm" (default) asks before running;
  * "deny" hard-blocks raw disk destruction (human-only). Every match is
  * gated regardless of sandbox state. Like the bash gate, this is a
- * HEURISTIC prompt guard, not a security boundary: string manipulation,
- * encoding tricks, and indirect invocation can evade text matching.
+ * HEURISTIC prompt guard, not a security boundary: string manipulation and
+ * indirect invocation can evade text matching. `-EncodedCommand` is decoded
+ * and re-gated (and confirmed even when the decoded text is clean), so
+ * base64 encoding is not an escape hatch.
  *
  * PowerShell quirks handled: alias→cmdlet resolution (rm/del/ri/…),
  * case-insensitivity, parameter PREFIX matching (-Rec == -Recurse),
@@ -102,6 +104,33 @@ function hasParam(args: string[], name: string): boolean {
 }
 
 const REGISTRY_HIVE = /^(HKLM|HKCR|HKEY_LOCAL_MACHINE|HKEY_CLASSES_ROOT)([\\:]|$)/i;
+
+/**
+ * Extract the -EncodedCommand payload from a segment, if present. Returns
+ * undefined when no segment carries the parameter, the BASE64 string when
+ * parseable, or "" when the parameter is present but its value is not
+ * parseable (both present cases must confirm — see findDangerousPowerShellRule).
+ * The value token is matched RAW (base64 uses +/=, which the usual PS token
+ * regex drops); surrounding single/double quotes are tolerated.
+ */
+function encodedPayloadOf(command: string): string | undefined {
+  for (const seg of psSegments(command)) {
+    if (!/-EncodedCommand/i.test(seg)) continue;
+    const m = /-EncodedCommand\s*["']?([A-Za-z0-9+/=]+)["']?/.exec(seg);
+    return m ? m[1] : "";
+  }
+  return undefined;
+}
+
+/** Decode a PowerShell -EncodedCommand value (UTF-16LE base64). Returns
+ * undefined when the value is not valid base64 / not even-length UTF-16LE. */
+function decodeEncodedCommand(b64: string): string | undefined {
+  if (b64.length === 0 || b64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64))
+    return undefined;
+  const buf = Buffer.from(b64, "base64");
+  if (buf.length === 0 || buf.length % 2 !== 0) return undefined;
+  return buf.toString("utf16le");
+}
 
 /** True when a path argument points at a machine-wide registry hive
  * (provider prefix `Registry::` normalized away). */
@@ -198,9 +227,35 @@ const PS_RULES: PsRule[] = [
  * Returns the matching PowerShell rule to surface: a DENY match wins over a
  * confirm one (same precedence as findDangerousRule). Undefined when nothing
  * matches.
+ *
+ * -EncodedCommand is handled BEFORE the static rules and merged with them
+ * (deny still wins overall): the payload is decoded (UTF-16LE base64) and
+ * re-gated recursively, but a decoded STATIC MISS still confirms — encoded
+ * execution never means "safe". Undecodable values and exhausted nesting
+ * budgets confirm as well. `depth` bounds the recursion; callers pass 0.
  */
-export function findDangerousPowerShellRule(command: string): GateMatch | undefined {
+export function findDangerousPowerShellRule(command: string, depth = 0): GateMatch | undefined {
   const matches = PS_RULES.filter((r) => r.test(command));
   const rule = matches.find((r) => r.disposition === "deny") ?? matches[0];
-  return rule ? { name: rule.name, disposition: rule.disposition ?? "confirm" } : undefined;
+  const staticMatch: GateMatch | undefined = rule
+    ? { name: rule.name, disposition: rule.disposition ?? "confirm" }
+    : undefined;
+  const enc = encodedPayloadOf(command);
+  let encodedMatch: GateMatch | undefined;
+  if (enc !== undefined) {
+    if (depth < 2 && enc !== "") {
+      const decoded = decodeEncodedCommand(enc);
+      encodedMatch =
+        decoded !== undefined
+          ? (findDangerousPowerShellRule(decoded, depth + 1) ?? {
+              name: "encoded PowerShell execution",
+              disposition: "confirm",
+            })
+          : { name: "encoded PowerShell execution (undecodable)", disposition: "confirm" };
+    } else {
+      encodedMatch = { name: "encoded PowerShell execution", disposition: "confirm" };
+    }
+  }
+  const all = [staticMatch, encodedMatch].filter((m): m is GateMatch => m !== undefined);
+  return all.find((m) => m.disposition === "deny") ?? all[0];
 }

@@ -7,6 +7,8 @@
  * without a live session or a working sandbox runner.
  */
 
+import { dirname, resolve } from "node:path";
+
 export const SANDBOX_RUNNERS = ["bwrap", "landlock", "sandbox-exec"] as const;
 export type SandboxRunner = (typeof SANDBOX_RUNNERS)[number];
 export type SandboxRunnerChoice = "auto" | SandboxRunner | "none";
@@ -552,6 +554,12 @@ export function buildWritableRoots(
  * writable roots: resolve the deepest existing ancestor via realpath, then
  * append the missing trailing components lexically (the target may not exist
  * yet — e.g. a new file). Pure: fs injected.
+ *
+ * The `exists` predicate must report ANY existing path — files, directories,
+ * and (dangling) symlinks. A directory-only predicate makes a symlink to a
+ * file "not exist", so the walk stops at its PARENT and the link is judged
+ * by its own name instead of its target: a workspace symlink pointing outside
+ * would pass the containment check.
  */
 export function canonicalizeTarget(
   target: string,
@@ -560,6 +568,29 @@ export function canonicalizeTarget(
 ): string {
   const base = resolveExistingRoot(target, exists);
   return realpath(base) + target.slice(base.length);
+}
+
+/**
+ * Lexical target of a DANGLING symlink: readlink, with relative targets
+ * resolved against the link's directory. Returns undefined when `p` is not
+ * a symlink or the link cannot be read. Pure: fs injected.
+ *
+ * Needed because fs.realpathSync THROWS on a dangling link — without this,
+ * a dangling symlink inside a writable root pointing outside would be judged
+ * by its own (inside) path instead of its (outside) target.
+ */
+export function danglingSymlinkTarget(
+  p: string,
+  isSymlink: (p: string) => boolean,
+  readlink: (p: string) => string,
+): string | undefined {
+  try {
+    if (!isSymlink(p)) return undefined;
+    const linkTo = readlink(p);
+    return linkTo.startsWith("/") ? linkTo : resolve(dirname(p), linkTo);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -638,20 +669,23 @@ export function wrapWithBwrap(command: string, policy: SandboxPolicy, ctx: Runne
   // sandbox's own pid namespace.
   const proc = policy.writableRoots.includes("/proc") ? "--proc /proc " : "";
   const shellFlags = policy.loginShell ? "-lc" : "-c";
+  // Join fixed-width fragments only — NEVER normalize whitespace across the
+  // whole string: the shell-quoted payload must survive byte-for-byte
+  // (heredocs, newlines, and quoted multi-space are significant), and the
+  // gate checked exactly these bytes.
   return [
     "bwrap",
     "--ro-bind / /",
-    binds ? ` ${binds}` : "",
-    dev,
-    tmpfs,
+    binds,
+    dev.trim(),
+    tmpfs.trim(),
     "--unshare-user --unshare-pid",
-    proc,
-    net,
+    proc.trim(),
+    net.trim(),
     `-- ${ctx.shellPath} ${shellFlags} ${shellQuote(command)}`,
   ]
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .filter((part) => part.length > 0)
+    .join(" ");
 }
 
 /**

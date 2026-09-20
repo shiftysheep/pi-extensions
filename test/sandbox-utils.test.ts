@@ -11,6 +11,7 @@ import {
   buildSeatbeltProfile,
   buildWritableRoots,
   canonicalizeTarget,
+  danglingSymlinkTarget,
   describeSandboxState,
   isInsideAnyRoot,
   isInsideRoot,
@@ -318,6 +319,43 @@ describe("canonicalizeTarget", () => {
   it("falls back to the literal path when nothing exists", () => {
     assert.equal(canonicalizeTarget("/nope/way/nope/f", exists, rp), "/nope/way/nope/f");
   });
+  it("judges a symlink by its TARGET when the predicate sees the link", () => {
+    // Regression: a directory-only predicate makes a symlink-to-file
+    // "not exist", so the walk stops at the parent and the link is judged
+    // by its own (inside) name instead of its (outside) target.
+    const dirOnly = (p: string) => p === "/ws";
+    assert.equal(canonicalizeTarget("/ws/link", dirOnly, rp), "/ws/link");
+    // Fixed predicate: any existing path (incl. symlinks) counts, and
+    // realpath resolves the link to its target.
+    const anyExists = (p: string) => p === "/ws" || p === "/ws/link";
+    const rpLink = (p: string) => (p === "/ws/link" ? "/outside/secret" : rp(p));
+    assert.equal(canonicalizeTarget("/ws/link", anyExists, rpLink), "/outside/secret");
+  });
+});
+
+describe("danglingSymlinkTarget", () => {
+  const isLink = (p: string) => p === "/ws/dead" || p === "/ws/rel";
+  const links: Record<string, string> = {
+    "/ws/dead": "/outside/secret",
+    "/ws/rel": "../outside/data",
+  };
+  const readlink = (p: string): string => {
+    if (!(p in links)) throw new Error("not a symlink");
+    return links[p];
+  };
+  it("returns the absolute link target", () => {
+    assert.equal(danglingSymlinkTarget("/ws/dead", isLink, readlink), "/outside/secret");
+  });
+  it("resolves relative targets against the link's directory", () => {
+    assert.equal(danglingSymlinkTarget("/ws/rel", isLink, readlink), "/outside/data");
+  });
+  it("returns undefined for non-symlinks or unreadable links", () => {
+    assert.equal(danglingSymlinkTarget("/ws/plain", isLink, readlink), undefined);
+    const boom = (): string => {
+      throw new Error("unreadable");
+    };
+    assert.equal(danglingSymlinkTarget("/ws/dead", isLink, boom), undefined);
+  });
 });
 
 describe("isNoexecPath", () => {
@@ -414,6 +452,16 @@ describe("wrapWithBwrap", () => {
   it("uses -c when loginShell is false", () => {
     const cmd = wrapWithBwrap("ls", { ...policy, loginShell: false }, CTX);
     assert.ok(cmd.endsWith("-- /bin/bash -c 'ls'"));
+  });
+  it("preserves the payload byte-for-byte (heredocs, newlines, quoted spaces)", () => {
+    // Regression: a global whitespace normalization collapsed newlines INSIDE
+    // the quoted payload, so the executed command differed from the gated one.
+    const payload = "cat <<'EOF'\na  b\nEOF";
+    const cmd = wrapWithBwrap(payload, policy, CTX);
+    assert.ok(cmd.endsWith(`-- /bin/bash -lc ${shellQuote(payload)}`));
+    // The wrapper portion (before the payload) has no doubled spaces.
+    const wrapper = cmd.slice(0, cmd.lastIndexOf("-- "));
+    assert.ok(!wrapper.includes("  "));
   });
 });
 
