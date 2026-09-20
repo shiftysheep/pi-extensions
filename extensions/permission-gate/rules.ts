@@ -154,32 +154,80 @@ const SAFE_DEV_TARGETS = [
   "/dev/urandom",
 ];
 
-/** True for a /dev/* path that is a real device, not a harmless special file. */
+/** bash virtual network sockets: /dev/tcp/HOST/PORT, /dev/udp/HOST/PORT. */
+const NETSOCKET_RE = /^\/dev\/(tcp|udp)\//;
+
+/** True for a /dev/* path that is a real device, not a harmless special file.
+ * bash's virtual network sockets (/dev/tcp, /dev/udp) are NOT devices — a
+ * redirect there opens a connection; the "network socket redirect" rule
+ * confirms those instead of the raw-device deny tier. */
 function isUnsafeDevTarget(target: string): boolean {
   if (!target.startsWith("/dev/")) return false;
+  if (NETSOCKET_RE.test(target)) return false;
   return !SAFE_DEV_TARGETS.some((s) => target === s || target.startsWith(`${s}/`));
 }
 
 /**
- * Extract redirection targets from a segment, quote-aware. Handles >, >>,
- * >&, >|; skips escaped characters and quoted spans (a quoted EXAMPLE of a
- * redirect is not a redirect); parses the target as a shell word, so
- * concatenated quoting (`>'tmp'/dev/sda`) yields the literal `tmp/dev/sda`
- * and a fully quoted target (`>"/dev/sda"`) yields `/dev/sda`.
+ * Parse a redirection target word starting at `from` (just past the
+ * operator): skip whitespace, then read until whitespace or an unquoted
+ * redirection/separator operator or parenthesis. Quoted spans fold into the
+ * target literally (`>'tmp'/dev/sda` → `tmp/dev/sda`); a backslash escapes
+ * the next character outside single quotes. Returns the target text and the
+ * index just past it.
  */
+function parseRedirectTarget(segment: string, from: number): { target: string; end: number } {
+  let j = from;
+  while (j < segment.length && /\s/.test(segment[j])) j++;
+  let target = "";
+  while (j < segment.length) {
+    const c = segment[j];
+    if (
+      /\s/.test(c) ||
+      c === ">" ||
+      c === "&" ||
+      c === "|" ||
+      c === ";" ||
+      c === "(" ||
+      c === ")" ||
+      c === "<"
+    )
+      break;
+    if (c === "'" || c === '"') {
+      const q = c;
+      j++;
+      while (j < segment.length && segment[j] !== q) {
+        if (q === '"' && segment[j] === "\\" && j + 1 < segment.length) j++;
+        target += segment[j] ?? "";
+        j++;
+      }
+      j++;
+      continue;
+    }
+    if (c === "\\" && j + 1 < segment.length) {
+      j++;
+      target += segment[j];
+      j++;
+      continue;
+    }
+    target += c;
+    j++;
+  }
+  return { target, end: j };
+}
+
+/** A redirection operator and its target word within a segment. */
+type Redirect = { op: string; target: string };
+
 /**
- * Extract redirection targets from a segment, quote-aware. Handles >, >>,
- * >&, >|; skips escaped characters and quoted spans (a quoted EXAMPLE of a
- * redirect is not a redirect; backslash is LITERAL inside single quotes).
- * Targets are shell words: they end at any whitespace or an unquoted
- * redirection/separator operator or parenthesis, so `cat >/tmp/out>/dev/sda`
- * yields two targets and an adjacent operator is reprocessed as the next
- * redirect. Parentheses matter: in `s=$(cmd 2>/dev/null)` the target is
- * `/dev/null`, NOT `/dev/null)` — a swallowed `)` would defeat the exact
- * safe-target match and false-positive on the most common idiom.
+ * All redirections in a segment, quote-aware, BOTH directions: `>`, `>>`,
+ * `>&`, `>|` (output) and `<`, `<>` (input). `<<` heredocs and `<<<`
+ * here-strings are skipped — their "targets" are delimiters or literals, not
+ * paths. Escaped characters and quoted spans are not redirections (a quoted
+ * EXAMPLE of a redirect is not a redirect). Parentheses matter: in
+ * `s=$(cmd 2>/dev/null)` the target is `/dev/null`, NOT `/dev/null)`.
  */
-function redirectTargets(segment: string): string[] {
-  const targets: string[] = [];
+function redirects(segment: string): Redirect[] {
+  const out: Redirect[] = [];
   let i = 0;
   while (i < segment.length) {
     const ch = segment[i];
@@ -197,52 +245,44 @@ function redirectTargets(segment: string): string[] {
       i++;
       continue;
     }
-    if (ch === ">") {
+    if (ch === ">" || ch === "<") {
       let j = i + 1;
-      if (segment[j] === ">") j++;
-      if (segment[j] === "&" || segment[j] === "|") j++;
-      while (j < segment.length && /\s/.test(segment[j])) j++;
-      let target = "";
-      while (j < segment.length) {
-        const c = segment[j];
-        if (
-          /\s/.test(c) ||
-          c === ">" ||
-          c === "&" ||
-          c === "|" ||
-          c === ";" ||
-          c === "(" ||
-          c === ")" ||
-          c === "<"
-        )
-          break;
-        if (c === "'" || c === '"') {
-          const q = c;
-          j++;
-          while (j < segment.length && segment[j] !== q) {
-            if (q === '"' && segment[j] === "\\" && j + 1 < segment.length) j++;
-            target += segment[j] ?? "";
-            j++;
-          }
-          j++;
+      let op = ch;
+      if (ch === "<") {
+        if (segment[j] === "<") {
+          // heredoc / here-string: delimiter or literal, not a path
+          i = j + 1;
           continue;
         }
-        if (c === "\\" && j + 1 < segment.length) {
+        if (segment[j] === ">") {
           j++;
-          target += segment[j];
-          j++;
-          continue;
+          op = "<>";
         }
-        target += c;
-        j++;
+      } else {
+        if (segment[j] === ">") {
+          j++;
+          op = ">>";
+        }
+        if (segment[j] === "&" || segment[j] === "|") {
+          j++;
+          op += segment[j];
+        }
       }
-      targets.push(target);
-      i = j;
+      const { target, end } = parseRedirectTarget(segment, j);
+      out.push({ op, target });
+      i = end;
       continue;
     }
     i++;
   }
-  return targets;
+  return out;
+}
+
+/** Output-redirection targets only (the raw-device deny rule's surface). */
+function redirectTargets(segment: string): string[] {
+  return redirects(segment)
+    .filter((r) => r.op.startsWith(">"))
+    .map((r) => r.target);
 }
 
 /** Option-sensitive check that ignores operands after a `--` terminator. */
@@ -650,6 +690,15 @@ const RULES: GateRule[] = [
     disposition: "deny",
     test: (command) =>
       segments(command).some((seg) => redirectTargets(seg).some(isUnsafeDevTarget)),
+  },
+  {
+    // bash virtual network sockets: `> /dev/tcp/H/P` (incl. `>&` and the
+    // classic `bash -i >& /dev/tcp/…` reverse shell), `<`/`<>` input forms,
+    // and /dev/udp. A NETWORK action requiring human intent — confirmed,
+    // not hard-blocked as a disk write (which it is not).
+    name: "network socket redirect",
+    test: (command) =>
+      segments(command).some((seg) => redirects(seg).some((r) => NETSOCKET_RE.test(r.target))),
   },
   {
     // Writers taking a raw device as an argument: tee/shred (any target),

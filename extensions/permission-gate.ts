@@ -11,7 +11,9 @@
  *      terraform/cdk/pulumi/vagrant/sam/serverless, az group delete,
  *      gcloud projects delete, docker volume rm/prune, kubectl delete
  *      namespace, aws s3 rm --recursive, repo delete, unpublish, DROP/
- *      TRUNCATE via known DB clients), download-to-shell pipes, and shell
+ *      TRUNCATE via known DB clients), download-to-shell pipes, service
+ *      stops, broad recursive chown, network socket redirects
+ *      (/dev/tcp, /dev/udp — incl. the reverse-shell form), and shell
  *      payloads (`bash -c`/`eval` seen through: literal payloads re-gated
  *      recursively, dynamic ones confirmed) — and, via a separate
  *      PowerShell rule set, dangerous cmdlets (recursive `Remove-Item`,
