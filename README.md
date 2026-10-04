@@ -15,7 +15,7 @@ Custom [pi](https://pi.dev) coding-agent extensions, with the recommended stack 
 
 ### Bundled recommended installs
 
-Six third-party packs (web search/fetch, subagents, question prompts, todo, fuzzy grep/find, Context7 docs) are bundled as npm dependencies — see [docs/bundled-packages.md](docs/bundled-packages.md).
+Five third-party packs (web search/fetch, subagents, question prompts, fuzzy grep/find, Context7 docs) are bundled as npm dependencies — see [docs/bundled-packages.md](docs/bundled-packages.md).
 
 ## Install
 
