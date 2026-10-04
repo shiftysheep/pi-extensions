@@ -79,8 +79,8 @@ describe("bwrap wrapper", () => {
     loginShell: true,
   };
 
-  function run(command: string) {
-    const wrapped = wrapWithBwrap(command, policy, {
+  function run(command: string, runPolicy = policy) {
+    const wrapped = wrapWithBwrap(command, runPolicy, {
       cwd: w,
       homeDir: os.homedir(),
       shellPath: "/bin/bash",
@@ -113,7 +113,13 @@ describe("bwrap wrapper", () => {
   });
 
   it("binds writable roots rw", () => {
-    const r = run(`echo hi > ${w}/a.txt && cat ${w}/a.txt`);
+    // The fixture is under os.tmpdir(); test this bind without the fresh /tmp
+    // mount, which is covered separately and would hide the nested workspace.
+    const rootBindPolicy = {
+      ...policy,
+      writableRoots: policy.writableRoots.filter((root) => root !== "/tmp"),
+    };
+    const r = run(`echo hi > ${w}/a.txt && cat ${w}/a.txt`, rootBindPolicy);
     assert.equal(r.status, 0, r.stderr);
     assert.ok(r.stdout.includes("hi"));
   });
