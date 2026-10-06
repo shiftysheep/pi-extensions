@@ -17,7 +17,8 @@ jobs:
       - run: npm run check
 
   # On merge to main: bump the version from the merged commits (feat -> minor,
-  # fix/chore -> patch, breaking -> major) and release via an automatic PR.
+  # fix/bug/hotfix/bump -> patch, breaking -> major; chore/docs do NOT bump)
+  # and release via an automatic PR.
   # cz infers the increment from conventional commits since the last tag; the
   # bump_message/tag_format come from .cz.toml.
   #
@@ -64,7 +65,20 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          uv run --with 'commitizen==4.18.*' cz bump --yes
+          # cz exits 21 (NO_INCREMENT) when the new commits are not bumpable
+          # (e.g. only chore:/docs: since the last tag, or the release commit
+          # of a release PR this push itself merged). That is a legitimate
+          # no-op, not a failure; any other non-zero exit must fail the job.
+          cz_out=$(uv run --with 'commitizen==4.18.*' cz bump --yes 2>&1) && rc=0 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            if [ "$rc" -eq 21 ] || printf '%s\n' "$cz_out" | grep -q 'NO_COMMITS_TO_BUMP'; then
+              echo "No bumpable commits since ${last_tag}; nothing to release."
+              exit 0
+            fi
+            printf '%s\n' "$cz_out" >&2
+            exit "$rc"
+          fi
+          printf '%s\n' "$cz_out"
           # cz created the release commit + tag locally. Ship the COMMIT on a
           # branch and merge it through a PR (direct pushes to main are
           # rejected). The tag is published only after the merge: a pushed tag
