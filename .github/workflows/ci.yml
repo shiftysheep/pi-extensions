@@ -16,6 +16,30 @@ jobs:
       - run: npm ci
       - run: npm run check
 
+  # Detect unused exports (dead code) after refactors.
+  dead-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: ts-prune (detect unused exports)
+        run: |
+          set -x
+          npx ts-prune extensions/**/*.ts test/**/*.ts scripts/**/*.ts \
+            --exclude test/ \
+            --exclude scripts/ \
+            > /tmp/ts-prune-output.txt
+          cat /tmp/ts-prune-output.txt
+          echo "---"
+          echo "Lines containing 'extensions/':"
+          grep "extensions/" /tmp/ts-prune-output.txt || echo "(none)"
+          echo "---"
+          echo "Lines containing 'extensions/' but NOT 'used in module' and NOT 'default':"
+          grep "extensions/" /tmp/ts-prune-output.txt | grep -v "used in module" | grep -v "default" || echo "(none)"
+
   # On merge to main: bump the version from the merged commits (feat -> minor,
   # fix/bug/hotfix/bump -> patch, breaking -> major; chore/docs do NOT bump)
   # and release via an automatic PR.
