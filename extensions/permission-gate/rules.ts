@@ -226,6 +226,31 @@ type Redirect = { op: string; target: string };
  * EXAMPLE of a redirect is not a redirect). Parentheses matter: in
  * `s=$(cmd 2>/dev/null)` the target is `/dev/null`, NOT `/dev/null)`.
  */
+/** Parse a redirect operator (> >> < <> >& >|) starting at index i.
+ * Returns the operator string and the index just past it. */
+function parseRedirectOp(segment: string, i: number): { op: string; next: number } {
+  const ch = segment[i];
+  let j = i + 1;
+  let op = ch;
+  if (ch === "<") {
+    if (segment[j] === "<") return { op: "<<", next: j + 1 }; // heredoc: not a path
+    if (segment[j] === ">") {
+      j++;
+      op = "<>";
+    }
+  } else {
+    if (segment[j] === ">") {
+      j++;
+      op = ">>";
+    }
+    if (segment[j] === "&" || segment[j] === "|") {
+      j++;
+      op += segment[j];
+    }
+  }
+  return { op, next: j };
+}
+
 function redirects(segment: string): Redirect[] {
   const out: Redirect[] = [];
   let i = 0;
@@ -246,29 +271,12 @@ function redirects(segment: string): Redirect[] {
       continue;
     }
     if (ch === ">" || ch === "<") {
-      let j = i + 1;
-      let op = ch;
-      if (ch === "<") {
-        if (segment[j] === "<") {
-          // heredoc / here-string: delimiter or literal, not a path
-          i = j + 1;
-          continue;
-        }
-        if (segment[j] === ">") {
-          j++;
-          op = "<>";
-        }
-      } else {
-        if (segment[j] === ">") {
-          j++;
-          op = ">>";
-        }
-        if (segment[j] === "&" || segment[j] === "|") {
-          j++;
-          op += segment[j];
-        }
+      const { op, next } = parseRedirectOp(segment, i);
+      if (op === "<<") {
+        i = next;
+        continue;
       }
-      const { target, end } = parseRedirectTarget(segment, j);
+      const { target, end } = parseRedirectTarget(segment, next);
       out.push({ op, target });
       i = end;
       continue;

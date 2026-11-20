@@ -452,83 +452,16 @@ export default function cronExtension(pi: ExtensionAPI): void {
     parameters: CronParamsSchema,
     async execute(_toolCallId, params: CronParams): Promise<CronResult> {
       switch (params.action) {
-        case "add": {
-          const name = params.name?.trim();
-          if (!name || !NAME_RE.test(name))
-            invalid(
-              "add requires a valid name: start with a letter/digit and use at most 64 letters, digits, spaces, or . _ : -.",
-            );
-          if (jobs.has(name))
-            invalid(`schedule "${name}" already exists; remove it first or choose another name.`);
-          if (jobs.size >= MAX_JOBS)
-            invalid(`cannot add another schedule; the limit is ${MAX_JOBS}.`);
-
-          const hasAt = typeof params.at === "string" && params.at.trim().length > 0;
-          const hasEvery = typeof params.every === "string" && params.every.trim().length > 0;
-          if (hasAt === hasEvery) invalid("add requires exactly one of at or every.");
-          const message = params.message?.trim();
-          if (!message) invalid("add requires a non-empty message.");
-          if (message.length > MAX_MESSAGE_LENGTH)
-            invalid(`message is too long; maximum is ${MAX_MESSAGE_LENGTH} characters.`);
-
-          const now = Date.now();
-          let trigger: CronTrigger;
-          if (hasAt) {
-            const atMs = parseAt(params.at!, now);
-            if (atMs <= now) invalid("one-shot time is already in the past.");
-            if (atMs - now > MAX_TIMER_DELAY_MS)
-              invalid("one-shot timestamps cannot be more than approximately 24 days away.");
-            trigger = { kind: "once", atMs };
-          } else {
-            const everyMs = parseEvery(params.every!);
-            trigger = { kind: "every", everyMs, anchorAt: now, nextRunAt: now + everyMs };
-          }
-
-          const job: CronJob = { name, trigger, message, paused: false, firedCount: 0 };
-          jobs.set(name, job);
-          persist();
-          arm(job, nextRunAt(job) - now);
-          return result(
-            `scheduled "${name}": ${describeJob(job)}\n> fires as: [cron:${name}] ${truncate(message, 160)}`,
-          );
-        }
-
+        case "add":
+          return handleAdd(params);
         case "list":
           return result(listText());
-
-        case "remove": {
-          const name = params.name?.trim();
-          if (!name) invalid("remove requires a name.");
-          if (!jobs.has(name)) invalid(`no schedule named "${name}".`);
-          disarm(name);
-          jobs.delete(name);
-          persist();
-          return result(`removed "${name}".`);
-        }
-
-        case "pause": {
-          const name = params.name?.trim();
-          const job = name ? jobs.get(name) : undefined;
-          if (!job) invalid(`no schedule named "${name ?? ""}".`);
-          if (!job.paused) {
-            job.paused = true;
-            disarm(job.name);
-            persist();
-          }
-          return result(`paused "${job.name}".`);
-        }
-
-        case "resume": {
-          const name = params.name?.trim();
-          const job = name ? jobs.get(name) : undefined;
-          if (!job) invalid(`no schedule named "${name ?? ""}".`);
-          job.paused = false;
-          const delay = Math.max(0, nextRunAt(job) - Date.now());
-          persist();
-          arm(job, delay);
-          return result(`resumed "${job.name}": ${describeJob(job)}.`);
-        }
-
+        case "remove":
+          return handleRemove(params);
+        case "pause":
+          return handlePause(params);
+        case "resume":
+          return handleResume(params);
         case "clear": {
           const count = jobs.size;
           clearTimers();
@@ -541,6 +474,83 @@ export default function cronExtension(pi: ExtensionAPI): void {
       }
     },
   });
+
+  /** /cron add: validate and create a new schedule. */
+  function handleAdd(params: CronParams): CronResult {
+    const name = params.name?.trim();
+    if (!name || !NAME_RE.test(name))
+      invalid(
+        "add requires a valid name: start with a letter/digit and use at most 64 letters, digits, spaces, or . _ : -.",
+      );
+    if (jobs.has(name))
+      invalid(`schedule "${name}" already exists; remove it first or choose another name.`);
+    if (jobs.size >= MAX_JOBS) invalid(`cannot add another schedule; the limit is ${MAX_JOBS}.`);
+
+    const hasAt = typeof params.at === "string" && params.at.trim().length > 0;
+    const hasEvery = typeof params.every === "string" && params.every.trim().length > 0;
+    if (hasAt === hasEvery) invalid("add requires exactly one of at or every.");
+    const message = params.message?.trim();
+    if (!message) invalid("add requires a non-empty message.");
+    if (message.length > MAX_MESSAGE_LENGTH)
+      invalid(`message is too long; maximum is ${MAX_MESSAGE_LENGTH} characters.`);
+
+    const now = Date.now();
+    let trigger: CronTrigger;
+    if (hasAt) {
+      const atMs = parseAt(params.at!, now);
+      if (atMs <= now) invalid("one-shot time is already in the past.");
+      if (atMs - now > MAX_TIMER_DELAY_MS)
+        invalid("one-shot timestamps cannot be more than approximately 24 days away.");
+      trigger = { kind: "once", atMs };
+    } else {
+      const everyMs = parseEvery(params.every!);
+      trigger = { kind: "every", everyMs, anchorAt: now, nextRunAt: now + everyMs };
+    }
+
+    const job: CronJob = { name, trigger, message, paused: false, firedCount: 0 };
+    jobs.set(name, job);
+    persist();
+    arm(job, nextRunAt(job) - now);
+    return result(
+      `scheduled "${name}": ${describeJob(job)}\n> fires as: [cron:${name}] ${truncate(message, 160)}`,
+    );
+  }
+
+  /** /cron remove: remove a schedule by name. */
+  function handleRemove(params: CronParams): CronResult {
+    const name = params.name?.trim();
+    if (!name) invalid("remove requires a name.");
+    if (!jobs.has(name)) invalid(`no schedule named "${name}".`);
+    disarm(name);
+    jobs.delete(name);
+    persist();
+    return result(`removed "${name}".`);
+  }
+
+  /** /cron pause: pause a schedule. */
+  function handlePause(params: CronParams): CronResult {
+    const name = params.name?.trim();
+    const job = name ? jobs.get(name) : undefined;
+    if (!job) invalid(`no schedule named "${name ?? ""}".`);
+    if (!job.paused) {
+      job.paused = true;
+      disarm(job.name);
+      persist();
+    }
+    return result(`paused "${job.name}".`);
+  }
+
+  /** /cron resume: resume a paused schedule. */
+  function handleResume(params: CronParams): CronResult {
+    const name = params.name?.trim();
+    const job = name ? jobs.get(name) : undefined;
+    if (!job) invalid(`no schedule named "${name ?? ""}".`);
+    job.paused = false;
+    const delay = Math.max(0, nextRunAt(job) - Date.now());
+    persist();
+    arm(job, delay);
+    return result(`resumed "${job.name}": ${describeJob(job)}.`);
+  }
 
   pi.registerCommand("cron", {
     description: "Show in-session cron schedules",

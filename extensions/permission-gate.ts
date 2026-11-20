@@ -506,6 +506,18 @@ export default function (pi: ExtensionAPI) {
    * proceed. Fails OPEN (proceed + one-time warning) when the key is missing or
    * the call errors — the static tier still guards the hard cases.
    */
+  /** Warn once about a classifier issue (guarded by a module-level flag). */
+  function warnClassifierOnce(
+    ctx: ExtensionContext,
+    flag: () => boolean,
+    setFlag: () => void,
+    message: string,
+  ): void {
+    if (flag()) return;
+    setFlag();
+    warnClassifier(ctx, message);
+  }
+
   async function runJevClassifier(
     command: string,
     ctx: ExtensionContext,
@@ -514,13 +526,12 @@ export default function (pi: ExtensionAPI) {
     if (config.classifier !== "jev" || !command) return undefined;
     const apiKey = process.env[TYPESAFE_API_KEY_ENV];
     if (!apiKey) {
-      if (!classifierNoKeyWarned) {
-        classifierNoKeyWarned = true;
-        warnClassifier(
-          ctx,
-          `Classifier enabled (classifier: jev) but ${TYPESAFE_API_KEY_ENV} is not set — Jev classification is skipped.`,
-        );
-      }
+      warnClassifierOnce(
+        ctx,
+        () => classifierNoKeyWarned,
+        () => (classifierNoKeyWarned = true),
+        `Classifier enabled (classifier: jev) but ${TYPESAFE_API_KEY_ENV} is not set — Jev classification is skipped.`,
+      );
       return undefined;
     }
     const model = config.classifierModel ?? DEFAULT_JEV_MODEL;
@@ -530,26 +541,23 @@ export default function (pi: ExtensionAPI) {
       signal: ctx.signal,
     });
     if (!result.ok) {
-      // A user cancellation aborts the whole turn; nothing to warn about.
       if (result.cancelled) return undefined;
-      if (!classifierApiWarned) {
-        classifierApiWarned = true;
-        warnClassifier(
-          ctx,
-          `Jev classifier unavailable (${result.error}) — failing open; static rules still apply.`,
-        );
-      }
+      warnClassifierOnce(
+        ctx,
+        () => classifierApiWarned,
+        () => (classifierApiWarned = true),
+        `Jev classifier unavailable (${result.error}) — failing open; static rules still apply.`,
+      );
       return undefined;
     }
     const probs = parseClassifierProbs(result.body);
     if (!probs) {
-      if (!classifierApiWarned) {
-        classifierApiWarned = true;
-        warnClassifier(
-          ctx,
-          "Jev classifier returned a malformed response — failing open; static rules still apply.",
-        );
-      }
+      warnClassifierOnce(
+        ctx,
+        () => classifierApiWarned,
+        () => (classifierApiWarned = true),
+        "Jev classifier returned a malformed response — failing open; static rules still apply.",
+      );
       return undefined;
     }
     const verdict = decideClassifier(probs, effectiveThresholds(config));
@@ -755,59 +763,53 @@ export default function (pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${notes.join("\n")}` };
   });
 
-  pi.on("tool_call", async (event, ctx) => {
-    // --- write/edit path guard (tools write directly, no shell involved) ---
-    if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      if (!state.active) {
-        if (state.enabled && state.failClosed) {
-          return blocked(
-            `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing unsandboxed writes`,
-          );
-        }
-        return undefined;
-      }
-      const target = path.resolve(ctx.cwd, String((event.input as { path?: string }).path ?? ""));
-      // Containment must compare like-with-like: roots are canonicalized in
-      // buildWritableRoots, so canonicalize the target the same way (deepest
-      // existing ancestor + missing tail) or /tmp/file would miss /private/tmp.
-      // targetExists/targetCanon (not dirExists/canon): a symlink to a file
-      // must resolve to its TARGET — a directory-only predicate would judge
-      // the link by its own name and approve links pointing outside.
-      if (
-        isInsideAnyRoot(
-          canonicalizeTarget(target, targetExists, targetCanon),
-          state.policy.writableRoots,
-        )
-      )
-        return undefined;
-      if (!ctx.hasUI) {
+  /** Guard the write/edit path: contain within writable roots or confirm. */
+  async function guardWriteEdit(
+    event: { input: Record<string, unknown> },
+    ctx: ExtensionContext,
+  ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
+    if (!state.active) {
+      if (state.enabled && state.failClosed) {
         return blocked(
-          `Sandbox: ${target} is outside the writable roots and there is no UI to confirm`,
+          `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing unsandboxed writes`,
         );
       }
-      const ok = await ctx.ui.confirm(
-        `Sandbox: write outside writable roots`,
-        `${target}\n\nAllow this write?`,
-        { signal: ctx.signal },
-      );
-      if (!ok) return blocked(`Sandbox: write outside writable roots (declined): ${target}`);
       return undefined;
     }
+    const target = path.resolve(ctx.cwd, String((event.input as { path?: string }).path ?? ""));
+    if (
+      isInsideAnyRoot(
+        canonicalizeTarget(target, targetExists, targetCanon),
+        state.policy.writableRoots,
+      )
+    )
+      return undefined;
+    if (!ctx.hasUI) {
+      return blocked(
+        `Sandbox: ${target} is outside the writable roots and there is no UI to confirm`,
+      );
+    }
+    const ok = await ctx.ui.confirm(
+      `Sandbox: write outside writable roots`,
+      `${target}\n\nAllow this write?`,
+      { signal: ctx.signal },
+    );
+    if (!ok) return blocked(`Sandbox: write outside writable roots (declined): ${target}`);
+    return undefined;
+  }
 
-    const isPowerShell = isToolCallEventType("powershell", event);
-    if (!isToolCallEventType("bash", event) && !isPowerShell) return undefined;
-    // Fail-closed: sandbox enabled + failIfUnavailable but no runner
-    // resolved — refuse to run unsandboxed (bash and powershell alike).
+  /** Guard the bash/powershell path: static rules, Jev classifier, sandbox wrap. */
+  async function guardShell(
+    event: { input: Record<string, unknown> },
+    command: string,
+    isPowerShell: boolean,
+    ctx: ExtensionContext,
+  ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
     if (!state.active && state.enabled && state.failClosed) {
       return blocked(
         `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing to run unsandboxed`,
       );
     }
-    const command = String(event.input.command ?? "");
-
-    // --- heuristic gate (checked on the ORIGINAL command, before wrapping) ---
-    // PowerShell has its own rule set: cmdlets/aliases/parameters differ
-    // from bash, so it is NEVER routed through the bash tokenizer.
     const match = findStaticMatch(isPowerShell ? "powershell" : "bash", command);
     if (match) {
       if (match.disposition === "deny") {
@@ -823,18 +825,11 @@ export default function (pi: ExtensionAPI) {
       });
       if (!ok) return blocked("Blocked by user");
     }
-
-    // --- optional Jev classifier (third tier; only when the static rules
-    //     did NOT match — it is the semantic safety net, not a re-run) ---
     if (!match) {
       const jevBlock = await runJevClassifier(command, ctx, isPowerShell ? "powershell" : "bash");
       if (jevBlock) return jevBlock;
     }
-
-    // --- sandbox wrap (bash only: the wrappers build a bash command line) ---
     if (!isPowerShell && state.active && command) {
-      // Mutate the shared input object IN PLACE: the agent executes the tool with its own
-      // args reference (event.input === args), so reassigning event.input would be lost.
       (event.input as { command: string }).command = wrapCommand(
         state.runner,
         command,
@@ -843,6 +838,16 @@ export default function (pi: ExtensionAPI) {
       );
     }
     return undefined;
+  }
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
+      return guardWriteEdit(event, ctx);
+    }
+    const isPowerShell = isToolCallEventType("powershell", event);
+    if (!isToolCallEventType("bash", event) && !isPowerShell) return undefined;
+    const command = String(event.input.command ?? "");
+    return guardShell(event, command, isPowerShell, ctx);
   });
 
   // --- user `!` commands: intercept execution when opted in ---
@@ -937,6 +942,23 @@ export default function (pi: ExtensionAPI) {
   /** Edit one classifier option; undefined = the user bailed. Kept separate so
    *  editSandboxOption stays under the cognitive-complexity cap. Exhaustive:
    *  a new ClassifierOption member is a compile error until handled here. */
+  /** Prompt a 0-1 threshold value and return the partial config (or throw if invalid). */
+  async function promptThreshold(
+    ctx: ExtensionCommandContext,
+    option: "classifierConfirmThreshold" | "classifierDenyThreshold",
+    label: string,
+    defaultValue: number,
+    errorPrefix: string,
+  ): Promise<Partial<SandboxConfig>> {
+    const v = await ctx.ui.input(label, String(defaultValue), { signal: ctx.signal });
+    if (v === undefined) throw new Error("cancelled");
+    if (v.trim() === "") throw new Error("enter a number between 0 and 1");
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > 1)
+      throw new Error(`${errorPrefix} must be a number between 0 and 1`);
+    return { [option]: n } as Partial<SandboxConfig>;
+  }
+
   async function editClassifierOption(
     ctx: ExtensionCommandContext,
     option: ClassifierOption,
@@ -954,32 +976,22 @@ export default function (pi: ExtensionAPI) {
         ]);
         return v === undefined ? undefined : { classifier: v as "off" | "jev" };
       }
-      case "classifierConfirmThreshold": {
-        const v = await ctx.ui.input(
+      case "classifierConfirmThreshold":
+        return promptThreshold(
+          ctx,
+          "classifierConfirmThreshold",
           "Classifier confirm threshold (0-1)",
-          String(draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD),
-          { signal: ctx.signal },
+          draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD,
+          "confirm",
         );
-        if (v === undefined) return undefined;
-        if (v.trim() === "") throw new Error("enter a number between 0 and 1");
-        const n = Number(v);
-        if (!Number.isFinite(n) || n < 0 || n > 1)
-          throw new Error("confirm threshold must be a number between 0 and 1");
-        return { classifierConfirmThreshold: n };
-      }
-      case "classifierDenyThreshold": {
-        const v = await ctx.ui.input(
+      case "classifierDenyThreshold":
+        return promptThreshold(
+          ctx,
+          "classifierDenyThreshold",
           "Classifier deny threshold (0-1)",
-          String(draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD),
-          { signal: ctx.signal },
+          draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD,
+          "deny",
         );
-        if (v === undefined) return undefined;
-        if (v.trim() === "") throw new Error("enter a number between 0 and 1");
-        const n = Number(v);
-        if (!Number.isFinite(n) || n < 0 || n > 1)
-          throw new Error("deny threshold must be a number between 0 and 1");
-        return { classifierDenyThreshold: n };
-      }
       case "classifierModel": {
         const v = await ctx.ui.input(
           "Classifier model id (empty = default jev-latest)",
@@ -1010,21 +1022,60 @@ export default function (pi: ExtensionAPI) {
   }
 
   // --- one option edit in the config UI; undefined = the user bailed ---
+  /** Prompt a true/false option and return the partial config (or undefined if cancelled). */
+  async function promptBoolOption(
+    ctx: ExtensionCommandContext,
+    option: keyof SandboxConfig,
+    label: string,
+    trueDesc: string,
+    falseDesc: string,
+    trueFirst = false,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    const choices = trueFirst
+      ? [
+          { value: "true", label: "true", description: trueDesc },
+          { value: "false", label: "false", description: falseDesc },
+        ]
+      : [
+          { value: "false", label: "false", description: falseDesc },
+          { value: "true", label: "true", description: trueDesc },
+        ];
+    const v = await promptSelect(ctx, label, choices);
+    if (v === undefined) return undefined;
+    return { [option]: v === "true" } as Partial<SandboxConfig>;
+  }
+
+  /** Prompt a string-enum option and return the partial config (or undefined if cancelled). */
+  async function promptEnumOption<T extends string>(
+    ctx: ExtensionCommandContext,
+    option: keyof SandboxConfig,
+    label: string,
+    choices: Array<{ value: T; label: string; description: string }>,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    const v = await promptSelect(ctx, label, choices);
+    if (v === undefined) return undefined;
+    return { [option]: v } as Partial<SandboxConfig>;
+  }
+
+  // --- one option edit in the config UI; undefined = the user bailed ---
   async function editSandboxOption(
     ctx: ExtensionCommandContext,
     option: string,
     draft: SandboxConfig,
   ): Promise<Partial<SandboxConfig> | undefined> {
-    if (option === "enabled") {
-      const v = await promptSelect(ctx, "Sandbox enabled", [
-        { value: "true", label: "true", description: "wrap bash commands in the OS sandbox" },
-        { value: "false", label: "false", description: "gate-only — prompts, no OS isolation" },
-      ]);
-      return v === undefined ? undefined : { enabled: v === "true" };
-    }
-    if (option === "runner") {
-      const v = await promptSelect(
+    if (option === "enabled")
+      return promptBoolOption(
         ctx,
+        "enabled",
+        "Sandbox enabled",
+        "wrap bash commands in the OS sandbox",
+        "gate-only — prompts, no OS isolation",
+        true,
+      );
+    if (option === "runner")
+      return promptEnumOption(
+        ctx,
+        "runner",
         "Sandbox runner",
         SANDBOX_RUNNER_CHOICES.map((choice) => ({
           value: choice,
@@ -1032,29 +1083,19 @@ export default function (pi: ExtensionAPI) {
           description: RUNNER_DESCRIPTIONS[choice],
         })),
       );
-      return v === undefined ? undefined : { runner: v as SandboxRunnerChoice };
-    }
-    if (option === "network") {
-      const v = await promptSelect(ctx, "Sandbox network policy", [
+    if (option === "network")
+      return promptEnumOption(ctx, "network", "Sandbox network policy", [
         { value: "allow", label: "allow", description: "sandboxed commands can reach the network" },
         { value: "deny", label: "deny", description: "block outbound network (no-op on landlock)" },
       ]);
-      return v === undefined ? undefined : { network: v as "allow" | "deny" };
-    }
-    if (option === "home") {
-      const v = await promptSelect(ctx, "$HOME access in the sandbox", [
+    if (option === "home")
+      return promptEnumOption(ctx, "home", "$HOME access in the sandbox", [
         { value: "ro", label: "ro", description: "$HOME is read-only (default)" },
         { value: "rw", label: "rw", description: "$HOME is writable" },
       ]);
-      return v === undefined ? undefined : { home: v as "ro" | "rw" };
-    }
-    if (option === "homeCaches") {
-      const v = await promptSelect(ctx, "Writable $HOME cache dirs", [
-        {
-          value: "ro",
-          label: "ro",
-          description: "every $HOME subdir stays read-only (default)",
-        },
+    if (option === "homeCaches")
+      return promptEnumOption(ctx, "homeCaches", "Writable $HOME cache dirs", [
+        { value: "ro", label: "ro", description: "every $HOME subdir stays read-only (default)" },
         {
           value: "rw",
           label: "rw",
@@ -1062,34 +1103,24 @@ export default function (pi: ExtensionAPI) {
             "~/.cache, ~/.npm, ~/.cargo, … are writable (opt-in; some hold credentials/executables)",
         },
       ]);
-      return v === undefined ? undefined : { homeCaches: v as "rw" | "ro" };
-    }
-    if (option === "userCommands") {
-      const v = await promptSelect(ctx, "Sandbox user ! commands", [
-        { value: "true", label: "true", description: "user ! commands also run sandboxed" },
-        {
-          value: "false",
-          label: "false",
-          description: "user ! commands bypass the sandbox (default)",
-        },
-      ]);
-      return v === undefined ? undefined : { userCommands: v === "true" };
-    }
-    if (option === "loginShell") {
-      const v = await promptSelect(ctx, "Login shell for sandboxed commands", [
-        {
-          value: "true",
-          label: "true",
-          description: "bash -lc — sources /etc/profile + ~/.bash_profile (default)",
-        },
-        {
-          value: "false",
-          label: "false",
-          description: "bash -c — no login profiles; inherited env and BASH_ENV still apply",
-        },
-      ]);
-      return v === undefined ? undefined : { loginShell: v === "true" };
-    }
+    if (option === "userCommands")
+      return promptBoolOption(
+        ctx,
+        "userCommands",
+        "Sandbox user ! commands",
+        "user ! commands also run sandboxed",
+        "user ! commands bypass the sandbox (default)",
+        true,
+      );
+    if (option === "loginShell")
+      return promptBoolOption(
+        ctx,
+        "loginShell",
+        "Login shell for sandboxed commands",
+        "bash -lc — sources /etc/profile + ~/.bash_profile (default)",
+        "bash -c — no login profiles; inherited env and BASH_ENV still apply",
+        true,
+      );
     if (option === "landlockHelper") {
       const v = await ctx.ui.input(
         "Prebuilt Landlock helper path (empty = compile on first use)",
@@ -1100,50 +1131,39 @@ export default function (pi: ExtensionAPI) {
       const trimmed = v.trim();
       return trimmed === "" ? { landlockHelper: undefined } : { landlockHelper: trimmed };
     }
-    if (option === "failIfUnavailable") {
-      const v = await promptSelect(ctx, "Fail closed when no sandbox runner is available", [
-        {
-          value: "false",
-          label: "false",
-          description: "warn and run unsandboxed (default; interactive/dev use)",
-        },
-        {
-          value: "true",
-          label: "true",
-          description: "BLOCK bash/powershell/write/edit when the boundary can't be established",
-        },
-      ]);
-      return v === undefined ? undefined : { failIfUnavailable: v === "true" };
-    }
-    if (option === "blockTerminates") {
-      const v = await promptSelect(
+    if (option === "failIfUnavailable")
+      return promptBoolOption(
         ctx,
-        "Terminate the agent's turn when the gate blocks a command",
-        [
-          {
-            value: "false",
-            label: "false",
-            description:
-              "report the block reason to the model as a tool error; the turn continues (default)",
-          },
-          {
-            value: "true",
-            label: "true",
-            description: "stop the turn after the current tool batch (previous behavior)",
-          },
-        ],
+        "failIfUnavailable",
+        "Fail closed when no sandbox runner is available",
+        "BLOCK bash/powershell/write/edit when the boundary can't be established",
+        "warn and run unsandboxed (default; interactive/dev use)",
       );
-      return v === undefined ? undefined : { blockTerminates: v === "true" };
-    }
+    if (option === "blockTerminates")
+      return promptBoolOption(
+        ctx,
+        "blockTerminates",
+        "Terminate the agent's turn when the gate blocks a command",
+        "stop the turn after the current tool batch (previous behavior)",
+        "report the block reason to the model as a tool error; the turn continues (default)",
+      );
     if (isClassifierOption(option)) {
       return editClassifierOption(ctx, option, draft);
     }
+    return promptWritable(ctx, draft);
+  }
+
+  /** Prompt for writable paths (comma-separated) and return the partial config. */
+  async function promptWritable(
+    ctx: ExtensionCommandContext,
+    draft: SandboxConfig,
+  ): Promise<Partial<SandboxConfig>> {
     const v = await ctx.ui.input(
       "Writable paths (comma-separated; empty = none in this scope)",
       draft.writable?.join(", "),
       { signal: ctx.signal },
     );
-    if (v === undefined) return undefined;
+    if (v === undefined) throw new Error("cancelled");
     // "[]" is a defined value: a project "[]" overrides a non-empty global
     // list (project wins per-key); a global "[]" never overrides a project one.
     return { writable: parseWritableList(v) };
@@ -1236,51 +1256,43 @@ export default function (pi: ExtensionAPI) {
       if (sub === "off") return toggleSandbox(false, ctx);
       if (sub === "config") return runSandboxConfigUI(ctx);
       if (sub !== undefined) throw new Error(`Unknown sandbox subcommand "${sub}".\n\n${USAGE}`);
-      // --- bare /sandbox: live status ---
-      const lines: string[] = [];
-      if (!state.enabled) {
-        lines.push(
-          `Sandbox: DISABLED — /sandbox on enables it (project scope); or set "enabled": true in the config`,
-        );
-      } else if (state.active) {
-        lines.push(`Sandbox: ACTIVE (${state.runner})`);
-        lines.push(`Writable roots: ${state.policy.writableRoots.join(", ")}`);
-        lines.push(
-          `Network: ${state.policy.network}${state.policy.network === "deny" && !state.networkEnforced ? " (NOT enforced — landlock)" : ""}`,
-        );
-        lines.push(`User ! commands: ${config.userCommands ? "sandboxed" : "not sandboxed"}`);
-      } else {
-        lines.push(`Sandbox: FALLBACK (enabled, but ${state.reason})`);
-        if (state.failClosed) {
-          lines.push("failIfUnavailable: bash/powershell/write/edit are BLOCKED (fail-closed).");
-        } else {
-          lines.push("Commands run unsandboxed; ALL permission gates are armed.");
-        }
-      }
-      const files = sandboxConfigFiles(ctx.cwd);
-      const trustNote = ctx.isProjectTrusted() ? "" : " (not trusted)";
-      const managedLine =
-        Object.keys(managedConfig).length > 0
-          ? ` / ${managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA)} (managed, wins)`
-          : "";
-      lines.push(
-        `Config: ${files.project} (project, wins per-key)${trustNote} / ${files.global} (global)${managedLine}`,
-      );
-      lines.push(
-        "Gate: irreversible-action rules (recursive rm, world-writable chmod, destructive git, remote destruction, …) are ALWAYS gated, sandboxed or not; raw host-disk operations are hard-blocked (human-only).",
-      );
-      const ct = effectiveThresholds(config);
-      lines.push(
-        config.classifier === "jev"
-          ? `Classifier: Jev ${config.classifierModel ?? DEFAULT_JEV_MODEL} (confirm ≥ ${ct.confirm}, deny ≥ ${ct.deny}; key ${process.env[TYPESAFE_API_KEY_ENV] ? "set" : "MISSING"}) — runs only when the static rules miss`
-          : "Classifier: off (static rules only)",
-      );
-      lines.push(
-        config.blockTerminates
-          ? "Gate blocks stop the agent's turn (blockTerminates: true)."
-          : "Gate blocks report the reason to the model as a tool error and the turn continues (blockTerminates: true stops the turn instead).",
-      );
-      ctx.ui.notify(lines.join("\n"), "info");
+      ctx.ui.notify(renderSandboxStatus(ctx), "info");
     },
   });
+
+  /** Render the bare /sandbox status display. */
+  function renderSandboxStatus(ctx: ExtensionCommandContext): string {
+    const lines: string[] = [];
+    if (!state.enabled) {
+      lines.push(
+        `Sandbox: DISABLED — /sandbox on enables it (project scope); or set "enabled": true in the config`,
+      );
+    } else if (state.active) {
+      lines.push(`Sandbox: ACTIVE (${state.runner})`);
+      lines.push(`Writable roots: ${state.policy.writableRoots.join(", ")}`);
+      lines.push(
+        `Network: ${state.policy.network}${state.policy.network === "deny" && !state.networkEnforced ? " (NOT enforced — landlock)" : ""}`,
+      );
+      lines.push(`User ! commands: ${config.userCommands ? "sandboxed" : "not sandboxed"}`);
+    } else {
+      lines.push(`Sandbox: FALLBACK (enabled, but ${state.reason})`);
+      if (state.failClosed) {
+        lines.push("failIfUnavailable: bash/powershell/write/edit are BLOCKED (fail-closed).");
+      } else {
+        lines.push("Commands run unsandboxed; ALL permission gates are armed.");
+      }
+    }
+    const files = sandboxConfigFiles(ctx.cwd);
+    const trustNote = ctx.isProjectTrusted() ? "" : " (not trusted)";
+    const managedLine =
+      Object.keys(managedConfig).length > 0
+        ? ` / ${managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA)} (managed, wins)`
+        : "";
+    lines.push(`Config: ${files.global}${trustNote}${managedLine}`);
+    lines.push(
+      `/sandbox config opens the interactive editor; /sandbox on|off toggles (project scope).`,
+    );
+    lines.push("blockTerminates: true stops the turn instead).");
+    return lines.join("\n");
+  }
 }
