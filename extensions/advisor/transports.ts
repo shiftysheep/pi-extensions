@@ -56,6 +56,41 @@ export type AdvisorConsultResult = {
 };
 
 /**
+ * Prepare the child's throwaway work dir: write the prompt (0600) and copy the
+ * host's model catalogs and auth.json (refresh tokens stripped, 0400). The
+ * child resolves the same model catalog as the host; extensions are not loaded.
+ */
+function prepareChildWorkDir(
+  workDir: string,
+  promptPath: string,
+  systemPrompt: string,
+  opts: { model: Model<any>; question: string; transcript: string; config?: AdvisorConfig },
+): void {
+  writeFileSync(
+    promptPath,
+    assembleChildPrompt(
+      systemPrompt,
+      assembleRequestText(opts.model, opts.question, opts.transcript, systemPrompt.length),
+    ),
+    { mode: 0o600 },
+  );
+  const hostAgentDir = getAgentDir();
+  for (const name of ["models.json", "models-store.json"]) {
+    const hostFile = join(hostAgentDir, name);
+    if (existsSync(hostFile)) {
+      copyFileSync(hostFile, join(workDir, name));
+      chmodSync(join(workDir, name), 0o600);
+    }
+  }
+  const hostAuth = join(hostAgentDir, "auth.json");
+  if (existsSync(hostAuth)) {
+    writeFileSync(join(workDir, "auth.json"), stripRefreshTokens(readFileSync(hostAuth, "utf8")), {
+      mode: 0o400,
+    });
+  }
+}
+
+/**
  * Run one advisor consultation in a child pi process. Both modes share the
  * transport: review mode spawns the child with --no-tools (a single model
  * call), explore mode with the read-only tool allowlist. Bounded by the
@@ -100,6 +135,7 @@ export async function consultWithChildProcess(opts: {
   const tools = opts.mode === "explore" ? ADVISOR_TOOLS : [];
   const workDir = mkdtempSync(join(tmpdir(), "pi-advisor-"));
   const promptPath = join(workDir, "prompt.txt");
+  prepareChildWorkDir(workDir, promptPath, systemPrompt, opts);
   // Test seam (see the opts.__test doc): fake spawn / mocked group-kill / short
   // margin, all defaulting to the real implementations (no production change).
   const spawnImpl =
@@ -239,47 +275,6 @@ export async function consultWithChildProcess(opts: {
   };
   const acc = new AdvisorEventAccumulator();
   try {
-    writeFileSync(
-      promptPath,
-      assembleChildPrompt(
-        systemPrompt,
-        assembleRequestText(opts.model, opts.question, opts.transcript, systemPrompt.length),
-      ),
-      { mode: 0o600 },
-    );
-    // The child resolves the same model catalog as the host: credentials and
-    // custom provider/model definitions (models.json, models-store.json) are
-    // copied over 0600. Extensions are still not loaded in the child.
-    const hostAgentDir = getAgentDir();
-    // Read-only model catalogs (custom providers / overrides): copy 0600 as-is.
-    for (const name of ["models.json", "models-store.json"]) {
-      const hostFile = join(hostAgentDir, name);
-      if (existsSync(hostFile)) {
-        copyFileSync(hostFile, join(workDir, name));
-        chmodSync(join(workDir, name), 0o600);
-      }
-    }
-    // auth.json: the credential store. The child's copy has its OAuth refresh
-    // tokens STRIPPED and is written 0400 (read-only). Stripping the refresh
-    // token is what actually protects the host: a refresh the child performs
-    // would rotate the token on the provider's side (invalidating the host's
-    // refresh token) before any local write, which a read-only file does not
-    // prevent. With no refresh token, the child uses its (pre-refreshed, fresh)
-    // access token directly; if it ever expires mid-run, the child's refresh
-    // fails cleanly and degrades to an auth error handled by the fallback
-    // chain, instead of corrupting the host's canonical credential. The
-    // read-only mode is defense-in-depth (the child can't persist anything).
-    const hostAuth = join(hostAgentDir, "auth.json");
-    if (existsSync(hostAuth)) {
-      writeFileSync(
-        join(workDir, "auth.json"),
-        stripRefreshTokens(readFileSync(hostAuth, "utf8")),
-        {
-          mode: 0o400,
-        },
-      );
-    }
-
     const args = buildChildPiArgs({
       provider: opts.model.provider,
       modelId: opts.model.id,
