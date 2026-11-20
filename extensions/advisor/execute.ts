@@ -1,0 +1,382 @@
+/**
+ * Advisor execution logic: the fallback-chain orchestration and per-candidate
+ * attempt. Extracted from advisor.ts so it can be unit-tested without a live
+ * ExtensionContext (the transport is injected via the consultWithChildProcess
+ * import, which tests can mock).
+ */
+
+import type { Model, Usage } from "@earendil-works/pi-ai";
+import type {
+  AgentToolResult,
+  AgentToolUpdateCallback,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  type AdvisorCandidate,
+  type AdvisorConfig,
+  type AdvisorReasoningEffort,
+  type AdvisorTarget,
+  addUsage,
+  buildCandidates,
+  capDiagnosticText,
+  composeAdviceText,
+  isReasoningEffort,
+  REASONING_EFFORTS,
+  remainingBudgetMs,
+  resolveConsultTimeoutMs,
+  timeoutPrefix,
+} from "../lib/advisor-utils.js";
+import { loadConfigSafe } from "./config.js";
+import { type AdvisorSlot, findModel, preRefreshProviderAuth } from "./models.js";
+import { sessionTranscript } from "./request.js";
+import {
+  type AdvisorConsultResult,
+  type AdvisorStatus,
+  consultWithChildProcess,
+} from "./transports.js";
+
+/**
+ * Terminal outcome of one candidate attempt. `terminal` outcomes end the
+ * consultation (the caller returns the built result); `failed` outcomes record
+ * a diagnostic and let the fallback chain advance to the next candidate.
+ */
+export type CandidateAttempt =
+  | { kind: "terminal"; result: AgentToolResult<Record<string, unknown>> }
+  | { kind: "failed"; failure: string };
+
+/**
+ * Build a terminal result from a consultation result, model label, source,
+ * status footer, status, prefix, mode, elapsed time, and usage.
+ */
+export function buildResult(
+  result: AdvisorConsultResult,
+  modelLabel: string,
+  source: string,
+  statusFooter: (status: string) => string,
+  status: AdvisorStatus,
+  prefix: string,
+  mode: string,
+  elapsedMs: number,
+  usage: Usage | undefined,
+): AgentToolResult<Record<string, unknown>> {
+  return {
+    content: [{ type: "text", text: composeAdviceText(prefix, result.text, statusFooter(status)) }],
+    details: {
+      model: modelLabel,
+      source,
+      status,
+      mode,
+      toolCalls: result.toolCalls,
+      modelRequests: result.modelRequests,
+      elapsedMs,
+    },
+    usage,
+  };
+}
+
+/**
+ * Attempt one candidate in the fallback chain: resolve the model, pre-refresh
+ * its OAuth credential, run the consultation in a child process, and classify
+ * the outcome. The shared absolute `deadline` bounds the whole chain, so an
+ * attempt that finds no remaining budget reports a skip without spawning.
+ *
+ * The `statusFooter` closure is built here (it captures the candidate's index,
+ * the chain's first target, and the caller's active model) so the terminal
+ * result carries the model-visible disclosure of who answered, whether the
+ * chain degraded, and whether independence was lost.
+ */
+export async function attemptCandidate(opts: {
+  candidate: AdvisorCandidate;
+  candidateIndex: number;
+  firstTarget: AdvisorTarget;
+  ctx: ExtensionContext;
+  mode: "review" | "explore";
+  question: string;
+  transcript: string;
+  effort: AdvisorReasoningEffort | undefined;
+  config: AdvisorConfig;
+  deadline: number;
+  timeoutMs: number;
+  signal: AbortSignal | undefined;
+  explicit: boolean;
+  onUpdate: AgentToolUpdateCallback | undefined;
+  /** Running usage total from prior attempts; the attempt adds its own. */
+  combinedUsage: Usage | undefined;
+  /**
+   * Internal test seam (used only by test/advisor-execute.test.ts). Lets a test
+   * inject a fake transport and a fake model resolver. All default to the real
+   * implementations, so production behaviour is unchanged. Never set elsewhere.
+   */
+  __test?: {
+    consultImpl?: typeof consultWithChildProcess;
+    findModelImpl?: typeof findModel;
+    preRefreshImpl?: typeof preRefreshProviderAuth;
+  };
+}): Promise<CandidateAttempt> {
+  const { candidate, candidateIndex, firstTarget, ctx, mode, question, transcript } = opts;
+  if (remainingBudgetMs(opts.deadline, performance.now()) <= 0) {
+    return {
+      kind: "failed",
+      failure: `${candidate.source}: skipped, consultation timed out before this attempt`,
+    };
+  }
+  const findModelImpl = opts.__test?.findModelImpl ?? findModel;
+  const preRefreshImpl = opts.__test?.preRefreshImpl ?? preRefreshProviderAuth;
+  const consultImpl = opts.__test?.consultImpl ?? consultWithChildProcess;
+  let model: Model<any>;
+  try {
+    model = findModelImpl(ctx, candidate.target);
+  } catch (error) {
+    return {
+      kind: "failed",
+      failure: `${candidate.source}: ${capDiagnosticText((error as Error).message)}`,
+    };
+  }
+
+  const modelLabel = `${model.provider}/${model.id}`;
+  // Best-effort pre-refresh of a near-expiry OAuth credential in the HOST's
+  // canonical credential store before the child copies auth.json, so the child
+  // inherits a fresh access token. The child's auth.json copy has its refresh
+  // token STRIPPED (see transports.ts), so the child can never perform a
+  // refresh — which is what protects the host's refresh token from being
+  // rotated server-side. A failure here just lets the child report its own
+  // auth error and fall back.
+  await preRefreshImpl(ctx, model.provider);
+  // Effort priority: tool-call override > per-model config > global default > medium.
+  const selectedEffort =
+    opts.effort ?? candidate.target.effort ?? opts.config.reasoningEffort ?? "medium";
+  const startedAt = Date.now();
+  try {
+    opts.onUpdate?.({
+      content: [
+        { type: "text", text: `Consulting ${modelLabel} (${candidate.source}, ${mode})...` },
+      ],
+      details: { model: modelLabel, source: candidate.source, mode },
+    });
+    // Both modes run in an isolated child pi process: no advisor model turn or
+    // tool call executes in the host process (privilege boundary, not a
+    // filesystem sandbox — the child's read tools reach what the OS user can).
+    const result = await consultImpl({
+      model,
+      modelLabel,
+      question,
+      transcript,
+      effort: selectedEffort,
+      cwd: ctx.cwd,
+      mode,
+      deadline: opts.deadline,
+      signal: opts.signal,
+      config: opts.config,
+      onUpdate: (update) => opts.onUpdate?.(update),
+    });
+    const elapsedMs = Date.now() - startedAt;
+    // Accumulate this attempt's usage into the running total (the result
+    // carries the total INCLUDING this attempt, matching the original behavior).
+    const totalUsage = result.usage
+      ? addUsage(opts.combinedUsage, result.usage)
+      : opts.combinedUsage;
+
+    // The footer is the model-visible disclosure: it always names who answered,
+    // whether the chain degraded, and whether independence was lost.
+    const flags: string[] = [];
+    if (candidateIndex > 0) {
+      flags.push(`fallbackFrom=${firstTarget.provider ?? "*"}/${firstTarget.model}`);
+    }
+    const selfReview =
+      ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
+    if (selfReview) flags.push("independent=false");
+    const statusFooter = (status: string) =>
+      `\n\n---\n[advisor: mode=${mode}, model=${modelLabel}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${flags.length > 0 ? `, ${flags.join(", ")}` : ""}${selfReview ? " — this advice came from the model already driving this session; treat it as self-review, not a second opinion" : ""}]`;
+
+    if (result.status === "aborted")
+      return {
+        kind: "terminal",
+        result: {
+          content: [{ type: "text", text: "Advisor consultation cancelled." }],
+          details: {
+            model: modelLabel,
+            source: candidate.source,
+            status: "aborted",
+            mode,
+            elapsedMs,
+          },
+          usage: totalUsage,
+        },
+      };
+    if (result.status === "timed_out") {
+      // A timeout is a terminal incomplete result, not a chain failure: the
+      // deadline is shared, so no later candidate could have had time anyway.
+      // Return the full (advice-capped) partial output with metrics and usage.
+      return {
+        kind: "terminal",
+        result: buildResult(
+          result,
+          modelLabel,
+          candidate.source,
+          statusFooter,
+          "timed_out",
+          timeoutPrefix(opts.mode, opts.timeoutMs, result.text),
+          mode,
+          elapsedMs,
+          totalUsage,
+        ),
+      };
+    }
+    return {
+      kind: "terminal",
+      result: buildResult(
+        result,
+        modelLabel,
+        candidate.source,
+        statusFooter,
+        "completed",
+        "",
+        mode,
+        elapsedMs,
+        totalUsage,
+      ),
+    };
+  } catch (error) {
+    if (opts.signal?.aborted) {
+      return {
+        kind: "terminal",
+        result: {
+          content: [{ type: "text", text: "Advisor consultation cancelled." }],
+          details: { model: modelLabel, source: candidate.source },
+        },
+      };
+    }
+    const message = capDiagnosticText(error instanceof Error ? error.message : String(error));
+    if (opts.explicit) throw new Error(`${modelLabel}: ${message}`);
+    return { kind: "failed", failure: `${candidate.source} (${modelLabel}): ${message}` };
+  }
+}
+
+/**
+ * Execute an advisor consultation: validate params, load config, build the
+ * candidate chain, resolve the timeout/deadline, assemble the transcript, and
+ * run the fallback chain via attemptCandidate. Returns the terminal result or
+ * throws if all candidates fail.
+ *
+ * `__test` is an internal test seam (used only by test/advisor-execute.test.ts)
+ * that lets a test inject fake implementations of loadConfigSafe, findModel,
+ * preRefreshProviderAuth, and consultWithChildProcess. All defaults to the real
+ * implementations, so production behaviour is unchanged. Never set elsewhere.
+ */
+export async function advisorExecute(
+  params: {
+    question: string;
+    provider?: string;
+    model?: string;
+    mode?: string;
+    effort?: string;
+    includeSession?: boolean;
+    timeoutMs?: number;
+  },
+  signal: AbortSignal | undefined,
+  onUpdate: AgentToolUpdateCallback | undefined,
+  ctx: ExtensionContext,
+  __test?: {
+    loadConfigImpl?: typeof loadConfigSafe;
+    findModelImpl?: typeof findModel;
+    preRefreshImpl?: typeof preRefreshProviderAuth;
+    consultImpl?: typeof consultWithChildProcess;
+  },
+): Promise<AgentToolResult<Record<string, unknown>>> {
+  if (params.effort !== undefined && !isReasoningEffort(params.effort)) {
+    throw new Error(
+      `Invalid advisor effort "${params.effort}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
+    );
+  }
+  const modeParam = params.mode ?? "review";
+  if (modeParam !== "review" && modeParam !== "explore") {
+    throw new Error(`Invalid advisor mode "${modeParam}". Expected "review" or "explore".`);
+  }
+  const mode: "review" | "explore" = modeParam;
+  if (
+    params.timeoutMs !== undefined &&
+    (typeof params.timeoutMs !== "number" ||
+      !Number.isFinite(params.timeoutMs) ||
+      params.timeoutMs <= 0)
+  ) {
+    throw new Error(
+      `Invalid advisor timeoutMs "${params.timeoutMs}". Expected a positive number of milliseconds (clamped to 30000..1800000).`,
+    );
+  }
+
+  const loadConfigImpl = __test?.loadConfigImpl ?? loadConfigSafe;
+  // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
+  const { config, loadError } = loadConfigImpl();
+  const { candidates, explicit } = buildCandidates({
+    provider: params.provider,
+    modelId: params.model,
+    config,
+    activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+  });
+  if (!explicit && candidates.length === 0) {
+    throw new Error(
+      "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
+    );
+  }
+  // Timeout priority: per-call > config > mode default (5 min review / 10 min explore),
+  // clamped to 30 s..30 min. The budget covers the WHOLE consultation, fallback
+  // chain included: every attempt (including its auth/session setup) runs against
+  // one shared absolute deadline, on a monotonic clock.
+  const timeoutMs = resolveConsultTimeoutMs({
+    perCall: params.timeoutMs,
+    config: config.timeoutMs,
+    mode,
+  });
+  const deadline = performance.now() + timeoutMs;
+  // Ground-truth default: no session content is sent unless explicitly requested.
+  const transcript = params.includeSession === true ? sessionTranscript(ctx) : "";
+  const failures: string[] = [];
+
+  // Each attempt starts with combinedUsage: undefined because the accumulation
+  // across attempts is a no-op in practice: a non-terminal attempt is a failure
+  // (the consultation threw, so there is no result.usage to add), and a terminal
+  // attempt's result carries its own usage. The only edge case where accumulation
+  // would matter is if result formatting (footer construction, buildResult) throws
+  // AFTER the consultation succeeds and adds result.usage to the local totalUsage —
+  // in that case the original code would have retained the usage in the mutable
+  // combinedUsage accumulator, but the new code discards it. This edge case is
+  // negligible (the footer is a template string that cannot realistically throw),
+  // so we pass undefined and let each attempt compute its own total from scratch.
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+    const attempt = await attemptCandidate({
+      candidate: candidates[candidateIndex],
+      candidateIndex,
+      firstTarget: candidates[0].target,
+      ctx,
+      mode,
+      question: params.question,
+      transcript,
+      effort: params.effort as AdvisorReasoningEffort | undefined,
+      config,
+      deadline,
+      timeoutMs,
+      signal,
+      explicit,
+      onUpdate,
+      combinedUsage: undefined,
+      __test: __test
+        ? {
+            findModelImpl: __test.findModelImpl,
+            preRefreshImpl: __test.preRefreshImpl,
+            consultImpl: __test.consultImpl,
+          }
+        : undefined,
+    });
+    if (attempt.kind === "terminal") {
+      return attempt.result;
+    }
+    failures.push(attempt.failure);
+  }
+
+  const configWarning = loadError
+    ? ` Note: advisor config was unreadable (${loadError}); run /advisor reset to recover.`
+    : "";
+  throw new Error(
+    `No usable advisor model (tried: ${candidates.map((c) => c.source).join(" → ")}). ${failures.join("; ")}${configWarning}`,
+  );
+}
