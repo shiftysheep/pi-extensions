@@ -1,11 +1,11 @@
 /**
  * Executor-level tests for advisorExecute and attemptCandidate (execute.ts).
  *
- * These tests verify the fallback-chain orchestration, the usage accumulation,
- * the disclosure flags (fallbackFrom, independent=false), and the error paths
- * (explicit lookup failure vs consultation failure, transport-returned abort
- * vs thrown cancellation). They use the __test seam to inject fake
- * implementations of loadConfigSafe, findModel, preRefreshProviderAuth, and
+ * These tests verify the fallback-chain orchestration, the disclosure flags
+ * (fallbackFrom, independent=false), and the error paths (explicit lookup
+ * failure vs consultation failure, transport-returned abort vs thrown
+ * cancellation). They use the __test seam to inject fake implementations of
+ * loadConfigSafe, findModel, preRefreshProviderAuth, and
  * consultWithChildProcess, so no live ExtensionContext or child process is
  * needed.
  */
@@ -74,7 +74,6 @@ describe("advisorExecute", () => {
   it("primary failure → fallback success, with usage and fallbackFrom disclosure", async () => {
     const primaryModel = fakeModel("openai", "gpt-4");
     const fallbackModel = fakeModel("anthropic", "claude-3");
-    const primaryUsage = fakeUsage(100, 50);
     const fallbackUsage = fakeUsage(200, 100);
 
     const consultCalls: string[] = [];

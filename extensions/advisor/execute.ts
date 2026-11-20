@@ -1,8 +1,5 @@
 /**
- * Advisor execution logic: the fallback-chain orchestration and per-candidate
- * attempt. Extracted from advisor.ts so it can be unit-tested without a live
- * ExtensionContext (the transport is injected via the consultWithChildProcess
- * import, which tests can mock).
+ * Advisor execution: the fallback-chain orchestration and per-candidate attempt.
  */
 
 import type { Model, Usage } from "@earendil-works/pi-ai";
@@ -34,19 +31,11 @@ import {
   consultWithChildProcess,
 } from "./transports.js";
 
-/**
- * Terminal outcome of one candidate attempt. `terminal` outcomes end the
- * consultation (the caller returns the built result); `failed` outcomes record
- * a diagnostic and let the fallback chain advance to the next candidate.
- */
+/** Outcome of one candidate attempt: `terminal` ends the consultation, `failed` advances the fallback chain. */
 export type CandidateAttempt =
   | { kind: "terminal"; result: AgentToolResult<Record<string, unknown>> }
   | { kind: "failed"; failure: string };
 
-/**
- * Build a terminal result from a consultation result, model label, source,
- * status footer, status, prefix, mode, elapsed time, and usage.
- */
 export function buildResult(
   result: AdvisorConsultResult,
   modelLabel: string,
@@ -73,17 +62,7 @@ export function buildResult(
   };
 }
 
-/**
- * Attempt one candidate in the fallback chain: resolve the model, pre-refresh
- * its OAuth credential, run the consultation in a child process, and classify
- * the outcome. The shared absolute `deadline` bounds the whole chain, so an
- * attempt that finds no remaining budget reports a skip without spawning.
- *
- * The `statusFooter` closure is built here (it captures the candidate's index,
- * the chain's first target, and the caller's active model) so the terminal
- * result carries the model-visible disclosure of who answered, whether the
- * chain degraded, and whether independence was lost.
- */
+/** Attempt one candidate: resolve the model, pre-refresh its OAuth credential, run the consultation, and classify the outcome. */
 export async function attemptCandidate(opts: {
   candidate: AdvisorCandidate;
   candidateIndex: number;
@@ -156,7 +135,6 @@ export async function attemptCandidate(opts: {
       onUpdate: (update) => opts.onUpdate?.(update),
     });
     const elapsedMs = Date.now() - startedAt;
-    const totalUsage = result.usage;
 
     const flags: string[] = [];
     if (candidateIndex > 0) {
@@ -180,7 +158,7 @@ export async function attemptCandidate(opts: {
             mode,
             elapsedMs,
           },
-          usage: totalUsage,
+          usage: result.usage,
         },
       };
     if (result.status === "timed_out") {
@@ -195,7 +173,7 @@ export async function attemptCandidate(opts: {
           timeoutPrefix(opts.mode, opts.timeoutMs, result.text),
           mode,
           elapsedMs,
-          totalUsage,
+          result.usage,
         ),
       };
     }
@@ -210,7 +188,7 @@ export async function attemptCandidate(opts: {
         "",
         mode,
         elapsedMs,
-        totalUsage,
+        result.usage,
       ),
     };
   } catch (error) {
@@ -229,17 +207,7 @@ export async function attemptCandidate(opts: {
   }
 }
 
-/**
- * Execute an advisor consultation: validate params, load config, build the
- * candidate chain, resolve the timeout/deadline, assemble the transcript, and
- * run the fallback chain via attemptCandidate. Returns the terminal result or
- * throws if all candidates fail.
- *
- * `__test` is an internal test seam (used only by test/advisor-execute.test.ts)
- * that lets a test inject fake implementations of loadConfigSafe, findModel,
- * preRefreshProviderAuth, and consultWithChildProcess. All defaults to the real
- * implementations, so production behaviour is unchanged. Never set elsewhere.
- */
+/** Execute an advisor consultation: validate params, load config, build the candidate chain, and run the fallback chain. */
 export async function advisorExecute(
   params: {
     question: string;
