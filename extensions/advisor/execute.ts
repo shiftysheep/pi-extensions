@@ -36,7 +36,7 @@ export type CandidateAttempt =
   | { kind: "terminal"; result: AgentToolResult<Record<string, unknown>> }
   | { kind: "failed"; failure: string };
 
-export function buildResult(
+function buildResult(
   result: AdvisorConsultResult,
   modelLabel: string,
   source: string,
@@ -63,7 +63,7 @@ export function buildResult(
 }
 
 /** Attempt one candidate: resolve the model, pre-refresh its OAuth credential, run the consultation, and classify the outcome. */
-export async function attemptCandidate(opts: {
+async function attemptCandidate(opts: {
   candidate: AdvisorCandidate;
   candidateIndex: number;
   firstTarget: AdvisorTarget;
