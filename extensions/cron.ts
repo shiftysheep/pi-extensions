@@ -536,6 +536,8 @@ export default function cronExtension(pi: ExtensionAPI): void {
           persist();
           return result(count ? `cleared ${count} schedule(s).` : "nothing to clear.");
         }
+        default:
+          return invalid("unknown action.");
       }
     },
   });
