@@ -16,7 +16,13 @@ jobs:
       - run: npm ci
       - run: npm run check
 
-  # Detect unused exports (dead code) after refactors.
+  # Detect truly unused exports (dead code) after refactors.
+  # ts-prune reports three kinds of exports:
+  #   - "(used in module)" — exported but only used within its own file (fine)
+  #   - "default"          — the pi extension entry points, loaded via the
+  #                          pi.extensions manifest, not imported (fine)
+  #   - (no annotation)    — truly unused: exported but referenced nowhere
+  # We fail only on the third kind, in extensions/.
   dead-code:
     runs-on: ubuntu-latest
     steps:
@@ -27,18 +33,17 @@ jobs:
       - run: npm ci
       - name: ts-prune (detect unused exports)
         run: |
-          set -x
           npx ts-prune extensions/**/*.ts test/**/*.ts scripts/**/*.ts \
             --exclude test/ \
             --exclude scripts/ \
-            > /tmp/ts-prune-output.txt
-          cat /tmp/ts-prune-output.txt
-          echo "---"
-          echo "Lines containing 'extensions/':"
-          grep "extensions/" /tmp/ts-prune-output.txt || echo "(none)"
-          echo "---"
-          echo "Lines containing 'extensions/' but NOT 'used in module' and NOT 'default':"
-          grep "extensions/" /tmp/ts-prune-output.txt | grep -v "used in module" | grep -v "default" || echo "(none)"
+            | tee /tmp/ts-prune-output.txt
+          UNUSED=$(grep "extensions/" /tmp/ts-prune-output.txt | grep -v "used in module" | grep -v " - default$")
+          if [ -n "$UNUSED" ]; then
+            echo "Truly unused exports found in extensions/:"
+            echo "$UNUSED"
+            exit 1
+          fi
+          echo "No truly unused exports in extensions/."
 
   # On merge to main: bump the version from the merged commits (feat -> minor,
   # fix/bug/hotfix/bump -> patch, breaking -> major; chore/docs do NOT bump)
