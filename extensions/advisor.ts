@@ -114,59 +114,77 @@ export default function (pi: ExtensionAPI) {
     if (sub === "show" || sub === "--help") {
       return config;
     }
-    if (sub === "set") {
-      const specs = parts
-        .slice(1)
-        .join(" ")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (specs.length !== 2)
-        throw new Error(
-          `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
-        );
-      config.primary = resolveSpec(ctx, specs[0]);
-      config.fallback = resolveSpec(ctx, specs[1]);
-      return config;
-    }
-    if (sub === "primary" || sub === "fallback" || sub === "secondary") {
-      const slot: AdvisorSlot = slotFromArg(sub);
-      if (parts.length !== 2)
-        throw new Error(
-          `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
-        );
-      config[slot] = resolveSpec(ctx, parts[1]);
-      return config;
-    }
-    if (sub === "clear") {
-      if (parts.length > 2)
-        throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
-      if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
-        delete config.reasoningEffort;
-      } else {
-        const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
-        if (slot) delete config[slot];
-        else {
-          delete config.primary;
-          delete config.fallback;
-        }
-      }
-      return config;
-    }
-    if (sub === "effort") {
-      if (parts.length !== 2)
-        throw new Error(
-          `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
-        );
-      const level = parts[1];
-      if (!isReasoningEffort(level))
-        throw new Error(
-          `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
-        );
-      config.reasoningEffort = level;
-      return config;
-    }
+    if (sub === "set") return handleSet(parts, config, ctx);
+    if (sub === "primary" || sub === "fallback" || sub === "secondary")
+      return handleSlotSet(sub, parts, config, ctx);
+    if (sub === "clear") return handleClear(parts, config);
+    if (sub === "effort") return handleEffort(parts, config);
     throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
+  }
+
+  /** /advisor set <primary>,<fallback> — set both slots from two comma-separated specs. */
+  function handleSet(parts: string[], config: AdvisorConfig, ctx: ExtensionContext): AdvisorConfig {
+    const specs = parts
+      .slice(1)
+      .join(" ")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (specs.length !== 2)
+      throw new Error(
+        `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
+      );
+    config.primary = resolveSpec(ctx, specs[0]);
+    config.fallback = resolveSpec(ctx, specs[1]);
+    return config;
+  }
+
+  /** /advisor primary|fallback <spec> — change one slot. */
+  function handleSlotSet(
+    sub: string,
+    parts: string[],
+    config: AdvisorConfig,
+    ctx: ExtensionContext,
+  ): AdvisorConfig {
+    const slot: AdvisorSlot = slotFromArg(sub);
+    if (parts.length !== 2)
+      throw new Error(
+        `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
+      );
+    config[slot] = resolveSpec(ctx, parts[1]);
+    return config;
+  }
+
+  /** /advisor clear [slot] — remove a slot, the default effort, or everything. */
+  function handleClear(parts: string[], config: AdvisorConfig): AdvisorConfig {
+    if (parts.length > 2)
+      throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
+    if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
+      delete config.reasoningEffort;
+    } else {
+      const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
+      if (slot) delete config[slot];
+      else {
+        delete config.primary;
+        delete config.fallback;
+      }
+    }
+    return config;
+  }
+
+  /** /advisor effort <level> — set the shared default reasoning effort. */
+  function handleEffort(parts: string[], config: AdvisorConfig): AdvisorConfig {
+    if (parts.length !== 2)
+      throw new Error(
+        `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
+      );
+    const level = parts[1];
+    if (!isReasoningEffort(level))
+      throw new Error(
+        `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
+      );
+    config.reasoningEffort = level;
+    return config;
   }
 
   pi.registerCommand("advisor", {
@@ -180,52 +198,14 @@ export default function (pi: ExtensionAPI) {
         ? `WARNING: ignoring unreadable advisor config (${loadError}). /advisor reset backs it up and starts clean.\n\n`
         : "";
 
-      async function interactivePicker(): Promise<void> {
-        const pickedPrimary = await pickModel(ctx, "primary");
-        if (pickedPrimary === undefined) return;
-        const pickedFallback = await pickModel(ctx, "fallback");
-        if (pickedFallback === undefined) {
-          ctx.ui.notify("advisor picker cancelled: no changes saved.", "warning");
-          return;
-        }
-        if (pickedPrimary === "unset") delete config.primary;
-        else config.primary = pickedPrimary;
-        if (pickedFallback === "unset") delete config.fallback;
-        else config.fallback = pickedFallback;
-        const backedUp = saveConfigValidated(config, loadError);
-        ctx.ui.notify(
-          `advisor updated:\n${describeConfig(config)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
-          "info",
-        );
-      }
-
       if (parts.length === 0) {
-        ctx.ui.notify(`${warn}${describeConfig(config, activeLabel)}`, "info");
-        if (ctx.hasUI && ctx.mode === "tui") {
-          const answer = await ctx.ui.confirm(
-            "Update advisor models now?",
-            "(primary, then secondary/fallback; Esc cancels)",
-          );
-          if (answer) return interactivePicker();
-        }
+        await handleNoArgs(config, activeLabel, warn, ctx, loadError);
         return;
       }
 
       const sub = parts[0];
       if (sub === "reset") {
-        let backedUp: string | undefined;
-        try {
-          renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
-          backedUp = `${CONFIG_PATH}.bak`;
-        } catch (error: unknown) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-            throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
-        }
-        saveConfig({});
-        ctx.ui.notify(
-          `advisor config reset.${backedUp ? ` Previous file moved to ${backedUp}.` : ""}${loadError ? ` (previous file was unreadable: ${loadError})` : ""}\n\n${describeConfig({}, activeLabel)}`,
-          backedUp || loadError ? "warning" : "info",
-        );
+        handleReset(activeLabel, loadError, ctx);
         return;
       }
       if (sub === "show" || sub === "--help") {
@@ -241,6 +221,60 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+
+  /** No-args /advisor: show config, then offer the interactive picker in TUI mode. */
+  async function handleNoArgs(
+    config: AdvisorConfig,
+    activeLabel: string | undefined,
+    warn: string,
+    ctx: ExtensionContext,
+    loadError: string | undefined,
+  ): Promise<void> {
+    ctx.ui.notify(`${warn}${describeConfig(config, activeLabel)}`, "info");
+    if (!(ctx.hasUI && ctx.mode === "tui")) return;
+    const answer = await ctx.ui.confirm(
+      "Update advisor models now?",
+      "(primary, then secondary/fallback; Esc cancels)",
+    );
+    if (!answer) return;
+    const pickedPrimary = await pickModel(ctx, "primary");
+    if (pickedPrimary === undefined) return;
+    const pickedFallback = await pickModel(ctx, "fallback");
+    if (pickedFallback === undefined) {
+      ctx.ui.notify("advisor picker cancelled: no changes saved.", "warning");
+      return;
+    }
+    if (pickedPrimary === "unset") delete config.primary;
+    else config.primary = pickedPrimary;
+    if (pickedFallback === "unset") delete config.fallback;
+    else config.fallback = pickedFallback;
+    const backedUp = saveConfigValidated(config, loadError);
+    ctx.ui.notify(
+      `advisor updated:\n${describeConfig(config)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
+      "info",
+    );
+  }
+
+  /** /advisor reset: back up the config to advisor.json.bak and start clean. */
+  function handleReset(
+    activeLabel: string | undefined,
+    loadError: string | undefined,
+    ctx: ExtensionContext,
+  ): void {
+    let backedUp: string | undefined;
+    try {
+      renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
+      backedUp = `${CONFIG_PATH}.bak`;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+        throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
+    }
+    saveConfig({});
+    ctx.ui.notify(
+      `advisor config reset.${backedUp ? ` Previous file moved to ${backedUp}.` : ""}${loadError ? ` (previous file was unreadable: ${loadError})` : ""}\n\n${describeConfig({}, activeLabel)}`,
+      backedUp || loadError ? "warning" : "info",
+    );
+  }
 
   pi.registerTool({
     name: "advisor",

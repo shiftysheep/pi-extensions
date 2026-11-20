@@ -84,113 +84,122 @@ export function landlockHelperPath(): string {
 }
 
 /**
+ * Resolve an explicitly configured landlockHelper path. An explicit override
+ * is a directive: a missing/unusable file fails the probe instead of
+ * silently compiling a different binary. Returns the resolved path, or a
+ * failure result.
+ */
+function resolveOverrideHelper(override: string): RunnerProbeResult | string {
+  const resolved = normalizeHelperPath(override, os.homedir());
+  if (resolved === undefined) {
+    return {
+      ok: false,
+      reason: `landlockHelper must be an absolute path (or start with ~): ${override}`,
+    };
+  }
+  try {
+    fs.accessSync(resolved, fs.constants.X_OK);
+  } catch {
+    return {
+      ok: false,
+      reason: `configured landlockHelper is not an executable file: ${resolved}`,
+    };
+  }
+  return resolved;
+}
+
+/**
+ * Build the Landlock helper from source (auto mode). Looks up a C compiler,
+ * checks the cache dir is not noexec, verifies source integrity, and compiles
+ * if stale. Returns the helper path, or a failure result.
+ */
+function buildLandlockHelper(): RunnerProbeResult | string {
+  const cc = which("cc") ?? which("gcc") ?? which("clang");
+  if (!cc)
+    return {
+      ok: false,
+      reason: "no C compiler found (cc/gcc/clang) to build the landlock helper",
+    };
+  const out = landlockHelperPath();
+  // noexec cache dir (common on hardened /home): fail with an actionable
+  // message instead of a confusing exec failure after a wasted build.
+  // Canonicalize first: a symlinked ancestor can sit on a different mount.
+  try {
+    const dir = path.dirname(out);
+    const base = resolveExistingRoot(dir, (p) => {
+      try {
+        fs.statSync(p);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    let canonBase = base;
+    try {
+      canonBase = fs.realpathSync(base);
+    } catch {
+      // keep the literal base
+    }
+    const mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
+    if (isNoexecPath(mountinfo, canonBase + dir.slice(base.length))) {
+      return {
+        ok: false,
+        reason: `landlock helper cache dir is mounted noexec: ${path.dirname(out)} — set "landlockHelper" to an exec-capable path`,
+      };
+    }
+  } catch {
+    // mountinfo unreadable (odd container); the canary below will surface
+    // any exec failure.
+  }
+  // Source integrity: refuse to compile unexpected code.
+  try {
+    const digest = crypto.createHash("sha256").update(fs.readFileSync(HELPER_SOURCE)).digest("hex");
+    if (digest !== HELPER_SOURCE_SHA256) {
+      return {
+        ok: false,
+        reason: `landlock-helper.c failed the integrity check (sha256 ${digest.slice(0, 12)}\u2026 \u2260 expected) — refusing to compile; restore the pristine source or set "landlockHelper" to a trusted prebuilt binary`,
+      };
+    }
+  } catch (err) {
+    return { ok: false, reason: `landlock helper source unreadable: ${String(err)}` };
+  }
+  try {
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    const srcStat = fs.statSync(HELPER_SOURCE);
+    const stale = !fs.existsSync(out) || fs.statSync(out).mtimeMs < srcStat.mtimeMs;
+    if (stale) {
+      const build = spawnSync(cc, ["-O2", "-o", out, HELPER_SOURCE], {
+        encoding: "utf8",
+        timeout: BUILD_TIMEOUT_MS,
+      });
+      if (build.status !== 0) {
+        return {
+          ok: false,
+          reason: `landlock helper build failed: ${(build.stderr ?? "").trim().slice(-300)}`,
+        };
+      }
+      fs.chmodSync(out, 0o700);
+    }
+  } catch (err) {
+    return { ok: false, reason: `landlock helper build failed: ${String(err)}` };
+  }
+  return out;
+}
+
+/**
  * Landlock: use a prebuilt helper when configured (no compilation),
  * otherwise build the helper (if stale) behind a source-integrity check,
  * and verify the kernel accepts it.
  */
 function probeLandlock(override?: string): RunnerProbeResult {
-  let out: string;
-  if (override !== undefined) {
-    // An explicit override is a directive: a missing/unusable file fails
-    // the probe instead of silently compiling a different binary. The path
-    // is normalized to absolute so validation and execution refer to the
-    // same binary (a relative path would be cwd-relative for accessSync
-    // but a PATH search for spawn).
-    const resolved = normalizeHelperPath(override, os.homedir());
-    if (resolved === undefined) {
-      return {
-        ok: false,
-        reason: `landlockHelper must be an absolute path (or start with ~): ${override}`,
-      };
-    }
-    try {
-      fs.accessSync(resolved, fs.constants.X_OK);
-    } catch {
-      return {
-        ok: false,
-        reason: `configured landlockHelper is not an executable file: ${resolved}`,
-      };
-    }
-    out = resolved;
-  } else {
-    const cc = which("cc") ?? which("gcc") ?? which("clang");
-    if (!cc)
-      return {
-        ok: false,
-        reason: "no C compiler found (cc/gcc/clang) to build the landlock helper",
-      };
-    out = landlockHelperPath();
-    // noexec cache dir (common on hardened /home): fail with an actionable
-    // message instead of a confusing exec failure after a wasted build.
-    // Canonicalize first: a symlinked ancestor can sit on a different mount.
-    try {
-      const dir = path.dirname(out);
-      const base = resolveExistingRoot(dir, (p) => {
-        try {
-          fs.statSync(p);
-          return true;
-        } catch {
-          return false;
-        }
-      });
-      let canonBase = base;
-      try {
-        canonBase = fs.realpathSync(base);
-      } catch {
-        // keep the literal base
-      }
-      const mountinfo = fs.readFileSync("/proc/self/mountinfo", "utf8");
-      if (isNoexecPath(mountinfo, canonBase + dir.slice(base.length))) {
-        return {
-          ok: false,
-          reason: `landlock helper cache dir is mounted noexec: ${path.dirname(out)} — set "landlockHelper" to an exec-capable path`,
-        };
-      }
-    } catch {
-      // mountinfo unreadable (odd container); the canary below will surface
-      // any exec failure.
-    }
-    // Source integrity: refuse to compile unexpected code.
-    try {
-      const digest = crypto
-        .createHash("sha256")
-        .update(fs.readFileSync(HELPER_SOURCE))
-        .digest("hex");
-      if (digest !== HELPER_SOURCE_SHA256) {
-        return {
-          ok: false,
-          reason: `landlock-helper.c failed the integrity check (sha256 ${digest.slice(0, 12)}\u2026 \u2260 expected) — refusing to compile; restore the pristine source or set "landlockHelper" to a trusted prebuilt binary`,
-        };
-      }
-    } catch (err) {
-      return { ok: false, reason: `landlock helper source unreadable: ${String(err)}` };
-    }
-    try {
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      const srcStat = fs.statSync(HELPER_SOURCE);
-      const stale = !fs.existsSync(out) || fs.statSync(out).mtimeMs < srcStat.mtimeMs;
-      if (stale) {
-        const build = spawnSync(cc, ["-O2", "-o", out, HELPER_SOURCE], {
-          encoding: "utf8",
-          timeout: BUILD_TIMEOUT_MS,
-        });
-        if (build.status !== 0) {
-          return {
-            ok: false,
-            reason: `landlock helper build failed: ${(build.stderr ?? "").trim().slice(-300)}`,
-          };
-        }
-        fs.chmodSync(out, 0o700);
-      }
-    } catch (err) {
-      return { ok: false, reason: `landlock helper build failed: ${String(err)}` };
-    }
-  }
-  const canary = spawnSync(out, ["--rw", "/tmp", "--", "/bin/sh", "-c", "true"], {
+  const resolved = override !== undefined ? resolveOverrideHelper(override) : buildLandlockHelper();
+  if (typeof resolved !== "string") return resolved;
+  const canary = spawnSync(resolved, ["--rw", "/tmp", "--", "/bin/sh", "-c", "true"], {
     encoding: "utf8",
     timeout: CANARY_TIMEOUT_MS,
   });
-  if (canary.status === 0) return { ok: true, runner: "landlock", detail: out, helperPath: out };
+  if (canary.status === 0)
+    return { ok: true, runner: "landlock", detail: resolved, helperPath: resolved };
   return {
     ok: false,
     reason: `landlock canary failed${canary.status != null ? ` (exit ${canary.status})` : ""}: ${

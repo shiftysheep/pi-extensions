@@ -33,6 +33,29 @@ const DEFAULT_BASE_URL = "https://api.typesafe.ai";
 /** Default per-call Jev timeout in ms — the single source of truth. */
 export const DEFAULT_CLASSIFIER_TIMEOUT_MS = 8000;
 
+/** Classify a non-OK HTTP response into a fixed-category error string. */
+function classifyStatus(status: number): string {
+  if (status === 401) return "authentication failed (401) — check TYPESAFE_API_KEY";
+  if (status === 422) return "request rejected by the API (422)";
+  if (status === 429 || status === 529) return `rate-limited or overloaded (${status})`;
+  return `unexpected status ${status}`;
+}
+
+/**
+ * Classify a fetch/JSON failure. An abort (caller cancel or timeout) is
+ * reported as such; anything else is a fixed "network error" category —
+ * never err.message, which could carry secrets.
+ */
+function classifyFailure(
+  opts: JevCallOptions,
+  controller: AbortController,
+  timeoutMs: number,
+): JevCallResult {
+  if (opts.signal?.aborted) return { ok: false, error: "cancelled", cancelled: true };
+  if (controller.signal.aborted) return { ok: false, error: `timed out after ${timeoutMs}ms` };
+  return { ok: false, error: "network error" };
+}
+
 /** POST a System One request to the Jev endpoint. Never throws. */
 export async function callJev(request: unknown, opts: JevCallOptions): Promise<JevCallResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
@@ -57,29 +80,19 @@ export async function callJev(request: unknown, opts: JevCallOptions): Promise<J
     if (!res.ok) {
       // Release the connection instead of leaving the body unconsumed.
       if (res.body) void res.body.cancel().catch(() => {});
-      if (res.status === 401)
-        return { ok: false, error: "authentication failed (401) — check TYPESAFE_API_KEY" };
-      if (res.status === 422) return { ok: false, error: "request rejected by the API (422)" };
-      if (res.status === 429 || res.status === 529)
-        return { ok: false, error: `rate-limited or overloaded (${res.status})` };
-      return { ok: false, error: `unexpected status ${res.status}` };
+      return { ok: false, error: classifyStatus(res.status) };
     }
-    let body: unknown;
     try {
-      body = await res.json();
+      return { ok: true, body: await res.json() };
     } catch {
-      // An abort (cancel or timeout) can reject res.json() mid-body-read; classify
-      // it as such rather than a malformed response.
+      // An abort (cancel or timeout) can reject res.json() mid-body-read;
+      // classify it as such rather than a malformed response.
       if (opts.signal?.aborted) return { ok: false, error: "cancelled", cancelled: true };
       if (controller.signal.aborted) return { ok: false, error: `timed out after ${timeoutMs}ms` };
       return { ok: false, error: "invalid JSON response" };
     }
-    return { ok: true, body };
   } catch {
-    // Fixed categories only — never echo err.message (could carry secrets).
-    if (opts.signal?.aborted) return { ok: false, error: "cancelled", cancelled: true };
-    if (controller.signal.aborted) return { ok: false, error: `timed out after ${timeoutMs}ms` };
-    return { ok: false, error: "network error" };
+    return classifyFailure(opts, controller, timeoutMs);
   } finally {
     clearTimeout(timer);
   }
