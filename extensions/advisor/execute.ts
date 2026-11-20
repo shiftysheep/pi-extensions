@@ -16,7 +16,6 @@ import {
   type AdvisorConfig,
   type AdvisorReasoningEffort,
   type AdvisorTarget,
-  addUsage,
   buildCandidates,
   capDiagnosticText,
   composeAdviceText,
@@ -100,8 +99,6 @@ export async function attemptCandidate(opts: {
   signal: AbortSignal | undefined;
   explicit: boolean;
   onUpdate: AgentToolUpdateCallback | undefined;
-  /** Running usage total from prior attempts; the attempt adds its own. */
-  combinedUsage: Usage | undefined;
   /**
    * Internal test seam (used only by test/advisor-execute.test.ts). Lets a test
    * inject a fake transport and a fake model resolver. All default to the real
@@ -134,15 +131,7 @@ export async function attemptCandidate(opts: {
   }
 
   const modelLabel = `${model.provider}/${model.id}`;
-  // Best-effort pre-refresh of a near-expiry OAuth credential in the HOST's
-  // canonical credential store before the child copies auth.json, so the child
-  // inherits a fresh access token. The child's auth.json copy has its refresh
-  // token STRIPPED (see transports.ts), so the child can never perform a
-  // refresh — which is what protects the host's refresh token from being
-  // rotated server-side. A failure here just lets the child report its own
-  // auth error and fall back.
   await preRefreshImpl(ctx, model.provider);
-  // Effort priority: tool-call override > per-model config > global default > medium.
   const selectedEffort =
     opts.effort ?? candidate.target.effort ?? opts.config.reasoningEffort ?? "medium";
   const startedAt = Date.now();
@@ -153,9 +142,6 @@ export async function attemptCandidate(opts: {
       ],
       details: { model: modelLabel, source: candidate.source, mode },
     });
-    // Both modes run in an isolated child pi process: no advisor model turn or
-    // tool call executes in the host process (privilege boundary, not a
-    // filesystem sandbox — the child's read tools reach what the OS user can).
     const result = await consultImpl({
       model,
       modelLabel,
@@ -170,14 +156,8 @@ export async function attemptCandidate(opts: {
       onUpdate: (update) => opts.onUpdate?.(update),
     });
     const elapsedMs = Date.now() - startedAt;
-    // Accumulate this attempt's usage into the running total (the result
-    // carries the total INCLUDING this attempt, matching the original behavior).
-    const totalUsage = result.usage
-      ? addUsage(opts.combinedUsage, result.usage)
-      : opts.combinedUsage;
+    const totalUsage = result.usage;
 
-    // The footer is the model-visible disclosure: it always names who answered,
-    // whether the chain degraded, and whether independence was lost.
     const flags: string[] = [];
     if (candidateIndex > 0) {
       flags.push(`fallbackFrom=${firstTarget.provider ?? "*"}/${firstTarget.model}`);
@@ -204,9 +184,6 @@ export async function attemptCandidate(opts: {
         },
       };
     if (result.status === "timed_out") {
-      // A timeout is a terminal incomplete result, not a chain failure: the
-      // deadline is shared, so no later candidate could have had time anyway.
-      // Return the full (advice-capped) partial output with metrics and usage.
       return {
         kind: "terminal",
         result: buildResult(
@@ -305,7 +282,6 @@ export async function advisorExecute(
   }
 
   const loadConfigImpl = __test?.loadConfigImpl ?? loadConfigSafe;
-  // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
   const { config, loadError } = loadConfigImpl();
   const { candidates, explicit } = buildCandidates({
     provider: params.provider,
@@ -318,30 +294,15 @@ export async function advisorExecute(
       "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
     );
   }
-  // Timeout priority: per-call > config > mode default (5 min review / 10 min explore),
-  // clamped to 30 s..30 min. The budget covers the WHOLE consultation, fallback
-  // chain included: every attempt (including its auth/session setup) runs against
-  // one shared absolute deadline, on a monotonic clock.
   const timeoutMs = resolveConsultTimeoutMs({
     perCall: params.timeoutMs,
     config: config.timeoutMs,
     mode,
   });
   const deadline = performance.now() + timeoutMs;
-  // Ground-truth default: no session content is sent unless explicitly requested.
   const transcript = params.includeSession === true ? sessionTranscript(ctx) : "";
   const failures: string[] = [];
 
-  // Each attempt starts with combinedUsage: undefined because the accumulation
-  // across attempts is a no-op in practice: a non-terminal attempt is a failure
-  // (the consultation threw, so there is no result.usage to add), and a terminal
-  // attempt's result carries its own usage. The only edge case where accumulation
-  // would matter is if result formatting (footer construction, buildResult) throws
-  // AFTER the consultation succeeds and adds result.usage to the local totalUsage —
-  // in that case the original code would have retained the usage in the mutable
-  // combinedUsage accumulator, but the new code discards it. This edge case is
-  // negligible (the footer is a template string that cannot realistically throw),
-  // so we pass undefined and let each attempt compute its own total from scratch.
   for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
     const attempt = await attemptCandidate({
       candidate: candidates[candidateIndex],
@@ -358,7 +319,6 @@ export async function advisorExecute(
       signal,
       explicit,
       onUpdate,
-      combinedUsage: undefined,
       __test: __test
         ? {
             findModelImpl: __test.findModelImpl,
