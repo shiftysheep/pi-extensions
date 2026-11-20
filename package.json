@@ -14,6 +14,7 @@
     "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/permission-gate-classifier.test.ts test/classifier-benchmark.test.ts test/status-line.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
     "check": "biome check && tsc --noEmit && npm test",
     "benchmark:classifier": "node --import tsx scripts/classifier-benchmark.ts",
+    "eval:advisor": "bash scripts/run-advisor-eval.sh",
     "commit": "cz",
     "commit:msg": "commitlint --edit",
     "precommit:install": "pre-commit install && pre-commit install -t commit-msg"
@@ -24,12 +25,12 @@
     }
   },
   "dependencies": {
-    "@earendil-works/pi-client": "^0.85.1",
-    "@earendil-works/pi-server": "^0.85.1",
+    "@earendil-works/pi-client": "^1.1.0",
+    "@earendil-works/pi-server": "^1.1.0",
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
     "@upstash/context7-pi": "^0.1.2",
-    "pi-subagents": "^0.65.0",
+    "pi-subagents": "^0.89.1",
     "pi-web-access": "^0.28.0"
   },
   "bundledDependencies": [
