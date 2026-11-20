@@ -8,13 +8,8 @@
  */
 
 import { renameSync } from "node:fs";
-import { type Model, type Usage, uuidv7 } from "@earendil-works/pi-ai";
-import type {
-  AgentToolResult,
-  AgentToolUpdateCallback,
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { uuidv7 } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   CONFIG_PATH,
@@ -23,6 +18,7 @@ import {
   saveConfig,
   saveConfigValidated,
 } from "./advisor/config.js";
+import { advisorExecute, type CandidateAttempt } from "./advisor/execute.js";
 import {
   type AdvisorSlot,
   findModel,
@@ -37,8 +33,10 @@ import {
   consultWithChildProcess,
 } from "./advisor/transports.js";
 import {
+  type AdvisorCandidate,
+  type AdvisorConfig,
   type AdvisorReasoningEffort,
-  addUsage,
+  type AdvisorTarget,
   buildCandidates,
   capDiagnosticText,
   composeAdviceText,
@@ -84,225 +82,9 @@ async function withAdvisorSlot<T>(work: () => Promise<T>, signal?: AbortSignal):
  * read tools still reach anything the OS user can read.
  */
 
-/**
- * Terminal result for a finished attempt: advice-capped text plus the status
- * footer and structured details. `prefix` lets a timed-out attempt keep its
- * full (capped) partial output instead of collapsing to a short error string.
- */
-function buildResult(
-  result: AdvisorConsultResult,
-  modelLabel: string,
-  source: string,
-  statusFooter: (status: string) => string,
-  status: AdvisorStatus,
-  prefix: string,
-  mode: string,
-  elapsedMs: number,
-  usage: Usage | undefined,
-): AgentToolResult<Record<string, unknown>> {
-  return {
-    content: [{ type: "text", text: composeAdviceText(prefix, result.text, statusFooter(status)) }],
-    details: {
-      model: modelLabel,
-      source,
-      status,
-      mode,
-      toolCalls: result.toolCalls,
-      modelRequests: result.modelRequests,
-      elapsedMs,
-    },
-    usage,
-  };
-}
-async function advisorExecute(
-  params: {
-    question: string;
-    provider?: string;
-    model?: string;
-    mode?: string;
-    effort?: string;
-    includeSession?: boolean;
-    timeoutMs?: number;
-  },
-  signal: AbortSignal | undefined,
-  onUpdate: AgentToolUpdateCallback | undefined,
-  ctx: ExtensionContext,
-): Promise<AgentToolResult<Record<string, unknown>>> {
-  if (params.effort !== undefined && !isReasoningEffort(params.effort)) {
-    throw new Error(
-      `Invalid advisor effort "${params.effort}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
-    );
-  }
-  const mode = params.mode ?? "review";
-  if (mode !== "review" && mode !== "explore") {
-    throw new Error(`Invalid advisor mode "${mode}". Expected "review" or "explore".`);
-  }
-  if (
-    params.timeoutMs !== undefined &&
-    (typeof params.timeoutMs !== "number" ||
-      !Number.isFinite(params.timeoutMs) ||
-      params.timeoutMs <= 0)
-  ) {
-    throw new Error(
-      `Invalid advisor timeoutMs "${params.timeoutMs}". Expected a positive number of milliseconds (clamped to 30000..1800000).`,
-    );
-  }
-
-  // Tolerate an unreadable advisor.json so explicit provider/model selections still work.
-  const { config, loadError } = loadConfigSafe();
-  const { candidates, explicit } = buildCandidates({
-    provider: params.provider,
-    modelId: params.model,
-    config,
-    activeModel: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
-  });
-  if (!explicit && candidates.length === 0) {
-    throw new Error(
-      "No advisor models configured. Run /advisor set <primary>,<fallback> (or just /advisor) to pick models.",
-    );
-  }
-  // Timeout priority: per-call > config > mode default (5 min review / 10 min explore),
-  // clamped to 30 s..30 min. The budget covers the WHOLE consultation, fallback
-  // chain included: every attempt (including its auth/session setup) runs against
-  // one shared absolute deadline, on a monotonic clock.
-  const timeoutMs = resolveConsultTimeoutMs({
-    perCall: params.timeoutMs,
-    config: config.timeoutMs,
-    mode,
-  });
-  const deadline = performance.now() + timeoutMs;
-  // Ground-truth default: no session content is sent unless explicitly requested.
-  const transcript = params.includeSession === true ? sessionTranscript(ctx) : "";
-  const failures: string[] = [];
-  let combinedUsage: Usage | undefined;
-
-  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
-    const candidate = candidates[candidateIndex];
-    if (remainingBudgetMs(deadline, performance.now()) <= 0) {
-      failures.push(`${candidate.source}: skipped, consultation timed out before this attempt`);
-      continue;
-    }
-    let model: Model<any>;
-    try {
-      model = findModel(ctx, candidate.target);
-    } catch (error) {
-      failures.push(`${candidate.source}: ${capDiagnosticText((error as Error).message)}`);
-      continue;
-    }
-
-    const modelLabel = `${model.provider}/${model.id}`;
-    // Best-effort pre-refresh of a near-expiry OAuth credential in the HOST's
-    // canonical credential store before the child copies auth.json, so the child
-    // inherits a fresh access token. The child's auth.json copy has its refresh
-    // token STRIPPED (see transports.ts), so the child can never perform a
-    // refresh — which is what protects the host's refresh token from being
-    // rotated server-side. A failure here just lets the child report its own
-    // auth error and fall back.
-    await preRefreshProviderAuth(ctx, model.provider);
-    // Effort priority: tool-call override > per-model config > global default > medium.
-    const selectedEffort =
-      (params.effort as AdvisorReasoningEffort | undefined) ??
-      candidate.target.effort ??
-      config.reasoningEffort ??
-      "medium";
-    const startedAt = Date.now();
-    try {
-      onUpdate?.({
-        content: [
-          { type: "text", text: `Consulting ${modelLabel} (${candidate.source}, ${mode})...` },
-        ],
-        details: { model: modelLabel, source: candidate.source, mode },
-      });
-      // Both modes run in an isolated child pi process: no advisor model turn or
-      // tool call executes in the host process (privilege boundary, not a
-      // filesystem sandbox — the child's read tools reach what the OS user can).
-      const result = await consultWithChildProcess({
-        model,
-        modelLabel,
-        question: params.question,
-        transcript,
-        effort: selectedEffort,
-        cwd: ctx.cwd,
-        mode,
-        deadline,
-        signal,
-        config,
-        onUpdate: (update) => onUpdate?.(update),
-      });
-      const elapsedMs = Date.now() - startedAt;
-
-      if (result.usage) combinedUsage = addUsage(combinedUsage, result.usage);
-      // The footer is the model-visible disclosure: it always names who answered,
-      // whether the chain degraded, and whether independence was lost.
-      const flags: string[] = [];
-      if (candidateIndex > 0) {
-        const first = candidates[0].target;
-        flags.push(`fallbackFrom=${first.provider ?? "*"}/${first.model}`);
-      }
-      const selfReview =
-        ctx.model && model.provider === ctx.model.provider && model.id === ctx.model.id;
-      if (selfReview) flags.push("independent=false");
-      const statusFooter = (status: string) =>
-        `\n\n---\n[advisor: mode=${mode}, model=${modelLabel}, status=${status}, toolCalls=${result.toolCalls}, elapsed=${Math.round(elapsedMs / 1000)}s${flags.length > 0 ? `, ${flags.join(", ")}` : ""}${selfReview ? " — this advice came from the model already driving this session; treat it as self-review, not a second opinion" : ""}]`;
-      if (result.status === "aborted")
-        return {
-          content: [{ type: "text", text: "Advisor consultation cancelled." }],
-          details: {
-            model: modelLabel,
-            source: candidate.source,
-            status: "aborted",
-            mode,
-            elapsedMs,
-          },
-          usage: combinedUsage,
-        };
-      if (result.status === "timed_out") {
-        // A timeout is a terminal incomplete result, not a chain failure: the
-        // deadline is shared, so no later candidate could have had time anyway.
-        // Return the full (advice-capped) partial output with metrics and usage.
-        return buildResult(
-          result,
-          modelLabel,
-          candidate.source,
-          statusFooter,
-          "timed_out",
-          timeoutPrefix(mode, timeoutMs, result.text),
-          mode,
-          elapsedMs,
-          combinedUsage,
-        );
-      }
-      return buildResult(
-        result,
-        modelLabel,
-        candidate.source,
-        statusFooter,
-        "completed",
-        "",
-        mode,
-        elapsedMs,
-        combinedUsage,
-      );
-    } catch (error) {
-      if (signal?.aborted) {
-        return {
-          content: [{ type: "text", text: "Advisor consultation cancelled." }],
-          details: { model: modelLabel, source: candidate.source },
-        };
-      }
-      const message = capDiagnosticText(error instanceof Error ? error.message : String(error));
-      if (explicit) throw new Error(`${modelLabel}: ${message}`);
-      failures.push(`${candidate.source} (${modelLabel}): ${message}`);
-    }
-  }
-
-  const configWarning = loadError
-    ? ` Note: advisor config was unreadable (${loadError}); run /advisor reset to recover.`
-    : "";
-  throw new Error(
-    `No usable advisor model (tried: ${candidates.map((c) => c.source).join(" → ")}). ${failures.join("; ")}${configWarning}`,
-  );
-}
+// The advisorExecute, buildResult, and CandidateAttempt type are now in
+// advisor/execute.ts (extracted for testability). advisor.ts imports them
+// above and uses them in the tool registration below.
 
 export default function (pi: ExtensionAPI) {
   const slotFromArg = (raw: string): AdvisorSlot => {
@@ -314,6 +96,78 @@ export default function (pi: ExtensionAPI) {
 
   const usageHints =
     'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level or a model slot) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Every consultation runs in an isolated child pi process with a throwaway agent dir (only a copy of auth.json, mode 0600; removed in a finally block) — a privilege boundary, not a filesystem sandbox. Optional key piBinary (path to the pi binary to spawn; default "pi" on PATH, or $PI_BINARY). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself; bounded by the consultation timeout only — tool-call count, model-request count, and elapsed time are reported for cost visibility, but never abort a consultation). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
+
+  /** Handle a /advisor subcommand: mutate the config and return the updated config (or throw). */
+  function handleAdvisorSubcommand(
+    sub: string,
+    parts: string[],
+    config: AdvisorConfig,
+    ctx: ExtensionContext,
+  ): AdvisorConfig {
+    if (sub === "reset") {
+      if (parts.length > 1)
+        throw new Error(
+          "/advisor reset takes no arguments. It moves advisor.json to advisor.json.bak and writes an empty config.",
+        );
+      return {};
+    }
+    if (sub === "show" || sub === "--help") {
+      return config;
+    }
+    if (sub === "set") {
+      const specs = parts
+        .slice(1)
+        .join(" ")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (specs.length !== 2)
+        throw new Error(
+          `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      config.primary = resolveSpec(ctx, specs[0]);
+      config.fallback = resolveSpec(ctx, specs[1]);
+      return config;
+    }
+    if (sub === "primary" || sub === "fallback" || sub === "secondary") {
+      const slot: AdvisorSlot = slotFromArg(sub);
+      if (parts.length !== 2)
+        throw new Error(
+          `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      config[slot] = resolveSpec(ctx, parts[1]);
+      return config;
+    }
+    if (sub === "clear") {
+      if (parts.length > 2)
+        throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
+      if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
+        delete config.reasoningEffort;
+      } else {
+        const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
+        if (slot) delete config[slot];
+        else {
+          delete config.primary;
+          delete config.fallback;
+        }
+      }
+      return config;
+    }
+    if (sub === "effort") {
+      if (parts.length !== 2)
+        throw new Error(
+          `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      const level = parts[1];
+      if (!isReasoningEffort(level))
+        throw new Error(
+          `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
+        );
+      config.reasoningEffort = level;
+      return config;
+    }
+    throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
+  }
 
   pi.registerCommand("advisor", {
     description:
@@ -327,7 +181,6 @@ export default function (pi: ExtensionAPI) {
         : "";
 
       async function interactivePicker(): Promise<void> {
-        // Collect both picks before writing: Esc at either prompt aborts the whole change.
         const pickedPrimary = await pickModel(ctx, "primary");
         if (pickedPrimary === undefined) return;
         const pickedFallback = await pickModel(ctx, "fallback");
@@ -360,10 +213,6 @@ export default function (pi: ExtensionAPI) {
 
       const sub = parts[0];
       if (sub === "reset") {
-        if (parts.length > 1)
-          throw new Error(
-            "/advisor reset takes no arguments. It moves advisor.json to advisor.json.bak and writes an empty config.",
-          );
         let backedUp: string | undefined;
         try {
           renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
@@ -383,57 +232,11 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`${warn}${describeConfig(config, activeLabel)}\n\n${usageHints}`, "info");
         return;
       }
-      if (sub === "set") {
-        const specs = parts
-          .slice(1)
-          .join(" ")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        if (specs.length !== 2)
-          throw new Error(
-            `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        config.primary = resolveSpec(ctx, specs[0]);
-        config.fallback = resolveSpec(ctx, specs[1]);
-      } else if (sub === "primary" || sub === "fallback" || sub === "secondary") {
-        const slot: AdvisorSlot = slotFromArg(sub);
-        if (parts.length !== 2)
-          throw new Error(
-            `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        config[slot] = resolveSpec(ctx, parts[1]);
-      } else if (sub === "clear") {
-        if (parts.length > 2)
-          throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
-        if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
-          delete config.reasoningEffort;
-        } else {
-          const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
-          if (slot) delete config[slot];
-          else {
-            delete config.primary;
-            delete config.fallback;
-          }
-        }
-      } else if (sub === "effort") {
-        if (parts.length !== 2)
-          throw new Error(
-            `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        const level = parts[1];
-        if (!isReasoningEffort(level))
-          throw new Error(
-            `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
-          );
-        config.reasoningEffort = level;
-      } else {
-        throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
-      }
 
-      const backedUp = saveConfigValidated(config, loadError);
+      const updatedConfig = handleAdvisorSubcommand(sub, parts, config, ctx);
+      const backedUp = saveConfigValidated(updatedConfig, loadError);
       ctx.ui.notify(
-        `${warn}advisor updated:\n${describeConfig(config, activeLabel)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
+        `${warn}advisor updated:\n${describeConfig(updatedConfig, activeLabel)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
         "info",
       );
     },

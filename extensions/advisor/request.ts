@@ -3,9 +3,8 @@
  * session transcript, and reasoning-effort normalization.
  */
 
-import type { Model, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import {
-  type AdvisorReasoningEffort,
   capTranscriptEntries,
   keepEnd,
   redactSensitiveText,
@@ -67,13 +66,4 @@ export function sessionTranscript(ctx: { sessionManager: { getBranch(): unknown[
   const redacted = lines.map((line) => redactSensitiveText(line));
   const transcript = redactSensitiveText(capTranscriptEntries(redacted).join("\n\n"));
   return keepEnd(transcript, MAX_SESSION_CONTEXT_CHARS, "[Earlier session context omitted.]\n\n");
-}
-export function neutralReasoningEffort(
-  model: Model<any>,
-  effort: AdvisorReasoningEffort,
-): ThinkingLevel | undefined {
-  // "none" (or a non-reasoning model) → omit the level; the advisor session then uses
-  // its default. An explicit "off" is not expressible through the agent API.
-  if (!model.reasoning || effort === "none") return undefined;
-  return effort;
 }
