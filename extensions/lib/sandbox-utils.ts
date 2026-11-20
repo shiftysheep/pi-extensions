@@ -212,6 +212,86 @@ export type RunnerContext = {
  * Validate parsed sandbox.json. Mirrors advisor's parseConfig: unknown keys
  * and wrong types are rejected with the config path in the message.
  */
+/** Per-key validator: returns the validated value or throws. */
+type KeyValidator = (value: unknown, configPath: string) => unknown;
+
+/** Table of per-key validators for parseSandboxConfig. */
+const SANDBOX_KEY_VALIDATORS: Record<string, KeyValidator> = {
+  enabled: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "enabled" must be a boolean`);
+    return v;
+  },
+  runner: (v, p) => {
+    if (typeof v !== "string" || !(SANDBOX_RUNNER_CHOICES as readonly string[]).includes(v))
+      throw new Error(`${p}: "runner" must be one of: ${SANDBOX_RUNNER_CHOICES.join(", ")}`);
+    return v;
+  },
+  writable: (v, p) => {
+    if (!Array.isArray(v) || v.some((x) => typeof x !== "string" || x.length === 0))
+      throw new Error(`${p}: "writable" must be an array of non-empty strings`);
+    return v;
+  },
+  home: (v, p) => {
+    if (v !== "rw" && v !== "ro") throw new Error(`${p}: "home" must be "rw" or "ro"`);
+    return v;
+  },
+  homeCaches: (v, p) => {
+    if (v !== "rw" && v !== "ro") throw new Error(`${p}: "homeCaches" must be "rw" or "ro"`);
+    return v;
+  },
+  network: (v, p) => {
+    if (v !== "allow" && v !== "deny") throw new Error(`${p}: "network" must be "allow" or "deny"`);
+    return v;
+  },
+  userCommands: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "userCommands" must be a boolean`);
+    return v;
+  },
+  loginShell: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "loginShell" must be a boolean`);
+    return v;
+  },
+  landlockHelper: (v, p) => {
+    if (typeof v !== "string" || v.length === 0)
+      throw new Error(`${p}: "landlockHelper" must be a non-empty string`);
+    return v;
+  },
+  failIfUnavailable: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "failIfUnavailable" must be a boolean`);
+    return v;
+  },
+  blockTerminates: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "blockTerminates" must be a boolean`);
+    return v;
+  },
+  classifier: (v, p) => {
+    if (v !== "off" && v !== "jev") throw new Error(`${p}: "classifier" must be "off" or "jev"`);
+    return v;
+  },
+  classifierConfirmThreshold: (v, p) => {
+    if (typeof v !== "number" || v < 0 || v > 1)
+      throw new Error(`${p}: "classifierConfirmThreshold" must be a number between 0 and 1`);
+    return v;
+  },
+  classifierDenyThreshold: (v, p) => {
+    if (typeof v !== "number" || v < 0 || v > 1)
+      throw new Error(`${p}: "classifierDenyThreshold" must be a number between 0 and 1`);
+    return v;
+  },
+  classifierModel: (v, p) => {
+    if (typeof v !== "string" || v.length === 0)
+      throw new Error(`${p}: "classifierModel" must be a non-empty string`);
+    return v;
+  },
+  classifierTimeoutMs: (v, p) => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 1 || v > MAX_CLASSIFIER_TIMEOUT_MS)
+      throw new Error(
+        `${p}: "classifierTimeoutMs" must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS}`,
+      );
+    return Math.round(v);
+  },
+};
+
 export function parseSandboxConfig(raw: unknown, configPath: string): SandboxConfig {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error(`${configPath}: expected a JSON object`);
@@ -225,125 +305,10 @@ export function parseSandboxConfig(raw: unknown, configPath: string): SandboxCon
     }
   }
   const config: SandboxConfig = {};
-  if (obj.enabled !== undefined) {
-    if (typeof obj.enabled !== "boolean")
-      throw new Error(`${configPath}: "enabled" must be a boolean`);
-    config.enabled = obj.enabled;
-  }
-  if (obj.runner !== undefined) {
-    if (
-      typeof obj.runner !== "string" ||
-      !(SANDBOX_RUNNER_CHOICES as readonly string[]).includes(obj.runner)
-    ) {
-      throw new Error(
-        `${configPath}: "runner" must be one of: ${SANDBOX_RUNNER_CHOICES.join(", ")}`,
-      );
+  for (const [key, validator] of Object.entries(SANDBOX_KEY_VALIDATORS)) {
+    if (obj[key] !== undefined) {
+      (config as Record<string, unknown>)[key] = validator(obj[key], configPath);
     }
-    config.runner = obj.runner as SandboxRunnerChoice;
-  }
-  if (obj.writable !== undefined) {
-    if (
-      !Array.isArray(obj.writable) ||
-      obj.writable.some((p) => typeof p !== "string" || p.length === 0)
-    ) {
-      throw new Error(`${configPath}: "writable" must be an array of non-empty strings`);
-    }
-    config.writable = obj.writable as string[];
-  }
-  if (obj.home !== undefined) {
-    if (obj.home !== "rw" && obj.home !== "ro") {
-      throw new Error(`${configPath}: "home" must be "rw" or "ro"`);
-    }
-    config.home = obj.home;
-  }
-  if (obj.homeCaches !== undefined) {
-    if (obj.homeCaches !== "rw" && obj.homeCaches !== "ro") {
-      throw new Error(`${configPath}: "homeCaches" must be "rw" or "ro"`);
-    }
-    config.homeCaches = obj.homeCaches;
-  }
-  if (obj.network !== undefined) {
-    if (obj.network !== "allow" && obj.network !== "deny") {
-      throw new Error(`${configPath}: "network" must be "allow" or "deny"`);
-    }
-    config.network = obj.network;
-  }
-  if (obj.userCommands !== undefined) {
-    if (typeof obj.userCommands !== "boolean") {
-      throw new Error(`${configPath}: "userCommands" must be a boolean`);
-    }
-    config.userCommands = obj.userCommands;
-  }
-  if (obj.loginShell !== undefined) {
-    if (typeof obj.loginShell !== "boolean") {
-      throw new Error(`${configPath}: "loginShell" must be a boolean`);
-    }
-    config.loginShell = obj.loginShell;
-  }
-  if (obj.landlockHelper !== undefined) {
-    if (typeof obj.landlockHelper !== "string" || obj.landlockHelper.length === 0) {
-      throw new Error(`${configPath}: "landlockHelper" must be a non-empty string`);
-    }
-    config.landlockHelper = obj.landlockHelper;
-  }
-  if (obj.failIfUnavailable !== undefined) {
-    if (typeof obj.failIfUnavailable !== "boolean") {
-      throw new Error(`${configPath}: "failIfUnavailable" must be a boolean`);
-    }
-    config.failIfUnavailable = obj.failIfUnavailable;
-  }
-  if (obj.blockTerminates !== undefined) {
-    if (typeof obj.blockTerminates !== "boolean") {
-      throw new Error(`${configPath}: "blockTerminates" must be a boolean`);
-    }
-    config.blockTerminates = obj.blockTerminates;
-  }
-  if (obj.classifier !== undefined) {
-    if (obj.classifier !== "off" && obj.classifier !== "jev") {
-      throw new Error(`${configPath}: "classifier" must be "off" or "jev"`);
-    }
-    config.classifier = obj.classifier;
-  }
-  if (obj.classifierConfirmThreshold !== undefined) {
-    if (
-      typeof obj.classifierConfirmThreshold !== "number" ||
-      obj.classifierConfirmThreshold < 0 ||
-      obj.classifierConfirmThreshold > 1
-    ) {
-      throw new Error(
-        `${configPath}: "classifierConfirmThreshold" must be a number between 0 and 1`,
-      );
-    }
-    config.classifierConfirmThreshold = obj.classifierConfirmThreshold;
-  }
-  if (obj.classifierDenyThreshold !== undefined) {
-    if (
-      typeof obj.classifierDenyThreshold !== "number" ||
-      obj.classifierDenyThreshold < 0 ||
-      obj.classifierDenyThreshold > 1
-    ) {
-      throw new Error(`${configPath}: "classifierDenyThreshold" must be a number between 0 and 1`);
-    }
-    config.classifierDenyThreshold = obj.classifierDenyThreshold;
-  }
-  if (obj.classifierModel !== undefined) {
-    if (typeof obj.classifierModel !== "string" || obj.classifierModel.length === 0) {
-      throw new Error(`${configPath}: "classifierModel" must be a non-empty string`);
-    }
-    config.classifierModel = obj.classifierModel;
-  }
-  if (obj.classifierTimeoutMs !== undefined) {
-    if (
-      typeof obj.classifierTimeoutMs !== "number" ||
-      !Number.isFinite(obj.classifierTimeoutMs) ||
-      obj.classifierTimeoutMs < 1 ||
-      obj.classifierTimeoutMs > MAX_CLASSIFIER_TIMEOUT_MS
-    ) {
-      throw new Error(
-        `${configPath}: "classifierTimeoutMs" must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS}`,
-      );
-    }
-    config.classifierTimeoutMs = Math.round(obj.classifierTimeoutMs);
   }
   return config;
 }
