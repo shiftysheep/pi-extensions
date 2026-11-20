@@ -8,13 +8,8 @@
  */
 
 import { renameSync } from "node:fs";
-import { type Model, type Usage, uuidv7 } from "@earendil-works/pi-ai";
-import type {
-  AgentToolResult,
-  AgentToolUpdateCallback,
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { uuidv7 } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   CONFIG_PATH,
@@ -23,7 +18,7 @@ import {
   saveConfig,
   saveConfigValidated,
 } from "./advisor/config.js";
-import { advisorExecute, buildResult, type CandidateAttempt } from "./advisor/execute.js";
+import { advisorExecute, type CandidateAttempt } from "./advisor/execute.js";
 import {
   type AdvisorSlot,
   findModel,
@@ -42,7 +37,6 @@ import {
   type AdvisorConfig,
   type AdvisorReasoningEffort,
   type AdvisorTarget,
-  addUsage,
   buildCandidates,
   capDiagnosticText,
   composeAdviceText,
@@ -103,6 +97,78 @@ export default function (pi: ExtensionAPI) {
   const usageHints =
     'Usage:\n  /advisor                              show current configuration, then offer the interactive picker\n  /advisor set <primary>,<fallback>   set both (provider/model ids; provider optional if unambiguous)\n  /advisor primary|fallback <spec>    change one slot\n  /advisor effort <level>             set the shared default reasoning effort (none|minimal|low|medium|high|xhigh|max)\n  /advisor clear [slot]               remove a slot, the default effort (effort=slot), or everything (no slot)\n  /advisor reset                      back up the config to advisor.json.bak and start clean (recovers from a broken file)\n\nadvisor.json is strictly validated: unknown keys (in the top level or a model slot) are rejected with an error naming the field, and primary/fallback must be different models. Optional keys: reasoningEffort, activeModelFallback (bool), timeoutMs (ms, clamped 30 s..30 min, covers the whole consultation including the fallback chain; the per-call timeoutMs parameter overrides it).\n\nSpecs may end with @effort to set a per-model effort: /advisor primary openai-codex/gpt-6-astra@high\nNo model is ever picked implicitly: with no configured slots the advisor fails and points back at /advisor. The active model of the calling session is only retried last when "activeModelFallback": true is set in advisor.json — that is a self-review, and the tool result says so. Effort "none" requests no reasoning level (session default); it does not force reasoning off.\nThe advisor tool does NOT see the session by default: cite workspace paths for anything on disk, and paste only evidence that exists nowhere on disk (includeSession:true opt-in attaches the redacted transcript as optional, verify-against-the-workspace context). Every consultation runs in an isolated child pi process with a throwaway agent dir (only a copy of auth.json, mode 0600; removed in a finally block) — a privilege boundary, not a filesystem sandbox. Optional key piBinary (path to the pi binary to spawn; default "pi" on PATH, or $PI_BINARY). Tool modes: "review" (default, single model call) and "explore" (read-only sub-agent with read/grep/find/ls that verifies against the workspace itself; bounded by the consultation timeout only — tool-call count, model-request count, and elapsed time are reported for cost visibility, but never abort a consultation). At most 2 consultations run concurrently (extras queue, never reject); returned advice is capped at 100k characters and error diagnostics at 4k, both marked with a visible [truncated] notice.';
 
+  /** Handle a /advisor subcommand: mutate the config and return the updated config (or throw). */
+  function handleAdvisorSubcommand(
+    sub: string,
+    parts: string[],
+    config: AdvisorConfig,
+    ctx: ExtensionContext,
+  ): AdvisorConfig {
+    if (sub === "reset") {
+      if (parts.length > 1)
+        throw new Error(
+          "/advisor reset takes no arguments. It moves advisor.json to advisor.json.bak and writes an empty config.",
+        );
+      return {};
+    }
+    if (sub === "show" || sub === "--help") {
+      return config;
+    }
+    if (sub === "set") {
+      const specs = parts
+        .slice(1)
+        .join(" ")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (specs.length !== 2)
+        throw new Error(
+          `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      config.primary = resolveSpec(ctx, specs[0]);
+      config.fallback = resolveSpec(ctx, specs[1]);
+      return config;
+    }
+    if (sub === "primary" || sub === "fallback" || sub === "secondary") {
+      const slot: AdvisorSlot = slotFromArg(sub);
+      if (parts.length !== 2)
+        throw new Error(
+          `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      config[slot] = resolveSpec(ctx, parts[1]);
+      return config;
+    }
+    if (sub === "clear") {
+      if (parts.length > 2)
+        throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
+      if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
+        delete config.reasoningEffort;
+      } else {
+        const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
+        if (slot) delete config[slot];
+        else {
+          delete config.primary;
+          delete config.fallback;
+        }
+      }
+      return config;
+    }
+    if (sub === "effort") {
+      if (parts.length !== 2)
+        throw new Error(
+          `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
+        );
+      const level = parts[1];
+      if (!isReasoningEffort(level))
+        throw new Error(
+          `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
+        );
+      config.reasoningEffort = level;
+      return config;
+    }
+    throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
+  }
+
   pi.registerCommand("advisor", {
     description:
       "Configure advisor (second-opinion) models in ~/.pi/agent/advisor.json; no args shows config and offers the picker.",
@@ -115,7 +181,6 @@ export default function (pi: ExtensionAPI) {
         : "";
 
       async function interactivePicker(): Promise<void> {
-        // Collect both picks before writing: Esc at either prompt aborts the whole change.
         const pickedPrimary = await pickModel(ctx, "primary");
         if (pickedPrimary === undefined) return;
         const pickedFallback = await pickModel(ctx, "fallback");
@@ -148,10 +213,6 @@ export default function (pi: ExtensionAPI) {
 
       const sub = parts[0];
       if (sub === "reset") {
-        if (parts.length > 1)
-          throw new Error(
-            "/advisor reset takes no arguments. It moves advisor.json to advisor.json.bak and writes an empty config.",
-          );
         let backedUp: string | undefined;
         try {
           renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
@@ -171,57 +232,11 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`${warn}${describeConfig(config, activeLabel)}\n\n${usageHints}`, "info");
         return;
       }
-      if (sub === "set") {
-        const specs = parts
-          .slice(1)
-          .join(" ")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        if (specs.length !== 2)
-          throw new Error(
-            `/advisor set expects two model specs: /advisor set <primary>,<fallback>\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        config.primary = resolveSpec(ctx, specs[0]);
-        config.fallback = resolveSpec(ctx, specs[1]);
-      } else if (sub === "primary" || sub === "fallback" || sub === "secondary") {
-        const slot: AdvisorSlot = slotFromArg(sub);
-        if (parts.length !== 2)
-          throw new Error(
-            `/advisor ${slot} needs exactly one model spec.\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        config[slot] = resolveSpec(ctx, parts[1]);
-      } else if (sub === "clear") {
-        if (parts.length > 2)
-          throw new Error("/advisor clear takes at most one slot: primary, fallback, or effort.");
-        if (parts.length === 2 && parts[1].toLowerCase() === "effort") {
-          delete config.reasoningEffort;
-        } else {
-          const slot = parts.length === 1 ? undefined : slotFromArg(parts[1]);
-          if (slot) delete config[slot];
-          else {
-            delete config.primary;
-            delete config.fallback;
-          }
-        }
-      } else if (sub === "effort") {
-        if (parts.length !== 2)
-          throw new Error(
-            `/advisor effort needs one level: ${REASONING_EFFORTS.join(", ")}.\n\n${describeConfig(config)}\n\n${usageHints}`,
-          );
-        const level = parts[1];
-        if (!isReasoningEffort(level))
-          throw new Error(
-            `Invalid advisor effort "${level}". Expected one of: ${REASONING_EFFORTS.join(", ")}.`,
-          );
-        config.reasoningEffort = level;
-      } else {
-        throw new Error(`Unknown advisor subcommand "${sub}".\n\n${usageHints}`);
-      }
 
-      const backedUp = saveConfigValidated(config, loadError);
+      const updatedConfig = handleAdvisorSubcommand(sub, parts, config, ctx);
+      const backedUp = saveConfigValidated(updatedConfig, loadError);
       ctx.ui.notify(
-        `${warn}advisor updated:\n${describeConfig(config, activeLabel)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
+        `${warn}advisor updated:\n${describeConfig(updatedConfig, activeLabel)}${backedUp ? `\n(Broken previous file backed up to ${CONFIG_PATH}.bak.)` : ""}`,
         "info",
       );
     },

@@ -19,7 +19,9 @@
     "rules": {
       "preset": "recommended",
       "style": {
-        "noNonNullAssertion": "warn"
+        "noNonNullAssertion": "warn",
+        "noInferrableTypes": "error",
+        "noParameterAssign": "error"
       },
       "suspicious": {
         "noExplicitAny": "warn"
@@ -27,8 +29,9 @@
       "complexity": {
         "noExcessiveCognitiveComplexity": {
           "level": "error",
-          "options": { "maxAllowedComplexity": 80 }
-        }
+          "options": { "maxAllowedComplexity": 65 }
+        },
+        "noUselessContinue": "error"
       }
     }
   },
