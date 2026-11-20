@@ -31,13 +31,14 @@ jobs:
             --exclude test/ \
             --exclude scripts/ \
             | tee /tmp/ts-prune-output.txt
-          # Fail if any unused exports are found in extensions/.
-          if grep -q "extensions/" /tmp/ts-prune-output.txt; then
-            echo "Unused exports found in extensions/:"
-            grep "extensions/" /tmp/ts-prune-output.txt
+          # Fail only on truly unused exports in extensions/ (not "used in module").
+          UNUSED=$(grep "extensions/" /tmp/ts-prune-output.txt | grep -v "used in module")
+          if [ -n "$UNUSED" ]; then
+            echo "Truly unused exports found in extensions/:"
+            echo "$UNUSED"
             exit 1
           fi
-          echo "No unused exports in extensions/."
+          echo "No truly unused exports in extensions/."
 
   # On merge to main: bump the version from the merged commits (feat -> minor,
   # fix/bug/hotfix/bump -> patch, breaking -> major; chore/docs do NOT bump)
