@@ -193,7 +193,10 @@ describe("callJev", () => {
       const fetchImpl = (async () => resp(status, {})) as unknown as typeof fetch;
       const r = await callJev({}, { apiKey: "k", fetchImpl });
       assert.equal(r.ok, false, String(status));
-      if (!r.ok) assert.match(r.error, new RegExp(String(status)));
+      if (!r.ok) {
+        assert.match(r.error, new RegExp(String(status)));
+        assert.equal(r.status, status);
+      }
     }
   });
   it("reports an unexpected status", async () => {

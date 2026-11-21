@@ -27,7 +27,7 @@ export type JevCallOptions = {
 
 export type JevCallResult =
   | { ok: true; body: unknown }
-  | { ok: false; error: string; cancelled?: boolean };
+  | { ok: false; error: string; cancelled?: boolean; status?: number };
 
 const DEFAULT_BASE_URL = "https://api.typesafe.ai";
 /** Default per-call Jev timeout in ms — the single source of truth. */
@@ -81,7 +81,7 @@ export async function callJev(request: unknown, opts: JevCallOptions): Promise<J
     if (!res.ok) {
       // Release the connection instead of leaving the body unconsumed.
       if (res.body) void res.body.cancel().catch(() => {});
-      return { ok: false, error: classifyStatus(res.status) };
+      return { ok: false, error: classifyStatus(res.status), status: res.status };
     }
     try {
       return { ok: true, body: await res.json() };

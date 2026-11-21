@@ -551,7 +551,7 @@ export default function (pi: ExtensionAPI) {
       timeoutMs: config.classifierTimeoutMs,
       signal: ctx.signal,
     });
-    if (!result.ok && result.error.includes("authentication failed (401)")) clearApiKeyCache();
+    if (!result.ok && result.status === 401) clearApiKeyCache();
     if (!result.ok) {
       if (result.cancelled) return undefined;
       warnClassifierOnce(

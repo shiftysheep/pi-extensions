@@ -75,7 +75,7 @@ The extension ignores a missing, malformed, symlinked, or insufficiently private
 Enable **`classifierKeychain`** in `/sandbox config` or set it to `true` in the global `~/.pi/agent/sandbox.json`. Then create a password entry with service **`pi-extensions`**, account **`typesafe-api-key`**, and the TypeSafe API key as its password:
 
 - **macOS:** In Keychain Access, add a Generic Password with those Account and Where (service) values.
-- **Windows:** In Credential Manager, add a Generic Credential with those target/service and user/account values.
+- **Windows:** In Credential Manager, add a Generic Credential with target **`typesafe-api-key.pi-extensions`** and user name **`typesafe-api-key`**. The native keyring library uses that target by default.
 - **Linux:** Use a Secret Service compatible keyring (such as GNOME Keyring, KWallet, or KeePassXC Secret Service). The extension requires persistent Secret Service storage; it does not use the Linux kernel keyring fallback.
 
 The extension reads the entry when a Jev check is needed, caches it briefly in memory, and falls back to the private file if the credential store is unavailable. A keychain miss is retried after a few seconds, so a newly added entry becomes available without restarting pi. Do not put the key in project config or shell command arguments.

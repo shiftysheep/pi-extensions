@@ -30,8 +30,6 @@ export type ApiKeySource = "env" | "file" | "keychain";
 export type ResolvedApiKey = {
   key: string;
   source: ApiKeySource;
-  /** Where the key came from (path or literal "env"/"keychain") — safe to show. */
-  detail: string;
 };
 
 const KEYCHAIN_SERVICE = "pi-extensions";
@@ -70,8 +68,15 @@ function isPrivateDirectory(directory: string): boolean {
 
 function readPrivateFile(file: string): string | undefined {
   let fd: number;
+  const noFollow = fs.constants.O_NOFOLLOW;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK keeps opening a FIFO from hanging before fstat can reject it.
+    // Windows lacks O_NOFOLLOW, so reject a symlink before opening there.
+    if (noFollow === undefined && fs.lstatSync(file).isSymbolicLink()) return undefined;
+    fd = fs.openSync(
+      file,
+      fs.constants.O_RDONLY | (noFollow ?? 0) | (fs.constants.O_NONBLOCK ?? 0),
+    );
   } catch {
     return undefined;
   }
@@ -164,13 +169,13 @@ export async function resolveApiKey(
 ): Promise<ResolvedApiKey | undefined> {
   const env = opts.env ?? process.env;
   const fromEnv = env[TYPESAFE_API_KEY_ENV]?.trim();
-  if (fromEnv) return { key: fromEnv, source: "env", detail: TYPESAFE_API_KEY_ENV };
+  if (fromEnv) return { key: fromEnv, source: "env" };
   if (opts.useKeychain) {
     const fromKeychain = await readKeychainCached(opts.readKeychain ?? readKeychain);
-    if (fromKeychain) return { key: fromKeychain, source: "keychain", detail: KEYCHAIN_SERVICE };
+    if (fromKeychain) return { key: fromKeychain, source: "keychain" };
   }
   const file = opts.filePath ?? apiKeyFilePath({ home: opts.home });
   const fromFile = readApiKeyFile(file);
-  if (fromFile) return { key: fromFile, source: "file", detail: file };
+  if (fromFile) return { key: fromFile, source: "file" };
   return undefined;
 }

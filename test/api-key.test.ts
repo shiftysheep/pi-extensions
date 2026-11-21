@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -52,11 +53,12 @@ describe("readApiKeyFile", () => {
   });
 
   it("rejects group/other-readable files", () => {
+    if (process.platform === "win32") return;
     const file = writeFile("k", "ts-key-123", 0o644);
     assert.equal(readApiKeyFile(file), undefined);
   });
 
-  it("rejects files inside a non-private directory", () => {
+  it("rejects files inside a non-private directory", { skip: process.platform === "win32" }, () => {
     const file = writeFile("open-dir/k", "ts-key-123", 0o600);
     fs.chmodSync(path.dirname(file), 0o755);
     assert.equal(readApiKeyFile(file), undefined);
@@ -69,16 +71,39 @@ describe("readApiKeyFile", () => {
     assert.equal(readApiKeyFile(file2), undefined);
   });
 
-  it("rejects symlinks and absent files", () => {
+  it("rejects symlinks where supported", (t) => {
     const target = writeFile("real", "ts-key-123", 0o600);
     const link = path.join(tmpDir, "link");
     try {
       fs.symlinkSync(target, link);
-      assert.equal(readApiKeyFile(link), undefined);
-    } catch {
-      // symlink unsupported — skip silently
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EACCES") {
+        t.skip("symlink creation is not permitted on this system");
+        return;
+      }
+      throw error;
     }
+    assert.equal(readApiKeyFile(link), undefined);
+  });
+
+  it("rejects absent files", () => {
     assert.equal(readApiKeyFile(path.join(tmpDir, "nope")), undefined);
+  });
+
+  it("rejects a FIFO without waiting for a writer", { skip: process.platform === "win32" }, () => {
+    const fifo = path.join(tmpDir, "fifo");
+    try {
+      execFileSync("mkfifo", [fifo]);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const moduleUrl = new URL("../extensions/permission-gate/api-key.ts", import.meta.url).href;
+    const script = `const { readApiKeyFile } = await import(${JSON.stringify(moduleUrl)}); if (readApiKeyFile(${JSON.stringify(fifo)}) !== undefined) process.exit(1);`;
+    execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+      timeout: 2000,
+    });
   });
 
   it("rejects oversized files", () => {
@@ -96,7 +121,7 @@ describe("resolveApiKey", () => {
       useKeychain: true,
       readKeychain: async () => "ts-keychain-key",
     });
-    assert.deepEqual(r, { key: "ts-env-key", source: "env", detail: TYPESAFE_API_KEY_ENV });
+    assert.deepEqual(r, { key: "ts-env-key", source: "env" });
   });
 
   it("falls back to the file", async () => {
