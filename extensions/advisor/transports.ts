@@ -72,30 +72,30 @@ function prepareChildWorkDir(
     const hostFile = join(hostAgentDir, name);
     if (!existsSync(hostFile)) continue;
     // Scrub secret-bearing fields (apiKey, accessToken, ...) before copying;
-    // an unparseable catalog is never copied raw.
+    // an unparseable catalog is never copied raw. Write failures must propagate:
+    // a partially-written catalog must not reach the child.
+    let scrubbed: string;
     try {
-      const scrubbed = scrubModelCatalog(readFileSync(hostFile, "utf8"));
-      writeFileSync(join(workDir, name), scrubbed, { mode: 0o600 });
-      chmodSync(join(workDir, name), 0o600);
+      scrubbed = scrubModelCatalog(readFileSync(hostFile, "utf8"));
     } catch {
-      // Never copy an unverified model catalog to the child.
+      continue; // Never copy an unverified model catalog to the child.
     }
+    writeFileSync(join(workDir, name), scrubbed, { mode: 0o600 });
+    chmodSync(join(workDir, name), 0o600);
   }
   const hostAuth = join(hostAgentDir, "auth.json");
   if (existsSync(hostAuth)) {
+    let stripped: string;
     try {
-      writeFileSync(
-        join(workDir, "auth.json"),
-        stripRefreshTokens(readFileSync(hostAuth, "utf8")),
-        {
-          mode: 0o400,
-        },
-      );
+      stripped = stripRefreshTokens(readFileSync(hostAuth, "utf8"));
     } catch {
       // Fail closed: skip the copy entirely rather than let the child see an
       // unverified credential file. The child then fails auth and the fallback
       // chain takes over.
+      return;
     }
+    // A write failure must propagate so createChildWorkDir cleans up the work dir.
+    writeFileSync(join(workDir, "auth.json"), stripped, { mode: 0o400 });
   }
 }
 

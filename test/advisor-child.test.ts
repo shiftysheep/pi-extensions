@@ -268,6 +268,56 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     }
   });
 
+  it("scrubs both catalog files (models.json and models-store.json) for the child", async () => {
+    const hostDir = mkdtempSync(join(tmpdir(), "advisor-host-scrub2-"));
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = hostDir;
+    const outFile = join(process.cwd(), ".advisor-child-test-scrub2");
+    try {
+      writeFileSync(
+        join(hostDir, "models.json"),
+        JSON.stringify({
+          providers: {
+            p: {
+              apiKey: "$CHILD_TOKEN",
+              baseUrl: "https://example.com/v1",
+              headers: { Authorization: "$AUTH_TOKEN", "X-Safe": "plain" },
+            },
+          },
+        }),
+      );
+      writeFileSync(
+        join(hostDir, "models-store.json"),
+        JSON.stringify({
+          providers: { q: { apiKey: "sk-literal-secret", baseUrl: "http://127.0.0.1:5000/v1" } },
+        }),
+      );
+      const bin = fakePi(
+        'const fs=require("node:fs");const p=require("node:path");const dir=process.env.PI_CODING_AGENT_DIR;' +
+          "fs.writeFileSync(" +
+          JSON.stringify(outFile) +
+          ',"models:"+fs.readFileSync(p.join(dir,"models.json"),"utf8")+"\\nstore:"+fs.readFileSync(p.join(dir,"models-store.json"),"utf8"));' +
+          msgEndScript("ok", { stopReason: "stop" }),
+      );
+      const result = await consult(bin);
+      assert.equal(result.status, "completed");
+      const out = readFileSync(outFile, "utf8");
+      const modelFile = JSON.parse(out.split("\nstore:")[0].slice("models:".length)) as any;
+      assert.equal(modelFile.providers.p.apiKey, "$CHILD_TOKEN");
+      assert.equal(modelFile.providers.p.models, undefined);
+      assert.equal(modelFile.providers.p.headers?.Authorization, undefined);
+      assert.equal(modelFile.providers.p.headers?.["X-Safe"], "plain");
+      const storeFile = JSON.parse(out.split("\nstore:")[1]) as any;
+      assert.equal(storeFile.providers.q.apiKey, undefined);
+      assert.equal(storeFile.providers.q.baseUrl, "http://127.0.0.1:5000/v1");
+    } finally {
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(hostDir, { recursive: true, force: true });
+      rmSync(outFile, { force: true });
+    }
+  });
+
   it("refuses to copy auth.json at all when it cannot be parsed", async () => {
     const hostDir = mkdtempSync(join(tmpdir(), "advisor-host-badauth-"));
     const savedAgentDir = process.env.PI_CODING_AGENT_DIR;

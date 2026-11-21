@@ -35,6 +35,23 @@ export function loadConfigSafe(): { config: AdvisorConfig; loadError?: string } 
 }
 
 /**
+ * Rename the existing config to `advisor.json.bak` (mode 0600) so the previous bytes
+ * survive a reset or a repair. Returns the backup path, or undefined when no config
+ * existed. Other rename errors propagate.
+ */
+export function backupExistingConfig(): string | undefined {
+  try {
+    renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
+    chmodSync(`${CONFIG_PATH}.bak`, 0o600);
+    return `${CONFIG_PATH}.bak`;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
  * Validate the mutated config with parseConfig BEFORE touching the file (e.g.
  * `/advisor set a/m,a/m` must not save a same-model pair that the next call
  * would reject), back up a broken previous file, then save.
@@ -48,18 +65,8 @@ export function saveConfigValidated(config: AdvisorConfig, loadError: string | u
       `Not saved: ${(error as Error).message}\nThe previous configuration is unchanged.`,
     );
   }
-  let backedUp = false;
-  if (loadError) {
-    // Repairing a broken file: keep the previous bytes instead of overwriting them.
-    try {
-      renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
-      chmodSync(`${CONFIG_PATH}.bak`, 0o600);
-      backedUp = true;
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-        throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
-    }
-  }
+  // Repairing a broken file: keep the previous bytes instead of overwriting them.
+  const backedUp = loadError ? !!backupExistingConfig() : false;
   saveConfig(config);
   return backedUp;
 }

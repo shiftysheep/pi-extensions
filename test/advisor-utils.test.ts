@@ -1225,6 +1225,82 @@ describe("scrubModelCatalog", () => {
     assert.equal(out.providers.exllama.models[0].id, "m");
   });
 
+  it("keeps credential env references but drops literal and command-based credentials", () => {
+    const input = JSON.stringify({
+      providers: {
+        a: {
+          apiKey: "$MY_API_KEY",
+          headers: { Authorization: "$AUTH_TOKEN", "X-Api-Key": "$OTHER" },
+        },
+        b: { apiKey: "!cat ~/.aws/credentials" },
+        c: { apiKey: "sk-secret-literal" },
+        d: { apiKey: "literal-placeholder" },
+      },
+    });
+    const out = JSON.parse(scrubModelCatalog(input)) as any;
+    assert.equal(out.providers.a.apiKey, "$MY_API_KEY");
+    assert.equal(
+      out.providers.a.headers.Authorization,
+      undefined,
+      "sensitive header keys are dropped",
+    );
+    assert.equal(
+      out.providers.a.headers["X-Api-Key"],
+      undefined,
+      "sensitive header keys are dropped",
+    );
+    assert.equal(
+      out.providers.b.apiKey,
+      undefined,
+      "command credentials must never reach the child",
+    );
+    assert.equal(
+      out.providers.c.apiKey,
+      undefined,
+      "literal credentials must never reach the child",
+    );
+    assert.equal(out.providers.d.apiKey, undefined);
+  });
+
+  it("drops synthetic credential-looking values with stray dollar signs", () => {
+    const input = JSON.stringify({
+      providers: {
+        a: { apiKey: "dummy$-literal", headers: { "X-Custom": "sk-aaaaaaaaaaaaaaaaaaaa$" } },
+      },
+    });
+    const out = JSON.parse(scrubModelCatalog(input)) as any;
+    assert.equal(out.providers.a.apiKey, undefined);
+    assert.equal(out.providers.a.headers["X-Custom"], undefined);
+  });
+
+  it("drops headers with literal secrets and literal userinfo in baseUrl", () => {
+    const input = JSON.stringify({
+      providers: {
+        a: {
+          baseUrl: "https://user:pass@example.com/v1",
+          headers: { "X-Custom-Token": "short-but-real-looking-literal", "X-Safe": "plain" },
+        },
+      },
+    });
+    const out = JSON.parse(scrubModelCatalog(input)) as any;
+    assert.equal(out.providers.a.baseUrl, undefined);
+    assert.equal(out.providers.a.headers["X-Safe"], "plain");
+  });
+
+  it("drops baseUrl values that embed credentials and keeps plain URLs", () => {
+    const input = JSON.stringify({
+      providers: {
+        a: { baseUrl: "http://127.0.0.1:5000/v1" },
+        b: { baseUrl: "https://user:p@ss@example.com/v1" },
+        c: { models: [{ id: "m", baseUrl: "https://user:pass@example.com/v1" }] },
+      },
+    });
+    const out = JSON.parse(scrubModelCatalog(input)) as any;
+    assert.equal(out.providers.a.baseUrl, "http://127.0.0.1:5000/v1");
+    assert.equal(out.providers.b.baseUrl, undefined);
+    assert.equal(out.providers.c.models[0].baseUrl, undefined);
+  });
+
   it("throws on unparseable input (fail closed)", () => {
     assert.throws(() => scrubModelCatalog("not json"), /could not be parsed/);
     assert.throws(() => scrubModelCatalog("[1,2,3]"), /must be an object/);
