@@ -11,7 +11,7 @@
     "lint": "biome check",
     "format": "biome check --write",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/permission-gate-classifier.test.ts test/classifier-benchmark.test.ts test/status-line.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
+    "test": "node --import tsx --test test/api-key.test.ts test/advisor-utils.test.ts test/advisor-child.test.ts test/permission-gate.test.ts test/permission-gate-classifier.test.ts test/classifier-benchmark.test.ts test/status-line.test.ts test/sandbox-utils.test.ts test/sandbox-landlock.test.ts test/sandbox-seatbelt.test.ts test/sandbox-bwrap.test.ts",
     "check": "biome check && tsc --noEmit && npm test",
     "benchmark:classifier": "node --import tsx scripts/classifier-benchmark.ts",
     "eval:advisor": "bash scripts/run-advisor-eval.sh",
@@ -29,6 +29,7 @@
     "@earendil-works/pi-server": "^1.1.0",
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
+    "@napi-rs/keyring": "^2.1.2",
     "@upstash/context7-pi": "^0.1.2",
     "pi-subagents": "^0.89.1",
     "pi-web-access": "^0.28.0"
@@ -38,6 +39,7 @@
     "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
+    "@napi-rs/keyring",
     "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"
@@ -86,6 +88,7 @@
     "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
+    "@napi-rs/keyring",
     "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"

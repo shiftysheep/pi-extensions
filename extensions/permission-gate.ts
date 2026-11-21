@@ -121,6 +121,7 @@ import {
   sandboxStateSignature,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
+import { clearApiKeyCache, resolveApiKey } from "./permission-gate/api-key.js";
 import {
   buildClassifierRequest,
   type ClassifierShell,
@@ -363,6 +364,7 @@ const CLASSIFIER_OPTIONS = [
   "classifierDenyThreshold",
   "classifierModel",
   "classifierTimeoutMs",
+  "classifierKeychain",
 ] as const;
 type ClassifierOption = (typeof CLASSIFIER_OPTIONS)[number];
 
@@ -455,6 +457,11 @@ function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
       label: `classifierTimeoutMs: ${draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS}`,
       description: `per-call Jev request timeout in ms (default ${DEFAULT_CLASSIFIER_TIMEOUT_MS})`,
     },
+    {
+      value: "classifierKeychain",
+      label: `classifierKeychain: ${draft.classifierKeychain ?? "false"}`,
+      description: "read the TypeSafe API key from the OS credential store before the private file",
+    },
     { value: "save", label: "— save —", description: "write the config file and re-apply" },
     { value: "cancel", label: "— cancel —", description: "discard changes" },
   ];
@@ -524,22 +531,27 @@ export default function (pi: ExtensionAPI) {
     shell: ClassifierShell,
   ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
     if (config.classifier !== "jev" || !command) return undefined;
-    const apiKey = process.env[TYPESAFE_API_KEY_ENV];
-    if (!apiKey) {
+    const resolved = await resolveApiKey({ useKeychain: config.classifierKeychain });
+    if (!resolved) {
+      const keychainHint = config.classifierKeychain
+        ? "configured keychain entry is unavailable, and "
+        : "";
       warnClassifierOnce(
         ctx,
         () => classifierNoKeyWarned,
         () => (classifierNoKeyWarned = true),
-        `Classifier enabled (classifier: jev) but ${TYPESAFE_API_KEY_ENV} is not set — Jev classification is skipped.`,
+        `Classifier enabled (classifier: jev) but no TypeSafe API key found (${TYPESAFE_API_KEY_ENV} is unset, ${keychainHint}and ~/.pi/credentials/typesafe-api-key is absent or unsafe) — Jev classification is skipped.`,
       );
       return undefined;
     }
+    const apiKey = resolved.key;
     const model = config.classifierModel ?? DEFAULT_JEV_MODEL;
     const result = await callJev(buildClassifierRequest(command, model, shell), {
       apiKey,
       timeoutMs: config.classifierTimeoutMs,
       signal: ctx.signal,
     });
+    if (!result.ok && result.status === 401) clearApiKeyCache();
     if (!result.ok) {
       if (result.cancelled) return undefined;
       warnClassifierOnce(
@@ -1043,6 +1055,13 @@ export default function (pi: ExtensionAPI) {
       }
       case "classifierTimeoutMs": {
         return promptClassifierTimeout(ctx, draft);
+      }
+      case "classifierKeychain": {
+        const value = await promptSelect(ctx, "Use OS keychain", [
+          { value: "false", label: "off", description: "use env var and private file only" },
+          { value: "true", label: "on", description: "try OS keychain, then private file" },
+        ]);
+        return value === undefined ? undefined : { classifierKeychain: value === "true" };
       }
     }
     // Unreachable: the switch above is exhaustive over ClassifierOption.

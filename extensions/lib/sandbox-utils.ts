@@ -37,6 +37,7 @@ export const SANDBOX_ALLOWED_KEYS = [
   "classifierDenyThreshold",
   "classifierModel",
   "classifierTimeoutMs",
+  "classifierKeychain",
 ] as const;
 
 /**
@@ -140,6 +141,8 @@ export type SandboxConfig = {
   classifierModel?: string;
   /** Per-call Jev request timeout, ms. Default 8000. */
   classifierTimeoutMs?: number;
+  /** Try the OS credential store before the private key file. Default: false. */
+  classifierKeychain?: boolean;
 };
 
 export type SandboxPolicy = {
@@ -281,6 +284,10 @@ const SANDBOX_KEY_VALIDATORS: Record<string, KeyValidator> = {
   classifierModel: (v, p) => {
     if (typeof v !== "string" || v.length === 0)
       throw new Error(`${p}: "classifierModel" must be a non-empty string`);
+    return v;
+  },
+  classifierKeychain: (v, p) => {
+    if (typeof v !== "boolean") throw new Error(`${p}: "classifierKeychain" must be a boolean`);
     return v;
   },
   classifierTimeoutMs: (v, p) => {

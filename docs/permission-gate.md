@@ -34,7 +34,7 @@ Off by default; enabling it makes **every** non-static-matched bash/PowerShell c
 - `risk ≥ classifierDenyThreshold` (default `0.85`) → **hard-block** (a model judgment, not a static rule — the message says so).
 - `risk ≥ classifierConfirmThreshold` (default `0.7`) → **confirm** prompt naming the concern(s) and probabilities.
 - otherwise → proceed.
-- **Fails open**: if `TYPESAFE_API_KEY` is unset, or the call errors / times out / returns a malformed body, the command proceeds (with a one-time warning) — the static tier still guards the hard cases. Pressing Esc during the call aborts it (no warning); in headless/print/JSON modes the one-time warning goes to stderr so stdout stays clean.
+- **Fails open**: if no API key is configured, or the call errors / times out / returns a malformed body, the command proceeds (with a one-time warning) — the static tier still guards the hard cases. Pressing Esc during the call aborts it (no warning); in headless/print/JSON modes the one-time warning goes to stderr so stdout stays clean.
 
 ### Config (`sandbox.json`)
 
@@ -45,8 +45,40 @@ Off by default; enabling it makes **every** non-static-matched bash/PowerShell c
 | `classifierDenyThreshold` | `0.85` | Probability at/above which a command is hard-blocked. |
 | `classifierModel` | `"jev-latest"` | Jev model id. |
 | `classifierTimeoutMs` | `8000` | Per-call request timeout (ms), capped at `60000`. |
+| `classifierKeychain` | `false` | Try the OS credential store between the environment variable and private key file. |
 
-The API key is read from the **`TYPESAFE_API_KEY` environment variable** — it is never stored in `sandbox.json`. All keys are editable in `/sandbox config` and shown in `/sandbox` status.
+The API key is resolved in this order: **`TYPESAFE_API_KEY`**, the OS credential store when `classifierKeychain: true`, then the private per-user file. The key is never stored in `sandbox.json`.
+
+### Setting up the API key file
+
+Create `~/.pi/credentials/typesafe-api-key` with the raw token on one line. On macOS or Linux, this command prompts without echoing the token and creates the private directory and file:
+
+```sh
+install -d -m 700 "$HOME/.pi/credentials"
+umask 077
+printf "TypeSafe API key: "
+stty -echo
+IFS= read -r key
+stty echo
+printf '\n'
+printf '%s\n' "$key" > "$HOME/.pi/credentials/typesafe-api-key"
+unset key
+chmod 600 "$HOME/.pi/credentials/typesafe-api-key"
+```
+
+The extension ignores a missing, malformed, symlinked, or insufficiently private file. On POSIX systems it requires a regular file owned by your user with no group/other permissions and a private parent directory. On Windows, protect the file and directory with an ACL that grants access only to your account; Node does not validate Windows ACLs.
+
+`TYPESAFE_API_KEY` remains useful for terminal sessions and CI. For GUI launches such as VS Code or T3 Code, use the keychain or private file when the host does not pass that environment variable through.
+
+### Setting up the OS credential store (optional)
+
+Enable **`classifierKeychain`** in `/sandbox config` or set it to `true` in the global `~/.pi/agent/sandbox.json`. Then create a password entry with service **`pi-extensions`**, account **`typesafe-api-key`**, and the TypeSafe API key as its password:
+
+- **macOS:** In Keychain Access, add a Generic Password with those Account and Where (service) values.
+- **Windows:** In Credential Manager, add a Generic Credential with target **`typesafe-api-key.pi-extensions`** and user name **`typesafe-api-key`**. The native keyring library uses that target by default.
+- **Linux:** Use a Secret Service compatible keyring (such as GNOME Keyring, KWallet, or KeePassXC Secret Service). The extension requires persistent Secret Service storage; it does not use the Linux kernel keyring fallback.
+
+The extension reads the entry when a Jev check is needed, caches it briefly in memory, and falls back to the private file if the credential store is unavailable. A keychain miss is retried after a few seconds, so a newly added entry becomes available without restarting pi. Do not put the key in project config or shell command arguments.
 
 ### Benchmarking
 
