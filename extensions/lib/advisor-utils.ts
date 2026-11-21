@@ -751,19 +751,158 @@ export function stripRefreshTokens(authJsonText: string): string {
   try {
     parsed = JSON.parse(authJsonText);
   } catch {
-    return authJsonText;
+    throw new Error(
+      "auth.json could not be parsed; refusing to copy unverified credentials to the child",
+    );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return authJsonText;
+    throw new Error(
+      "auth.json must be an object of provider -> credential maps; refusing to copy it to the child",
+    );
   }
-  const providers = parsed as { [providerId: string]: unknown };
-  for (const id of Object.keys(providers)) {
-    const credential = providers[id];
-    if (typeof credential === "object" && credential !== null && !Array.isArray(credential)) {
-      delete (credential as { [field: string]: unknown }).refresh;
+  const clone = structuredClone(parsed) as Record<string, unknown>;
+  stripRefreshKeys(clone);
+  return JSON.stringify(clone);
+}
+
+/** Recursively delete every `refresh` field at any depth of a parsed credential document. */
+function stripRefreshKeys(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) stripRefreshKeys(item);
+    return;
+  }
+  if (typeof node !== "object" || node === null) return;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (key === "refresh") delete (node as Record<string, unknown>).refresh;
+    else stripRefreshKeys(value);
+  }
+}
+
+const SECRET_KEY_PATTERN =
+  /(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pwd|secret|refresh)/i;
+
+/** Literal-looking values that resemble credentials (not structural strings). */
+const SECRET_VALUE_PATTERN =
+  /(?:gh[pousr]_[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|[A-Za-z0-9_+/=.-]{40,})/;
+
+/** Header keys that carry credentials regardless of their value shape. */
+const SENSITIVE_HEADER_KEY_PATTERN =
+  /(?:authorization|proxy-authorization|cookie|api[_-]?key|token|secret|password|passwd|pwd)/i;
+
+/**
+ * A credential carried in the catalog as an env reference (`$NAME`, `${NAME}`, or a
+ * template interpolating one) is structurally safe: pi resolves it from the child's
+ * environment at runtime. A `!command` reference is NOT safe to keep — it would make
+ * the child execute a shell command — and a literal value carries the credential
+ * itself. Both are dropped.
+ */
+function sanitizeCredentialReference(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("!")) return undefined;
+  const parts = trimmed.split(/(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)/g);
+  let hasReference = false;
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith("$")) {
+      hasReference = true;
+      continue;
+    }
+    if (part.length > 16 || SECRET_VALUE_PATTERN.test(part)) return undefined;
+  }
+  return hasReference ? trimmed : undefined;
+}
+
+/**
+ * Header values are kept if they are env references (pi resolves them in the child) or
+ * short literals that do not resemble credentials (e.g. `plain`). Anything secret-shaped
+ * is dropped, and `!command` references are never kept.
+ */
+function sanitizeHeaderValue(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("!")) return undefined;
+  if (SECRET_VALUE_PATTERN.test(trimmed)) return undefined;
+  const reference = sanitizeCredentialReference(trimmed);
+  if (reference !== undefined) return reference;
+  if (trimmed.length <= 32 && !/\$/.test(trimmed)) return trimmed;
+  return undefined;
+}
+
+/**
+ * A baseUrl carrying an embedded credential (userinfo such as `user:pass@host`) is
+ * never copied. URLs without an `@` are kept as-is; anything unparseable is dropped.
+ */
+function sanitizeUrl(value: string): string | undefined {
+  if (value.includes("@")) return undefined;
+  return value;
+}
+
+function scrubHeaders(headers: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(headers)) {
+    if (SENSITIVE_HEADER_KEY_PATTERN.test(key)) {
+      delete headers[key];
+      continue;
+    }
+    if (typeof value === "string") {
+      const kept = sanitizeHeaderValue(value);
+      if (kept === undefined) delete headers[key];
+      else headers[key] = kept;
     }
   }
-  return JSON.stringify(parsed);
+}
+
+/**
+ * Best-effort scrub of secret-bearing fields from a parsed models.json document.
+ * Structural fields are preserved: providers, models, modelOverrides, baseUrl, compat,
+ * and env-reference-based credentials. Throws on unparseable input so the caller refuses
+ * to copy it — a raw copy of an unverified model catalog must never reach the child.
+ */
+export function scrubModelCatalog(modelJsonText: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(modelJsonText);
+  } catch {
+    throw new Error("models.json could not be parsed; refusing to copy it to the child");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("models.json must be an object; refusing to copy it to the child");
+  }
+  const clone = structuredClone(parsed);
+  scrubSecretKeys(clone as Record<string, unknown>);
+  return JSON.stringify(clone);
+}
+
+function scrubSecretKeys(node: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "apiKey" && typeof value === "string") {
+      const kept = sanitizeCredentialReference(value);
+      if (kept === undefined) delete node.apiKey;
+      else node.apiKey = kept;
+      continue;
+    }
+    if (key === "baseUrl" && typeof value === "string") {
+      const kept = sanitizeUrl(value);
+      if (kept === undefined) delete node.baseUrl;
+      continue;
+    }
+    if (key === "headers" && typeof value === "object" && value !== null && !Array.isArray(value)) {
+      scrubHeaders(value as Record<string, unknown>);
+      continue;
+    }
+    if (SECRET_KEY_PATTERN.test(key)) {
+      delete node[key];
+      continue;
+    }
+    if (typeof value === "object" && value !== null) scrubCollection(value);
+  }
+}
+
+function scrubCollection(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) scrubCollection(item);
+    return;
+  }
+  if (typeof node !== "object" || node === null) return;
+  scrubSecretKeys(node as Record<string, unknown>);
 }
 
 /**

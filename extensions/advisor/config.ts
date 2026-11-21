@@ -3,7 +3,7 @@
  * and the human-readable description shown by /advisor.
  */
 
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { type AdvisorConfig, parseConfig } from "../lib/advisor-utils.js";
@@ -35,6 +35,23 @@ export function loadConfigSafe(): { config: AdvisorConfig; loadError?: string } 
 }
 
 /**
+ * Rename the existing config to `advisor.json.bak` (mode 0600) so the previous bytes
+ * survive a reset or a repair. Returns the backup path, or undefined when no config
+ * existed. Other rename errors propagate.
+ */
+export function backupExistingConfig(): string | undefined {
+  try {
+    renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
+    chmodSync(`${CONFIG_PATH}.bak`, 0o600);
+    return `${CONFIG_PATH}.bak`;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
  * Validate the mutated config with parseConfig BEFORE touching the file (e.g.
  * `/advisor set a/m,a/m` must not save a same-model pair that the next call
  * would reject), back up a broken previous file, then save.
@@ -48,17 +65,8 @@ export function saveConfigValidated(config: AdvisorConfig, loadError: string | u
       `Not saved: ${(error as Error).message}\nThe previous configuration is unchanged.`,
     );
   }
-  let backedUp = false;
-  if (loadError) {
-    // Repairing a broken file: keep the previous bytes instead of overwriting them.
-    try {
-      renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
-      backedUp = true;
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-        throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
-    }
-  }
+  // Repairing a broken file: keep the previous bytes instead of overwriting them.
+  const backedUp = loadError ? !!backupExistingConfig() : false;
   saveConfig(config);
   return backedUp;
 }
@@ -75,10 +83,13 @@ export function saveConfig(config: AdvisorConfig): void {
   if (config.awsRegion) out.awsRegion = config.awsRegion;
   if (config.env) out.env = config.env;
   // Write a temp file in the same directory, then rename atomically, so an interrupted
-  // write or a concurrent reader never sees a truncated/invalid config.
+  // write or a concurrent reader never sees a truncated/invalid config. The config
+  // may carry child-scoped env (secrets), so it must never be group/world-readable.
   const tmpPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(out, null, 2)}\n`);
+  writeFileSync(tmpPath, `${JSON.stringify(out, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(tmpPath, 0o600);
   renameSync(tmpPath, CONFIG_PATH);
+  chmodSync(CONFIG_PATH, 0o600);
 }
 export function describeConfig(config: AdvisorConfig, activeModelLabel?: string): string {
   const rows = [
@@ -101,8 +112,8 @@ export function describeConfig(config: AdvisorConfig, activeModelLabel?: string)
     [
       "child env",
       config.env
-        ? Object.entries(config.env)
-            .map(([k, v]) => `${k}=${v}`)
+        ? Object.keys(config.env)
+            .map((k) => `${k}=<set>`)
             .join(" ")
         : "(none)",
     ],

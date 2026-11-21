@@ -7,11 +7,11 @@
  * including models from custom providers.
  */
 
-import { renameSync } from "node:fs";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+  backupExistingConfig,
   CONFIG_PATH,
   describeConfig,
   loadConfigSafe,
@@ -240,14 +240,7 @@ export default function (pi: ExtensionAPI) {
     loadError: string | undefined,
     ctx: ExtensionContext,
   ): void {
-    let backedUp: string | undefined;
-    try {
-      renameSync(CONFIG_PATH, `${CONFIG_PATH}.bak`);
-      backedUp = `${CONFIG_PATH}.bak`;
-    } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-        throw new Error(`Could not back up ${CONFIG_PATH}: ${(error as Error).message}`);
-    }
+    const backedUp = backupExistingConfig();
     saveConfig({});
     ctx.ui.notify(
       `advisor config reset.${backedUp ? ` Previous file moved to ${backedUp}.` : ""}${loadError ? ` (previous file was unreadable: ${loadError})` : ""}\n\n${describeConfig({}, activeLabel)}`,
