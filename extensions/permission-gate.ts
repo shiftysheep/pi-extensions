@@ -105,6 +105,7 @@ import {
   describeSandboxState,
   isInsideAnyRoot,
   MAX_CLASSIFIER_TIMEOUT_MS,
+  managedSandboxConfigPath,
   mergeSandboxConfigs,
   parseWritableList,
   type RunnerContext,
@@ -962,6 +963,20 @@ export default function (pi: ExtensionAPI) {
     writeScopeConfig(file, draft);
     ctx.ui.notify(`sandbox config saved: ${file}`, "info");
     const reloaded = loadSandboxConfigs(ctx.cwd, trusted);
+    if (reloaded.managedFailClosed) {
+      // The managed scope is broken: refuse to apply whatever lower scopes say.
+      state = {
+        active: false,
+        enabled: true,
+        reason: `invalid config: ${reloaded.error}`,
+        failClosed: true,
+      };
+      ctx.ui.notify(
+        `Sandbox config invalid (${reloaded.error}) — fail-closed: commands are BLOCKED until the managed config is fixed`,
+        "warning",
+      );
+      return;
+    }
     if (reloaded.error)
       // The save succeeded, but the OTHER scope file is invalid; apply the
       // merge of the valid scopes (managed still wins) rather than the
@@ -1054,6 +1069,7 @@ export default function (pi: ExtensionAPI) {
           state,
           config,
           managedConfig,
+          managedFile: managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA),
           files: sandboxConfigFiles(ctx.cwd),
           trusted: ctx.isProjectTrusted(),
         }),

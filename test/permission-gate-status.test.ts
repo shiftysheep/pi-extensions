@@ -6,6 +6,7 @@ import { isClassifierOption, RUNNER_DESCRIPTIONS } from "../extensions/permissio
 import { renderSandboxStatus } from "../extensions/permission-gate/status.js";
 
 const files = { global: "/tmp/global/sandbox.json", project: "/tmp/project/sandbox.json" };
+const managedFile = "/etc/pi/agent/sandbox.json";
 
 describe("renderSandboxStatus", () => {
   it("renders DISABLED when the sandbox is off", () => {
@@ -14,6 +15,7 @@ describe("renderSandboxStatus", () => {
       config: {},
       managedConfig: {},
       files,
+      managedFile,
       trusted: true,
     });
     assert.match(text, /DISABLED/);
@@ -32,6 +34,7 @@ describe("renderSandboxStatus", () => {
       config: { userCommands: true },
       managedConfig: {},
       files,
+      managedFile,
       trusted: true,
     });
     assert.match(text, /ACTIVE \(bwrap\)/);
@@ -53,6 +56,7 @@ describe("renderSandboxStatus", () => {
       config: {},
       managedConfig: {},
       files,
+      managedFile,
       trusted: false,
     });
     assert.match(text, /NOT enforced — landlock/);
@@ -71,6 +75,7 @@ describe("renderSandboxStatus", () => {
       config: {},
       managedConfig: {},
       files,
+      managedFile,
       trusted: true,
     });
     assert.match(text, /FALLBACK/);
@@ -119,5 +124,58 @@ describe("RUNNER_DESCRIPTIONS", () => {
     for (const choice of SANDBOX_RUNNER_CHOICES) {
       assert.ok(RUNNER_DESCRIPTIONS[choice], `missing description for ${choice}`);
     }
+  });
+});
+
+describe("status footer and managed line", () => {
+  it("renders the blockTerminates footer", () => {
+    const text = renderSandboxStatus({
+      state: { active: false, enabled: false },
+      config: {},
+      managedConfig: {},
+      managedFile,
+      files,
+      trusted: true,
+    });
+    assert.match(text, /blockTerminates: true stops the agent's turn/);
+  });
+
+  it("renders the managed path and config line when managed scope contributes keys", () => {
+    const text = renderSandboxStatus({
+      state: { active: false, enabled: false },
+      config: {},
+      managedConfig: { enabled: true },
+      managedFile,
+      files,
+      trusted: true,
+    });
+    assert.match(text, new RegExp(`${managedFile.replace(/[/.]/g, "\\$&")} \\(managed, wins\\)`));
+    assert.match(text, /Config: \/tmp\/global\/sandbox\.json/);
+  });
+
+  it("omits the managed path when the managed scope is empty", () => {
+    const text = renderSandboxStatus({
+      state: { active: false, enabled: false },
+      config: {},
+      managedConfig: {},
+      managedFile,
+      files,
+      trusted: true,
+    });
+    assert.doesNotMatch(text, /managed, wins/);
+  });
+
+  it("renders the fail-open display when the sandbox is enabled but unavailable", () => {
+    const state: SandboxState = { active: false, enabled: true, reason: "no runner" };
+    const text = renderSandboxStatus({
+      state,
+      config: {},
+      managedConfig: {},
+      managedFile,
+      files,
+      trusted: true,
+    });
+    assert.match(text, /ALL permission gates are armed/);
+    assert.doesNotMatch(text, /BLOCKED/);
   });
 });

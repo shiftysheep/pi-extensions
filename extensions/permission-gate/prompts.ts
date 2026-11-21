@@ -5,6 +5,7 @@
 
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type SelectItem, SelectList, type SelectListTheme, Text } from "@earendil-works/pi-tui";
+import type { SandboxRunnerChoice } from "../lib/sandbox-utils.js";
 
 /** Theme mapping for SelectList: accent selection, dimmed descriptions. */
 export function sandboxSelectTheme(theme: Theme): SelectListTheme {
@@ -95,7 +96,7 @@ export async function promptSelect(
 }
 
 /** Dim hint for each runner choice in the config UI. */
-export const RUNNER_DESCRIPTIONS: Record<string, string> = {
+export const RUNNER_DESCRIPTIONS: Record<SandboxRunnerChoice, string> = {
   auto: "best available (bwrap → landlock → sandbox-exec)",
   none: "no OS sandbox (gate-only mode)",
   bwrap: "force bubblewrap (Linux)",

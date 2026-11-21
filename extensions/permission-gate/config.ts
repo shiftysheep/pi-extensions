@@ -58,9 +58,12 @@ export function readScopeConfig(file: string): SandboxConfig {
  * Load and merge both scopes: per-key, project wins. An untrusted project
  * contributes nothing (its file is neither read nor honored).
  */
-export function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandboxConfigs {
+export function loadSandboxConfigs(
+  cwd: string,
+  projectTrusted: boolean,
+  managedFile = managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA),
+): LoadedSandboxConfigs {
   const files = sandboxConfigFiles(cwd);
-  const managedFile = managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA);
   // Every scope is read INDEPENDENTLY: a malformed file must not discard the
   // other scopes' validated policy (a broken project file must not drop a
   // valid global failIfUnavailable, and a broken user file must not drop the

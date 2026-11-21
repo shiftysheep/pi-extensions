@@ -3,18 +3,16 @@
  * Kept separate so the wiring file stays inside the complexity budget.
  */
 
-import {
-  managedSandboxConfigPath,
-  type SandboxConfig,
-  type SandboxScope,
-  type SandboxState,
-} from "../lib/sandbox-utils.js";
+import type { SandboxConfig, SandboxScope, SandboxState } from "../lib/sandbox-utils.js";
 
 export type SandboxStatusInput = {
   state: SandboxState;
   config: SandboxConfig;
   /** Managed config as read (keys present => rendered on the Config line). */
   managedConfig: SandboxConfig;
+  /** Resolved managed config path (rendered on the Config line when the
+   *  managed scope contributed keys). */
+  managedFile: string;
   files: Record<SandboxScope, string>;
   /** Whether the current project is trusted. */
   trusted: boolean;
@@ -22,7 +20,7 @@ export type SandboxStatusInput = {
 
 /** Render the bare /sandbox status display. */
 export function renderSandboxStatus(input: SandboxStatusInput): string {
-  const { state, config, managedConfig, files, trusted } = input;
+  const { state, config, managedConfig, managedFile, files, trusted } = input;
   const lines: string[] = [];
   if (!state.enabled) {
     lines.push(
@@ -45,9 +43,7 @@ export function renderSandboxStatus(input: SandboxStatusInput): string {
   }
   const trustNote = trusted ? "" : " (not trusted)";
   const managedLine =
-    Object.keys(managedConfig).length > 0
-      ? ` / ${managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA)} (managed, wins)`
-      : "";
+    Object.keys(managedConfig).length > 0 ? ` / ${managedFile} (managed, wins)` : "";
   lines.push(`Config: ${files.global}${trustNote}${managedLine}`);
   lines.push(
     `/sandbox config opens the interactive editor; /sandbox on|off toggles (project scope).`,
