@@ -150,7 +150,25 @@ jobs:
           # Wait for the required check, then merge (a PR merge is allowed by
           # protection). --match-head-commit refuses to merge a moved head.
           gh pr checks "$pr_number" --watch
-          gh pr merge "$pr_number" --merge --delete-branch --match-head-commit "$head_sha"
+          # --auto: the base branch policy blocks an immediate bot merge now that
+          # strict checks are enforced for bots; auto-merge merges as soon as the
+          # required checks are green.
+          gh pr merge "$pr_number" --merge --delete-branch --match-head-commit "$head_sha" --auto
+          # --auto schedules the merge asynchronously; wait for it before
+          # publishing the tag.
+          for i in $(seq 1 30); do
+            state=$(gh pr view "$pr_number" --json state --jq '.state')
+            if [ "$state" = "MERGED" ]; then break; fi
+            if [ "$state" = "CLOSED" ]; then
+              echo "release PR #$pr_number closed without merging" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          if [ "$(gh pr view "$pr_number" --json state --jq '.state')" != "MERGED" ]; then
+            echo "release PR #$pr_number did not merge in time" >&2
+            exit 1
+          fi
           # Publish the tag now that the release commit is merged into main.
           # Plain push: fails loudly if the tag is published elsewhere, is a
           # no-op if it already points at this commit (retried run).
