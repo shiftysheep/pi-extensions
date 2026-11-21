@@ -88,16 +88,14 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ExtensionUIContext,
-  Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
   type BashOperations,
   CONFIG_DIR_NAME,
   createLocalBashOperations,
-  getAgentDir,
   isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
-import { type SelectItem, SelectList, type SelectListTheme, Text } from "@earendil-works/pi-tui";
+import type { SandboxScope } from "./lib/sandbox-utils.js";
 import {
   applyManagedSandboxConfig,
   applySandboxToggle,
@@ -107,17 +105,12 @@ import {
   describeSandboxState,
   isInsideAnyRoot,
   MAX_CLASSIFIER_TIMEOUT_MS,
-  managedSandboxConfigPath,
   mergeSandboxConfigs,
-  parseSandboxConfig,
   parseWritableList,
   type RunnerContext,
   SANDBOX_RUNNER_CHOICES,
   type SandboxConfig,
-  type SandboxRunnerChoice,
-  type SandboxScope,
   type SandboxState,
-  sandboxConfigPath,
   sandboxStateSignature,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
@@ -133,9 +126,23 @@ import {
   parseClassifierProbs,
   TYPESAFE_API_KEY_ENV,
 } from "./permission-gate/classifier.js";
+import {
+  loadSandboxConfigs,
+  readScopeConfig,
+  sandboxConfigFiles,
+  writeScopeConfig,
+} from "./permission-gate/config.js";
 import { callJev, DEFAULT_CLASSIFIER_TIMEOUT_MS } from "./permission-gate/jev-client.js";
+import { sandboxOptionItems } from "./permission-gate/menu.js";
+import {
+  type ClassifierOption,
+  isClassifierOption,
+  promptSelect,
+  RUNNER_DESCRIPTIONS,
+} from "./permission-gate/prompts.js";
 import { findStaticMatch } from "./permission-gate/rules.js";
 import { resolveRunner } from "./permission-gate/runner.js";
+import { renderSandboxStatus } from "./permission-gate/status.js";
 
 const SANDBOX_CONFIG_FILE = "sandbox.json";
 
@@ -145,327 +152,6 @@ const USAGE =
   '  /sandbox on       enable (project scope; runner defaults to "auto"; an explicit runner in either scope is kept)\n' +
   "  /sandbox off      disable (project scope)\n" +
   "  /sandbox config   interactive editor (pick the global or project scope)";
-
-/** Both scope config file paths for a working directory. */
-function sandboxConfigFiles(cwd: string): Record<SandboxScope, string> {
-  const base = { agentDir: getAgentDir(), projectDir: path.join(cwd, CONFIG_DIR_NAME) };
-  return {
-    global: sandboxConfigPath("global", base),
-    project: sandboxConfigPath("project", base),
-  };
-}
-
-export type LoadedSandboxConfigs = {
-  /** Merged config (per-key project wins, then the managed layer). Empty on error. */
-  config: SandboxConfig;
-  /** Per-scope configs as read (project is {} when untrusted or on error). */
-  globalConfig: SandboxConfig;
-  projectConfig: SandboxConfig;
-  /** Managed (admin) config as read; {} when the file is absent. */
-  managedConfig: SandboxConfig;
-  files: Record<SandboxScope, string>;
-  /** Managed config file path (highest precedence). */
-  managedFile: string;
-  /** Set when any scope file failed to parse/validate. `config` still holds
-   * the merge of the scopes that DID validate (scopes are read
-   * independently, so a broken project file cannot discard a valid global
-   * failIfUnavailable/enabled policy). Only {} when managed failed closed. */
-  error?: string;
-  /** A malformed MANAGED file: fail closed — refuse to run without a
-   * verified admin policy. */
-  managedFailClosed?: boolean;
-};
-
-/** Read + strictly validate one scope file. Absent file = empty config. */
-function readScopeConfig(file: string): SandboxConfig {
-  if (!fs.existsSync(file)) return {};
-  return parseSandboxConfig(JSON.parse(fs.readFileSync(file, "utf8")), file);
-}
-
-/**
- * Load and merge both scopes: per-key, project wins. An untrusted project
- * contributes nothing (its file is neither read nor honored).
- */
-function loadSandboxConfigs(cwd: string, projectTrusted: boolean): LoadedSandboxConfigs {
-  const files = sandboxConfigFiles(cwd);
-  const managedFile = managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA);
-  // Every scope is read INDEPENDENTLY: a malformed file must not discard the
-  // other scopes' validated policy (a broken project file must not drop a
-  // valid global failIfUnavailable, and a broken user file must not drop the
-  // admin policy).
-  let managedConfig: SandboxConfig | undefined;
-  let managedError: string | undefined;
-  try {
-    managedConfig = readScopeConfig(managedFile);
-  } catch (err) {
-    managedError = String(err instanceof Error ? err.message : err);
-  }
-  let globalConfig: SandboxConfig = {};
-  let projectConfig: SandboxConfig = {};
-  const lowerErrors: string[] = [];
-  try {
-    globalConfig = readScopeConfig(files.global);
-  } catch (err) {
-    lowerErrors.push(`global: ${String(err instanceof Error ? err.message : err)}`);
-  }
-  if (projectTrusted) {
-    try {
-      projectConfig = readScopeConfig(files.project);
-    } catch (err) {
-      lowerErrors.push(`project: ${String(err instanceof Error ? err.message : err)}`);
-    }
-  }
-  if (managedError) {
-    // A malformed managed file fails closed: refuse to run without a
-    // verified admin policy.
-    return {
-      config: {},
-      globalConfig: {},
-      projectConfig: {},
-      managedConfig: {},
-      files,
-      managedFile,
-      error: `managed config invalid: ${managedError}`,
-      managedFailClosed: true,
-    };
-  }
-  // Managed keys still win outright over the surviving lower scopes
-  // (applyManagedSandboxConfig), so a lower-scope error cannot defeat managed
-  // enforcement; the valid lower scopes simply fill the keys managed omits.
-  return {
-    config: applyManagedSandboxConfig(
-      mergeSandboxConfigs(globalConfig, projectConfig),
-      managedConfig ?? {},
-    ),
-    globalConfig,
-    projectConfig,
-    managedConfig: managedConfig ?? {},
-    files,
-    managedFile,
-    error: lowerErrors.length > 0 ? lowerErrors.join("; ") : undefined,
-  };
-}
-
-/** Persist one scope's whole config. Written atomically (temp + rename, the
- *  same pattern as the advisor config) so an interrupted write never leaves a
- *  truncated file behind (creates the project .pi dir when needed). */
-function writeScopeConfig(file: string, config: SandboxConfig): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-  fs.renameSync(tmp, file);
-}
-
-// --- select prompts with dim per-option descriptions ---
-// ctx.ui.select renders plain strings only; ui.custom + pi-tui's SelectList
-// (the component the built-in selectors use) renders {label, description}
-// with the description dimmed.
-
-function sandboxSelectTheme(theme: Theme): SelectListTheme {
-  return {
-    selectedPrefix: (text) => theme.fg("accent", text),
-    selectedText: (text) => theme.fg("accent", text),
-    description: (text) => theme.fg("dim", text),
-    scrollInfo: (text) => theme.fg("dim", text),
-    noMatch: (text) => theme.fg("dim", text),
-  };
-}
-
-class SandboxSelectPrompt {
-  onDone: (value: string | undefined) => void = () => {};
-  dispose?: () => void;
-  private readonly title: Text;
-  private readonly list: SelectList;
-  private readonly hint: Text;
-
-  constructor(theme: Theme, titleText: string, items: SelectItem[]) {
-    this.title = new Text(theme.fg("accent", theme.bold(titleText)), 1, 0);
-    this.list = new SelectList(items, Math.min(items.length, 12), sandboxSelectTheme(theme));
-    this.list.onSelect = (item) => this.onDone(item.value);
-    this.list.onCancel = () => this.onDone(undefined);
-    this.hint = new Text(theme.fg("dim", "↑/↓ or j/k: move · enter: select · esc: cancel"), 1, 0);
-  }
-
-  render(width: number): string[] {
-    return [...this.title.render(width), ...this.list.render(width), ...this.hint.render(width)];
-  }
-
-  handleInput(data: string): void {
-    this.list.handleInput(data);
-  }
-
-  invalidate(): void {
-    this.title.invalidate();
-    this.list.invalidate();
-    this.hint.invalidate();
-  }
-}
-
-/** Select prompt with a dim description on every option. Returns the chosen
- *  item's value (undefined when cancelled). The custom SelectList path is
- *  TUI-only: RPC mode exposes a callable ui.custom that never invokes the
- *  factory, so gate on ctx.mode (pi's documented guard for terminal-only UI).
- *  Other modes fall back to ctx.ui.select (plain labels, no descriptions),
- *  mapping the returned label back to the item's value. */
-async function promptSelect(
-  ctx: ExtensionCommandContext,
-  title: string,
-  items: SelectItem[],
-): Promise<string | undefined> {
-  if (ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
-    const label = await ctx.ui.select(
-      title,
-      items.map((item) => item.label),
-      {
-        signal: ctx.signal,
-      },
-    );
-    return items.find((item) => item.label === label)?.value;
-  }
-  return ctx.ui.custom<string | undefined>((_tui, theme, _keybindings, done) => {
-    const prompt = new SandboxSelectPrompt(theme, title, items);
-    let settled = false;
-    let onAbort: (() => void) | undefined;
-    const finish = (value: string | undefined) => {
-      if (settled) return;
-      settled = true;
-      if (ctx.signal && onAbort) ctx.signal.removeEventListener("abort", onAbort);
-      done(value);
-    };
-    if (ctx.signal) {
-      if (ctx.signal.aborted) {
-        finish(undefined);
-      } else {
-        onAbort = () => finish(undefined);
-        ctx.signal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
-    prompt.onDone = (value) => finish(value);
-    prompt.dispose = () => {
-      if (ctx.signal && onAbort) ctx.signal.removeEventListener("abort", onAbort);
-    };
-    return prompt;
-  });
-}
-
-/** Dim hint for each runner choice in the config UI. */
-const RUNNER_DESCRIPTIONS: Record<SandboxRunnerChoice, string> = {
-  auto: "best available (bwrap → landlock → sandbox-exec)",
-  none: "no OS sandbox (gate-only mode)",
-  bwrap: "force bubblewrap (Linux)",
-  landlock: "force Landlock (Linux 5.13+; network policy not enforced)",
-  "sandbox-exec": "force macOS Seatbelt",
-};
-
-/** The classifier config keys, editable from the config menu. */
-const CLASSIFIER_OPTIONS = [
-  "classifier",
-  "classifierConfirmThreshold",
-  "classifierDenyThreshold",
-  "classifierModel",
-  "classifierTimeoutMs",
-  "classifierKeychain",
-] as const;
-type ClassifierOption = (typeof CLASSIFIER_OPTIONS)[number];
-
-/** Membership guard so the menu dispatch can't route a typo into the editor. */
-function isClassifierOption(option: string): option is ClassifierOption {
-  return (CLASSIFIER_OPTIONS as readonly string[]).includes(option);
-}
-
-/** The config menu rows: label = current value, description = dim hint. */
-function sandboxOptionItems(draft: SandboxConfig): SelectItem[] {
-  return [
-    {
-      value: "enabled",
-      label: `enabled: ${draft.enabled ?? "false"}`,
-      description: "master switch — when on, bash runs inside the OS sandbox",
-    },
-    {
-      value: "runner",
-      label: `runner: ${draft.runner ?? "auto"}`,
-      description: "sandbox backend: auto (best available) or forced",
-    },
-    {
-      value: "network",
-      label: `network: ${draft.network ?? "allow"}`,
-      description: "outbound network for sandboxed commands",
-    },
-    {
-      value: "home",
-      label: `home: ${draft.home ?? "ro"}`,
-      description: "access to your $HOME inside the sandbox",
-    },
-    {
-      value: "homeCaches",
-      label: `homeCaches: ${draft.homeCaches ?? "ro"}`,
-      description: "writable $HOME cache dirs (~/.cache, ~/.npm, ~/.cargo, …); ro = strict",
-    },
-    {
-      value: "userCommands",
-      label: `userCommands: ${draft.userCommands ?? "false"}`,
-      description: "also sandbox user ! commands",
-    },
-    {
-      value: "loginShell",
-      label: `loginShell: ${draft.loginShell ?? "true"}`,
-      description: "true: bash -lc (sources ~/.bash_profile); false: plain bash -c",
-    },
-    {
-      value: "landlockHelper",
-      label: `landlockHelper: ${draft.landlockHelper ?? "(compile on first use)"}`,
-      description: "prebuilt Landlock helper path (skips compilation; Linux only)",
-    },
-    {
-      value: "failIfUnavailable",
-      label: `failIfUnavailable: ${draft.failIfUnavailable ?? "false"}`,
-      description: "block commands instead of running unsandboxed when no runner resolves",
-    },
-    {
-      value: "blockTerminates",
-      label: `blockTerminates: ${draft.blockTerminates ?? "false"}`,
-      description: "stop the agent's turn on a gate block instead of letting it continue",
-    },
-    {
-      value: "writable",
-      label: `writable: ${draft.writable?.length ? draft.writable.join(", ") : "(none)"}`,
-      description: "extra directories sandboxed commands may write to",
-    },
-    {
-      value: "classifier",
-      label: `classifier: ${draft.classifier ?? "off"}`,
-      description:
-        "optional Jev danger classifier for commands the static rules miss (needs TYPESAFE_API_KEY)",
-    },
-    {
-      value: "classifierConfirmThreshold",
-      label: `classifierConfirmThreshold: ${draft.classifierConfirmThreshold ?? DEFAULT_CONFIRM_THRESHOLD}`,
-      description: `Jev probability at/above which a command prompts for confirmation (default ${DEFAULT_CONFIRM_THRESHOLD})`,
-    },
-    {
-      value: "classifierDenyThreshold",
-      label: `classifierDenyThreshold: ${draft.classifierDenyThreshold ?? DEFAULT_DENY_THRESHOLD}`,
-      description: `Jev probability at/above which a command is hard-blocked (default ${DEFAULT_DENY_THRESHOLD})`,
-    },
-    {
-      value: "classifierModel",
-      label: `classifierModel: ${draft.classifierModel ?? DEFAULT_JEV_MODEL}`,
-      description: "Jev model id (default jev-latest)",
-    },
-    {
-      value: "classifierTimeoutMs",
-      label: `classifierTimeoutMs: ${draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS}`,
-      description: `per-call Jev request timeout in ms (default ${DEFAULT_CLASSIFIER_TIMEOUT_MS})`,
-    },
-    {
-      value: "classifierKeychain",
-      label: `classifierKeychain: ${draft.classifierKeychain ?? "false"}`,
-      description: "read the TypeSafe API key from the OS credential store before the private file",
-    },
-    { value: "save", label: "— save —", description: "write the config file and re-apply" },
-    { value: "cancel", label: "— cancel —", description: "discard changes" },
-  ];
-}
 
 export default function (pi: ExtensionAPI) {
   let config: SandboxConfig = {};
@@ -1363,43 +1049,16 @@ export default function (pi: ExtensionAPI) {
       if (sub === "off") return toggleSandbox(false, ctx);
       if (sub === "config") return runSandboxConfigUI(ctx);
       if (sub !== undefined) throw new Error(`Unknown sandbox subcommand "${sub}".\n\n${USAGE}`);
-      ctx.ui.notify(renderSandboxStatus(ctx), "info");
+      ctx.ui.notify(
+        renderSandboxStatus({
+          state,
+          config,
+          managedConfig,
+          files: sandboxConfigFiles(ctx.cwd),
+          trusted: ctx.isProjectTrusted(),
+        }),
+        "info",
+      );
     },
   });
-
-  /** Render the bare /sandbox status display. */
-  function renderSandboxStatus(ctx: ExtensionCommandContext): string {
-    const lines: string[] = [];
-    if (!state.enabled) {
-      lines.push(
-        `Sandbox: DISABLED — /sandbox on enables it (project scope); or set "enabled": true in the config`,
-      );
-    } else if (state.active) {
-      lines.push(`Sandbox: ACTIVE (${state.runner})`);
-      lines.push(`Writable roots: ${state.policy.writableRoots.join(", ")}`);
-      lines.push(
-        `Network: ${state.policy.network}${state.policy.network === "deny" && !state.networkEnforced ? " (NOT enforced — landlock)" : ""}`,
-      );
-      lines.push(`User ! commands: ${config.userCommands ? "sandboxed" : "not sandboxed"}`);
-    } else {
-      lines.push(`Sandbox: FALLBACK (enabled, but ${state.reason})`);
-      if (state.failClosed) {
-        lines.push("failIfUnavailable: bash/powershell/write/edit are BLOCKED (fail-closed).");
-      } else {
-        lines.push("Commands run unsandboxed; ALL permission gates are armed.");
-      }
-    }
-    const files = sandboxConfigFiles(ctx.cwd);
-    const trustNote = ctx.isProjectTrusted() ? "" : " (not trusted)";
-    const managedLine =
-      Object.keys(managedConfig).length > 0
-        ? ` / ${managedSandboxConfigPath(process.platform, process.env.PROGRAMDATA)} (managed, wins)`
-        : "";
-    lines.push(`Config: ${files.global}${trustNote}${managedLine}`);
-    lines.push(
-      `/sandbox config opens the interactive editor; /sandbox on|off toggles (project scope).`,
-    );
-    lines.push("blockTerminates: true stops the turn instead).");
-    return lines.join("\n");
-  }
 }
