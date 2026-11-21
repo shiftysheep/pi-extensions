@@ -113,11 +113,21 @@ const REGISTRY_HIVE = /^(HKLM|HKCR|HKEY_LOCAL_MACHINE|HKEY_CLASSES_ROOT)([\\:]|$
  * The value token is matched RAW (base64 uses +/=, which the usual PS token
  * regex drops); surrounding single/double quotes are tolerated.
  */
+const ENC_PARAM_TOKEN_RE = /-([A-Za-z]+)(?=[\s"':=]|$)/g;
+
 function encodedPayloadOf(command: string): string | undefined {
   for (const seg of psSegments(command)) {
-    if (!/-EncodedCommand/i.test(seg)) continue;
-    const m = /-EncodedCommand\s*["']?([A-Za-z0-9+/=]+)["']?/.exec(seg);
-    return m ? m[1] : "";
+    // PowerShell prefix matching: -e, -enc, -encodedcommand, ... The gate
+    // must over-confirm (never miss), so any token that is a prefix of
+    // "encodedcommand" counts.
+    ENC_PARAM_TOKEN_RE.lastIndex = 0;
+    for (let tok = ENC_PARAM_TOKEN_RE.exec(seg); tok !== null; tok = ENC_PARAM_TOKEN_RE.exec(seg)) {
+      const prefix = tok[1].toLowerCase();
+      if (prefix.length < 1 || !"encodedcommand".startsWith(prefix)) continue;
+      const rest = seg.slice(tok.index);
+      const m = /^-([A-Za-z]+)(?![A-Za-z])\s*:?\s*["']?([A-Za-z0-9+/=]+)["']?/.exec(rest);
+      return m ? m[2] : "";
+    }
   }
   return undefined;
 }

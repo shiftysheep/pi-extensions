@@ -469,6 +469,7 @@ export default function (pi: ExtensionAPI) {
   // recreates the extension instance — an acceptable re-warn).
   let classifierNoKeyWarned = false;
   let classifierApiWarned = false;
+  let powerShellUnsandboxedWarned = false;
 
   const runnerContext = (cwd: string): RunnerContext => ({
     cwd,
@@ -644,12 +645,22 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  /** Probe runners and build the policy for a merged config. */
+  /** Probe runners and build the policy for a merged config. Supported
+   * platforms are Linux and macOS; on anything else the sandbox is treated
+   * as disabled (the heuristic gate still applies). */
   function computeState(
     cwd: string,
     cfg: SandboxConfig,
   ): { state: SandboxState; warnings: string[] } {
     if (!cfg.enabled) return { state: { active: false, enabled: false }, warnings: [] };
+    if (process.platform !== "linux" && process.platform !== "darwin") {
+      return {
+        state: { active: false, enabled: false },
+        warnings: [
+          `Sandbox is not supported on ${process.platform} (Linux/macOS only) — treated as disabled. The heuristic gate still applies.`,
+        ],
+      };
+    }
     const probe = resolveRunner(cfg.runner ?? "auto", { landlockHelper: cfg.landlockHelper });
     if (!probe.ok) {
       const failClosed = cfg.failIfUnavailable === true;
@@ -808,6 +819,17 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  /** Warn once per session when a PowerShell command runs while the sandbox
+   *  is active (PowerShell is never sandboxed — no backend). */
+  function warnPowerShellUnsandboxed(ctx: ExtensionContext): void {
+    if (!state.active || powerShellUnsandboxedWarned) return;
+    powerShellUnsandboxedWarned = true;
+    warnClassifier(
+      ctx,
+      "Sandbox is active but PowerShell is not sandboxed (no backend). Bash commands are confined; PowerShell runs unsandboxed — use bash for sandboxed execution.",
+    );
+  }
+
   /** Guard the bash/powershell path: static rules, Jev classifier, sandbox wrap. */
   async function guardShell(
     event: { input: Record<string, unknown> },
@@ -820,13 +842,15 @@ export default function (pi: ExtensionAPI) {
         `Sandbox: no runner available (${state.reason}) and failIfUnavailable is set — refusing to run unsandboxed`,
       );
     }
-    const match = findStaticMatch(isPowerShell ? "powershell" : "bash", command);
+    const shell = isPowerShell ? "powershell" : "bash";
+    const match = findStaticMatch(shell, command);
     const staticBlock = match ? await confirmStaticMatch(match, command, ctx) : undefined;
     if (staticBlock) return staticBlock;
     if (!match) {
-      const jevBlock = await runJevClassifier(command, ctx, isPowerShell ? "powershell" : "bash");
+      const jevBlock = await runJevClassifier(command, ctx, shell);
       if (jevBlock) return jevBlock;
     }
+    if (isPowerShell) warnPowerShellUnsandboxed(ctx);
     if (!isPowerShell && state.active && command) {
       (event.input as { command: string }).command = wrapCommand(
         state.runner,
@@ -911,6 +935,13 @@ export default function (pi: ExtensionAPI) {
 
   // --- /sandbox on|off: toggle the PROJECT scope, re-apply, report (dimmed) ---
   async function toggleSandbox(enabled: boolean, ctx: ExtensionCommandContext): Promise<void> {
+    if (enabled && process.platform !== "linux" && process.platform !== "darwin") {
+      ctx.ui.notify(
+        `Sandbox is not supported on ${process.platform} (Linux/macOS only) — leaving it off. The heuristic gate still applies.`,
+        "warning",
+      );
+      return;
+    }
     if (!ctx.isProjectTrusted()) {
       ctx.ui.notify(
         `Sandbox unchanged: /sandbox ${enabled ? "on" : "off"} writes the project config (${ctx.cwd}/${CONFIG_DIR_NAME}/${SANDBOX_CONFIG_FILE}), but this project is not trusted. Use /sandbox config (global scope) instead.`,
