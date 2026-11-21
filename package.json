@@ -29,6 +29,7 @@
     "@earendil-works/pi-server": "^1.1.0",
     "@ff-labs/pi-fff": "^0.10.6",
     "@juicesharp/rpiv-ask-user-question": "^2.9.0",
+    "@napi-rs/keyring": "^2.1.2",
     "@upstash/context7-pi": "^0.1.2",
     "pi-subagents": "^0.89.1",
     "pi-web-access": "^0.28.0"
@@ -38,6 +39,7 @@
     "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
+    "@napi-rs/keyring",
     "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"
@@ -86,6 +88,7 @@
     "@earendil-works/pi-server",
     "@ff-labs/pi-fff",
     "@juicesharp/rpiv-ask-user-question",
+    "@napi-rs/keyring",
     "@upstash/context7-pi",
     "pi-subagents",
     "pi-web-access"

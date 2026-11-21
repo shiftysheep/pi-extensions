@@ -3,8 +3,8 @@
  *
  * The env var (TYPESAFE_API_KEY) works in normal terminals but is unset when
  * pi is launched from a GUI host (VS Code, T3 Code), so we also support a
- * private per-user file. Resolution order: env var → private file. OS
- * keychain support is added separately. The key is never copied into
+ * private per-user file. Resolution order: env var → OS keychain (opt-in)
+ * → private file. The key is never copied into
  * process.env, config files, or logs.
  *
  * The file is a single raw token (one line, optional trailing newline) at
@@ -33,6 +33,15 @@ export type ResolvedApiKey = {
   /** Where the key came from (path or literal "env"/"keychain") — safe to show. */
   detail: string;
 };
+
+const KEYCHAIN_SERVICE = "pi-extensions";
+const KEYCHAIN_ACCOUNT = "typesafe-api-key";
+const KEYCHAIN_TIMEOUT_MS = 5000;
+const KEYCHAIN_CACHE_TTL_MS = 60_000;
+const KEYCHAIN_MISS_CACHE_TTL_MS = 5_000;
+
+let keychainCache: { value: string | undefined; expiresAt: number } | undefined;
+let keychainLookup: Promise<string | undefined> | undefined;
 
 /** Absolute path of the private key file (outside the workspace). */
 export function apiKeyFilePath(opts: { home?: string } = {}): string {
@@ -103,16 +112,63 @@ export function readApiKeyFile(file: string): string | undefined {
   return trimmed;
 }
 
+async function readKeychain(): Promise<string | undefined> {
+  try {
+    const { AsyncEntry } = await import("@napi-rs/keyring");
+    const entry = new AsyncEntry(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, {
+      linux: { store: "secret-service" },
+    });
+    const key = await entry.getPassword(AbortSignal.timeout(KEYCHAIN_TIMEOUT_MS));
+    const trimmed = key?.trim();
+    return trimmed ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readKeychainCached(
+  loader: () => Promise<string | undefined>,
+): Promise<string | undefined> {
+  if (keychainCache && keychainCache.expiresAt > Date.now()) return keychainCache.value;
+  if (keychainLookup) return keychainLookup;
+  keychainLookup = loader()
+    .catch(() => undefined)
+    .then((value) => {
+      const ttl = value ? KEYCHAIN_CACHE_TTL_MS : KEYCHAIN_MISS_CACHE_TTL_MS;
+      keychainCache = { value, expiresAt: Date.now() + ttl };
+      return value;
+    })
+    .finally(() => {
+      keychainLookup = undefined;
+    });
+  return keychainLookup;
+}
+
+/** Clear the short-lived keychain cache, for example after an authentication failure. */
+export function clearApiKeyCache(): void {
+  keychainCache = undefined;
+}
+
 /**
- * Resolve the API key from the env var or private file. Pure with respect to
- * the filesystem (injectable) for tests.
+ * Resolve the API key from the env var, optional OS keychain, or private file.
+ * File and keychain readers are injectable for tests.
  */
-export function resolveApiKey(
-  opts: { env?: NodeJS.ProcessEnv; home?: string; filePath?: string } = {},
-): ResolvedApiKey | undefined {
+export async function resolveApiKey(
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    home?: string;
+    filePath?: string;
+    useKeychain?: boolean;
+    readKeychain?: () => Promise<string | undefined>;
+  } = {},
+): Promise<ResolvedApiKey | undefined> {
   const env = opts.env ?? process.env;
   const fromEnv = env[TYPESAFE_API_KEY_ENV]?.trim();
   if (fromEnv) return { key: fromEnv, source: "env", detail: TYPESAFE_API_KEY_ENV };
+  if (opts.useKeychain) {
+    const fromKeychain = await readKeychainCached(opts.readKeychain ?? readKeychain);
+    if (fromKeychain) return { key: fromKeychain, source: "keychain", detail: KEYCHAIN_SERVICE };
+  }
   const file = opts.filePath ?? apiKeyFilePath({ home: opts.home });
   const fromFile = readApiKeyFile(file);
   if (fromFile) return { key: fromFile, source: "file", detail: file };

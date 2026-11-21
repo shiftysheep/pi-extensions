@@ -120,6 +120,7 @@ describe("parseSandboxConfig: classifier keys", () => {
         classifierDenyThreshold: 0.95,
         classifierModel: "jev-2",
         classifierTimeoutMs: 5000,
+        classifierKeychain: true,
       },
       P,
     );
@@ -128,6 +129,10 @@ describe("parseSandboxConfig: classifier keys", () => {
     assert.equal(cfg.classifierDenyThreshold, 0.95);
     assert.equal(cfg.classifierModel, "jev-2");
     assert.equal(cfg.classifierTimeoutMs, 5000);
+    assert.equal(cfg.classifierKeychain, true);
+  });
+  it("rejects a non-boolean keychain option", () => {
+    assert.throws(() => parseSandboxConfig({ classifierKeychain: "yes" }, P), /classifierKeychain/);
   });
   it("rejects a non-finite or out-of-bounds timeout", () => {
     assert.throws(

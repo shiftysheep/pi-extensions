@@ -36,7 +36,7 @@ export const DEFAULT_CLASSIFIER_TIMEOUT_MS = 8000;
 /** Classify a non-OK HTTP response into a fixed-category error string. */
 function classifyStatus(status: number): string {
   if (status === 401)
-    return "authentication failed (401) — check the TypeSafe API key (env var or ~/.pi/credentials/typesafe-api-key)";
+    return "authentication failed (401) — check the configured TypeSafe API key source";
   if (status === 422) return "request rejected by the API (422)";
   if (status === 429 || status === 529) return `rate-limited or overloaded (${status})`;
   return `unexpected status ${status}`;

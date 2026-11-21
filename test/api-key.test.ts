@@ -10,6 +10,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   apiKeyFilePath,
+  clearApiKeyCache,
   readApiKeyFile,
   resolveApiKey,
 } from "../extensions/permission-gate/api-key.js";
@@ -18,10 +19,12 @@ import { TYPESAFE_API_KEY_ENV } from "../extensions/permission-gate/classifier.j
 let tmpDir: string;
 
 beforeEach(() => {
+  clearApiKeyCache();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-key-"));
 });
 
 afterEach(() => {
+  clearApiKeyCache();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -85,24 +88,55 @@ describe("readApiKeyFile", () => {
 });
 
 describe("resolveApiKey", () => {
-  it("prefers the env var over the file", () => {
+  it("prefers the env var over the file and keychain", async () => {
     const file = writeFile("k", "ts-file-key", 0o600);
-    const r = resolveApiKey({
+    const r = await resolveApiKey({
       env: { [TYPESAFE_API_KEY_ENV]: "ts-env-key" },
       filePath: file,
+      useKeychain: true,
+      readKeychain: async () => "ts-keychain-key",
     });
     assert.deepEqual(r, { key: "ts-env-key", source: "env", detail: TYPESAFE_API_KEY_ENV });
   });
 
-  it("falls back to the file", () => {
+  it("falls back to the file", async () => {
     const file = writeFile("k", "ts-file-key", 0o600);
-    const r = resolveApiKey({ env: {}, filePath: file });
+    const r = await resolveApiKey({ env: {}, filePath: file });
     assert.equal(r?.source, "file");
     assert.equal(r?.key, "ts-file-key");
   });
 
-  it("returns undefined when neither exists", () => {
-    const r = resolveApiKey({ env: {}, filePath: path.join(tmpDir, "nope") });
+  it("uses the keychain before the file and caches concurrent lookups", async () => {
+    const file = writeFile("k", "ts-file-key", 0o600);
+    let reads = 0;
+    const readKeychain = async () => {
+      reads += 1;
+      return "ts-keychain-key";
+    };
+    const [first, second] = await Promise.all([
+      resolveApiKey({ env: {}, filePath: file, useKeychain: true, readKeychain }),
+      resolveApiKey({ env: {}, filePath: file, useKeychain: true, readKeychain }),
+    ]);
+    assert.equal(first?.source, "keychain");
+    assert.equal(first?.key, "ts-keychain-key");
+    assert.deepEqual(second, first);
+    assert.equal(reads, 1);
+  });
+
+  it("falls back to the file when keychain lookup fails", async () => {
+    const file = writeFile("k", "ts-file-key", 0o600);
+    const result = await resolveApiKey({
+      env: {},
+      filePath: file,
+      useKeychain: true,
+      readKeychain: async () => undefined,
+    });
+    assert.equal(result?.source, "file");
+    assert.equal(result?.key, "ts-file-key");
+  });
+
+  it("returns undefined when neither exists", async () => {
+    const r = await resolveApiKey({ env: {}, filePath: path.join(tmpDir, "nope") });
     assert.equal(r, undefined);
   });
 });
