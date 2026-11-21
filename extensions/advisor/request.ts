@@ -3,7 +3,6 @@
  * session transcript, and reasoning-effort normalization.
  */
 
-import type { Model } from "@earendil-works/pi-ai";
 import {
   capTranscriptEntries,
   keepEnd,

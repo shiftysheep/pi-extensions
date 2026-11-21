@@ -233,22 +233,25 @@ export default function statusLine(pi: ExtensionAPI): void {
       const sessionStartMs = Date.parse(t);
       const artDir = join(sessionDir, "subagent-artifacts");
       for (const name of fs.readdirSync(artDir)) {
-        if (!name.endsWith("_meta.json") || countedMetaFiles.has(name)) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(fs.readFileSync(join(artDir, name), "utf8"));
-        } catch {
-          continue; // unreadable/partial meta: skip
-        }
-        const meta = extractSubagentMeta(name, parsed);
-        if (!meta) continue;
-        if (meta.completedAt === null || meta.completedAt < sessionStartMs) continue;
-        countedMetaFiles.add(name);
-        addSubagentTotals(subagentTotals, meta.totals);
+        addSubagentMetaFile(artDir, name, sessionStartMs);
       }
     } catch {
       /* no artifacts dir (or unreadable): nothing to add */
     }
+  }
+
+  function addSubagentMetaFile(artDir: string, name: string, sessionStartMs: number): void {
+    if (!name.endsWith("_meta.json") || countedMetaFiles.has(name)) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(join(artDir, name), "utf8"));
+    } catch {
+      return;
+    }
+    const meta = extractSubagentMeta(name, parsed);
+    if (!meta || meta.completedAt === null || meta.completedAt < sessionStartMs) return;
+    countedMetaFiles.add(name);
+    addSubagentTotals(subagentTotals, meta.totals);
   }
 
   function setWorkingMessage(ctx: ExtensionContext, message?: string): void {

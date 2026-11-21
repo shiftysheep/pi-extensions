@@ -385,40 +385,10 @@ export default function cronExtension(pi: ExtensionAPI): void {
     clearTimers();
     jobs.clear();
 
-    let latest: unknown;
-    for (const entry of ctx.sessionManager.getEntries()) {
-      if (
-        entry.type === "custom" &&
-        entry.customType === CRON_STATE_TYPE &&
-        isRecord(entry.data) &&
-        entry.data.version === 1 &&
-        entry.data.processNonce === PROCESS_NONCE
-      ) {
-        latest = entry.data;
-      }
-    }
+    const latest = latestCronSnapshot(ctx);
     if (!isRecord(latest) || !Array.isArray(latest.jobs)) return;
 
-    let changed = false;
-    for (const raw of latest.jobs.slice(-MAX_JOBS)) {
-      const job = parsePersistedJob(raw);
-      if (!job || jobs.has(job.name)) {
-        if (job) changed = true;
-        continue;
-      }
-      jobs.set(job.name, job);
-
-      if (job.paused) continue;
-      const dueAt = nextRunAt(job);
-      if (dueAt <= Date.now()) {
-        // The snapshot is from this process, so a due job was interrupted by
-        // reload/session switching. Keep the original due time so recurring
-        // jobs preserve their cadence; fire() advances past missed slots.
-        arm(job, RESTORE_CATCH_UP_DELAY_MS);
-      } else {
-        arm(job, dueAt - Date.now());
-      }
-    }
+    const changed = restoreJobs(latest.jobs);
 
     if (changed) persist();
     const active = Array.from(jobs.values()).filter((job) => !job.paused);
@@ -429,6 +399,41 @@ export default function cronExtension(pi: ExtensionAPI): void {
         "info",
       );
     }
+  }
+
+  function latestCronSnapshot(ctx: ExtensionContext): Record<string, unknown> | undefined {
+    let latest: unknown;
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (
+        entry.type === "custom" &&
+        entry.customType === CRON_STATE_TYPE &&
+        isRecord(entry.data) &&
+        entry.data.version === 1 &&
+        entry.data.processNonce === PROCESS_NONCE
+      )
+        latest = entry.data;
+    }
+    return isRecord(latest) ? latest : undefined;
+  }
+
+  function restoreJobs(rawJobs: unknown[]): boolean {
+    let changed = false;
+    for (const raw of rawJobs.slice(-MAX_JOBS)) {
+      const job = parsePersistedJob(raw);
+      if (!job || jobs.has(job.name)) {
+        if (job) changed = true;
+        continue;
+      }
+      jobs.set(job.name, job);
+      if (!job.paused) armRestoredJob(job);
+    }
+    return changed;
+  }
+
+  function armRestoredJob(job: CronJob): void {
+    const dueAt = nextRunAt(job);
+    // Keep overdue recurring jobs on their original cadence; fire() advances missed slots.
+    arm(job, dueAt <= Date.now() ? RESTORE_CATCH_UP_DELAY_MS : dueAt - Date.now());
   }
 
   pi.registerTool({
@@ -477,35 +482,15 @@ export default function cronExtension(pi: ExtensionAPI): void {
 
   /** /cron add: validate and create a new schedule. */
   function handleAdd(params: CronParams): CronResult {
-    const name = params.name?.trim();
-    if (!name || !NAME_RE.test(name))
-      invalid(
-        "add requires a valid name: start with a letter/digit and use at most 64 letters, digits, spaces, or . _ : -.",
-      );
+    const name = validateNewName(params.name);
     if (jobs.has(name))
       invalid(`schedule "${name}" already exists; remove it first or choose another name.`);
     if (jobs.size >= MAX_JOBS) invalid(`cannot add another schedule; the limit is ${MAX_JOBS}.`);
 
-    const hasAt = typeof params.at === "string" && params.at.trim().length > 0;
-    const hasEvery = typeof params.every === "string" && params.every.trim().length > 0;
-    if (hasAt === hasEvery) invalid("add requires exactly one of at or every.");
-    const message = params.message?.trim();
-    if (!message) invalid("add requires a non-empty message.");
-    if (message.length > MAX_MESSAGE_LENGTH)
-      invalid(`message is too long; maximum is ${MAX_MESSAGE_LENGTH} characters.`);
+    const message = validateNewMessage(params.message);
 
     const now = Date.now();
-    let trigger: CronTrigger;
-    if (hasAt) {
-      const atMs = parseAt(params.at!, now);
-      if (atMs <= now) invalid("one-shot time is already in the past.");
-      if (atMs - now > MAX_TIMER_DELAY_MS)
-        invalid("one-shot timestamps cannot be more than approximately 24 days away.");
-      trigger = { kind: "once", atMs };
-    } else {
-      const everyMs = parseEvery(params.every!);
-      trigger = { kind: "every", everyMs, anchorAt: now, nextRunAt: now + everyMs };
-    }
+    const trigger = createTrigger(params, now);
 
     const job: CronJob = { name, trigger, message, paused: false, firedCount: 0 };
     jobs.set(name, job);
@@ -514,6 +499,38 @@ export default function cronExtension(pi: ExtensionAPI): void {
     return result(
       `scheduled "${name}": ${describeJob(job)}\n> fires as: [cron:${name}] ${truncate(message, 160)}`,
     );
+  }
+
+  function validateNewName(input: string | undefined): string {
+    const name = input?.trim();
+    if (!name || !NAME_RE.test(name))
+      invalid(
+        "add requires a valid name: start with a letter/digit and use at most 64 letters, digits, spaces, or . _ : -.",
+      );
+    return name;
+  }
+
+  function validateNewMessage(input: string | undefined): string {
+    const message = input?.trim();
+    if (!message) invalid("add requires a non-empty message.");
+    if (message.length > MAX_MESSAGE_LENGTH)
+      invalid(`message is too long; maximum is ${MAX_MESSAGE_LENGTH} characters.`);
+    return message;
+  }
+
+  function createTrigger(params: CronParams, now: number): CronTrigger {
+    const hasAt = typeof params.at === "string" && params.at.trim().length > 0;
+    const hasEvery = typeof params.every === "string" && params.every.trim().length > 0;
+    if (hasAt === hasEvery) invalid("add requires exactly one of at or every.");
+    if (!hasAt) {
+      const everyMs = parseEvery(params.every ?? "");
+      return { kind: "every", everyMs, anchorAt: now, nextRunAt: now + everyMs };
+    }
+    const atMs = parseAt(params.at ?? "", now);
+    if (atMs <= now) invalid("one-shot time is already in the past.");
+    if (atMs - now > MAX_TIMER_DELAY_MS)
+      invalid("one-shot timestamps cannot be more than approximately 24 days away.");
+    return { kind: "once", atMs };
   }
 
   /** /cron remove: remove a schedule by name. */

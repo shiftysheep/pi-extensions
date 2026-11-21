@@ -18,34 +18,13 @@ import {
   saveConfig,
   saveConfigValidated,
 } from "./advisor/config.js";
-import { advisorExecute, type CandidateAttempt } from "./advisor/execute.js";
+import { advisorExecute } from "./advisor/execute.js";
+import { type AdvisorSlot, pickModel, resolveSpec } from "./advisor/models.js";
 import {
-  type AdvisorSlot,
-  findModel,
-  pickModel,
-  preRefreshProviderAuth,
-  resolveSpec,
-} from "./advisor/models.js";
-import { sessionTranscript } from "./advisor/request.js";
-import {
-  type AdvisorConsultResult,
-  type AdvisorStatus,
-  consultWithChildProcess,
-} from "./advisor/transports.js";
-import {
-  type AdvisorCandidate,
   type AdvisorConfig,
-  type AdvisorReasoningEffort,
-  type AdvisorTarget,
-  buildCandidates,
-  capDiagnosticText,
-  composeAdviceText,
   createConcurrencyLimiter,
   isReasoningEffort,
   REASONING_EFFORTS,
-  remainingBudgetMs,
-  resolveConsultTimeoutMs,
-  timeoutPrefix,
   withSlot,
 } from "./lib/advisor-utils.js";
 

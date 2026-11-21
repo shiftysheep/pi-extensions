@@ -23,7 +23,7 @@ import {
   timeoutPrefix,
 } from "../lib/advisor-utils.js";
 import { loadConfigSafe } from "./config.js";
-import { type AdvisorSlot, findModel, preRefreshProviderAuth } from "./models.js";
+import { findModel, preRefreshProviderAuth } from "./models.js";
 import { sessionTranscript } from "./request.js";
 import {
   type AdvisorConsultResult,
