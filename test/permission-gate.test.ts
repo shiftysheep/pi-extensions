@@ -810,4 +810,21 @@ describe("PowerShell -EncodedCommand", () => {
   it("leaves plain commands untouched", () => {
     assert.equal(findDangerousPowerShellRule("Get-ChildItem"), undefined);
   });
+  it("matches prefix-matched aliases (-enc, -e, -encd) and : form", () => {
+    for (const alias of ["-enc", "-e", "-encode", "-encoded", "-encodedcommand"]) {
+      const m = findDangerousPowerShellRule(`powershell ${alias} ${enc("Get-ChildItem")}`);
+      assert.equal(
+        m?.name,
+        "encoded PowerShell execution",
+        `alias ${alias} must decode and confirm`,
+      );
+    }
+    const colon = findDangerousPowerShellRule(
+      `powershell -EncodedCommand:${enc("Clear-Disk -Number 1")}`,
+    );
+    assert.equal(colon?.disposition, "deny");
+    assert.equal(colon?.name, "disk wipe");
+    const colonAlias = findDangerousPowerShellRule(`powershell -enc:${enc("Get-ChildItem")}`);
+    assert.equal(colonAlias?.name, "encoded PowerShell execution");
+  });
 });
