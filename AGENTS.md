@@ -50,8 +50,8 @@ tested with `pi -e ./extensions/<file>.ts` (isolated run) or by copying into
   added there or it will not load (and do not add an `extensions/<subdir>/index.ts`;
   only the manifest's explicit entries load). Shared code goes in subdirs like
   `extensions/lib/` or `extensions/advisor/`.
-- **Complexity**: cognitive complexity is capped at 80 (current peak is 75 in
-  `advisor.ts`). Don't grow already-large functions; extract helpers instead.
+- **Complexity**: cognitive complexity is capped at 20. Don't grow already-large
+  functions; extract helpers instead.
 - **Commits**: conventional commits, enforced by commitlint on the `commit-msg` hook.
   Use `npm run commit` or write `<type>: <summary>` messages (types: feat, fix, chore,
   docs, refactor, ...).

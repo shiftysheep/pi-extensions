@@ -51,19 +51,15 @@ export function segments(command: string): string[] {
   while (i < command.length) {
     const ch = command[i];
     if (quote !== null) {
-      if (quote === '"' && ch === "\\" && i + 1 < command.length) {
-        cur += ch + command[i + 1]; // backslash escapes only inside double quotes
-        i += 2;
-        continue;
-      }
-      cur += ch;
-      if (ch === quote) quote = null;
-      prev = ch;
+      const consumed = consumeQuotedSegmentChar(command, i, quote, cur);
+      cur = consumed.cur;
+      if (consumed.closed) quote = null;
+      if (consumed.updatePrev) prev = consumed.prev;
       prevEscaped = false;
-      i++;
+      i = consumed.next;
       continue;
     }
-    if (ch === "'" || ch === '"') {
+    if (isQuote(ch)) {
       quote = ch;
       cur += ch;
       prev = ch;
@@ -78,20 +74,13 @@ export function segments(command: string): string[] {
       i += 2;
       continue;
     }
-    if ((ch === "&" || ch === "|") && command[i + 1] === ch) {
-      flush(); // && / ||
-      prev = ch;
+    if (isSegmentSeparator(ch)) {
+      const step = consumeSegmentSeparator(command, i, ch, prev, prevEscaped);
+      if (step.flush) flush();
+      else cur += step.text;
+      prev = step.prev;
       prevEscaped = false;
-      i += 2;
-      continue;
-    }
-    if (ch === "\n" || ch === ";" || ch === "&" || ch === "|") {
-      const isRedirectOp = (ch === "&" || ch === "|") && prev === ">" && !prevEscaped;
-      if (isRedirectOp) cur += ch;
-      else flush();
-      prev = ch;
-      prevEscaped = false;
-      i++;
+      i = step.next;
       continue;
     }
     cur += ch;
@@ -101,6 +90,40 @@ export function segments(command: string): string[] {
   }
   flush();
   return out;
+}
+
+function isSegmentSeparator(ch: string): boolean {
+  return ch === "\n" || ch === ";" || ch === "&" || ch === "|";
+}
+
+function isQuote(ch: string): boolean {
+  return ch === "'" || ch === '"';
+}
+
+function consumeSegmentSeparator(
+  command: string,
+  index: number,
+  ch: string,
+  previous: string | null,
+  previousEscaped: boolean,
+): { flush: boolean; text: string; prev: string; next: number } {
+  if ((ch === "&" || ch === "|") && command[index + 1] === ch)
+    return { flush: true, text: "", prev: ch, next: index + 2 };
+  const redirect = (ch === "&" || ch === "|") && previous === ">" && !previousEscaped;
+  return { flush: !redirect, text: redirect ? ch : "", prev: ch, next: index + 1 };
+}
+
+function consumeQuotedSegmentChar(command: string, i: number, quote: string, cur: string) {
+  const ch = command[i];
+  if (quote === '"' && ch === "\\" && i + 1 < command.length)
+    return {
+      cur: cur + ch + command[i + 1],
+      closed: false,
+      prev: "",
+      updatePrev: false,
+      next: i + 2,
+    };
+  return { cur: cur + ch, closed: ch === quote, prev: ch, updatePrev: true, next: i + 1 };
 }
 
 /** Extract the command word (minus env-var prefixes, `env` wrappers, and
@@ -119,17 +142,7 @@ function commandOf(segment: string): { cmd: string; args: string[] } | undefined
     // env [FLAGS] [VAR=VALUE]* [--] COMMAND — unwrap to the real command.
     // -u/-C/--unset take an operand that must not be mistaken for the
     // command word; `--` terminates options.
-    i++;
-    while (i < parts.length) {
-      const p = parts[i];
-      if (p === "--") {
-        i++;
-        break;
-      }
-      if (p === "-u" || p === "-C" || p === "--unset") i += 2;
-      else if (/^--?\w/.test(p) || /^[A-Za-z_]\w*=\S+$/.test(p)) i++;
-      else break;
-    }
+    i = envCommandIndex(parts, i + 1);
     if (i >= parts.length) return undefined;
     cmd = parts[i].split("/").pop() ?? parts[i];
   }
@@ -137,6 +150,18 @@ function commandOf(segment: string): { cmd: string; args: string[] } | undefined
   // e.g. `tee -- /dev/sda`); option-sensitive rules like recursive rm stop
   // interpreting them as flags themselves.
   return { cmd, args: parts.slice(i + 1) };
+}
+
+function envCommandIndex(parts: string[], index: number): number {
+  let i = index;
+  while (i < parts.length) {
+    const part = parts[i];
+    if (part === "--") return i + 1;
+    if (part === "-u" || part === "-C" || part === "--unset") i += 2;
+    else if (/^--?\w/.test(part) || /^[A-Za-z_]\w*=\S+$/.test(part)) i++;
+    else break;
+  }
+  return i;
 }
 
 // Harmless /dev targets that are NOT raw device writes. Prefix-aware: /dev/fd/3
@@ -193,14 +218,9 @@ function parseRedirectTarget(segment: string, from: number): { target: string; e
     )
       break;
     if (c === "'" || c === '"') {
-      const q = c;
-      j++;
-      while (j < segment.length && segment[j] !== q) {
-        if (q === '"' && segment[j] === "\\" && j + 1 < segment.length) j++;
-        target += segment[j] ?? "";
-        j++;
-      }
-      j++;
+      const quoted = readRedirectQuote(segment, j, c);
+      target += quoted.text;
+      j = quoted.end;
       continue;
     }
     if (c === "\\" && j + 1 < segment.length) {
@@ -213,6 +233,21 @@ function parseRedirectTarget(segment: string, from: number): { target: string; e
     j++;
   }
   return { target, end: j };
+}
+
+function readRedirectQuote(
+  segment: string,
+  start: number,
+  quote: string,
+): { text: string; end: number } {
+  let j = start + 1;
+  let text = "";
+  while (j < segment.length && segment[j] !== quote) {
+    if (quote === '"' && segment[j] === "\\" && j + 1 < segment.length) j++;
+    text += segment[j] ?? "";
+    j++;
+  }
+  return { text, end: j + 1 };
 }
 
 /** A redirection operator and its target word within a segment. */
@@ -261,13 +296,7 @@ function redirects(segment: string): Redirect[] {
       continue;
     }
     if (ch === "'" || ch === '"') {
-      const q = ch;
-      i++;
-      while (i < segment.length && segment[i] !== q) {
-        if (q === '"' && segment[i] === "\\" && i + 1 < segment.length) i++;
-        i++;
-      }
-      i++;
+      i = skipQuotedText(segment, i, ch);
       continue;
     }
     if (ch === ">" || ch === "<") {
@@ -284,6 +313,15 @@ function redirects(segment: string): Redirect[] {
     i++;
   }
   return out;
+}
+
+function skipQuotedText(text: string, start: number, quote: string): number {
+  let i = start + 1;
+  while (i < text.length && text[i] !== quote) {
+    if (quote === '"' && text[i] === "\\" && i + 1 < text.length) i++;
+    i++;
+  }
+  return i + 1;
 }
 
 /** Output-redirection targets only (the raw-device deny rule's surface). */
@@ -406,17 +444,23 @@ export type CatalogEntry = {
 /** True when any command in the segment's chain satisfies a catalog entry. */
 function catalogMatches(entries: readonly CatalogEntry[], segment: string): boolean {
   return commandChain(segment).some(({ cmd, args }) =>
-    entries.some((e) => {
-      if (!e.cmds.includes(cmd)) return false;
-      const a = e.positional ? positionalArgs(args, e.optsWithArg) : args;
-      if (e.sub && !e.sub.includes(a[0] ?? "")) return false;
-      if (e.sub2 && !e.sub2.includes(a[1] ?? "")) return false;
-      if (e.has && !e.has.some((h) => args.includes(h))) return false;
-      if (e.notHas && e.notHas.some((h) => args.includes(h))) return false;
-      if (e.test && !e.test(args, segment)) return false;
-      return true;
-    }),
+    entries.some((entry) => catalogEntryMatches(entry, cmd, args, segment)),
   );
+}
+
+function catalogEntryMatches(
+  entry: CatalogEntry,
+  cmd: string,
+  args: string[],
+  segment: string,
+): boolean {
+  if (!entry.cmds.includes(cmd)) return false;
+  const values = entry.positional ? positionalArgs(args, entry.optsWithArg) : args;
+  if (entry.sub && !entry.sub.includes(values[0] ?? "")) return false;
+  if (entry.sub2 && !entry.sub2.includes(values[1] ?? "")) return false;
+  if (entry.has && !entry.has.some((has) => args.includes(has))) return false;
+  if (entry.notHas && entry.notHas.some((has) => args.includes(has))) return false;
+  return !entry.test || entry.test(args, segment);
 }
 
 const PRIVILEGE_ESCALATION: readonly CatalogEntry[] = [{ cmds: ["sudo", "doas", "pkexec"] }];
@@ -424,6 +468,34 @@ const PRIVILEGE_ESCALATION: readonly CatalogEntry[] = [{ cmds: ["sudo", "doas", 
 const POWER_ACTIONS: readonly CatalogEntry[] = [
   { cmds: ["shutdown", "reboot", "poweroff", "halt"] },
 ];
+
+function destructiveGitArgs(args: string[]): boolean {
+  const optionsWithArg = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) i += optionsWithArg.has(args[i]) ? 2 : 1;
+  const [sub, ...rest] = args.slice(i);
+  if (sub === "push")
+    return rest.some(
+      (arg) =>
+        ["--force", "--force-with-lease", "-f", "--delete"].includes(arg) ||
+        arg.startsWith("--force-with-lease=") ||
+        arg.startsWith("+"),
+    );
+  if (sub === "reset") return rest.includes("--hard");
+  if (sub === "clean")
+    return rest.some((arg) => arg === "-f" || arg === "--force" || /^-[a-z]*f/.test(arg));
+  if (sub === "branch") return destructiveBranchArgs(rest);
+  return sub === "filter-repo" || sub === "filter-branch";
+}
+
+function destructiveBranchArgs(args: string[]): boolean {
+  return (
+    args.includes("-D") ||
+    (args.includes("-d") && args.includes("-f")) ||
+    args.some((arg) => /^-(?!-)[A-Za-z]+$/.test(arg) && /[dD]/.test(arg) && /f/.test(arg)) ||
+    (args.includes("--delete") && (args.includes("-f") || args.includes("--force")))
+  );
+}
 
 const DEVICE_WIPES: readonly CatalogEntry[] = [
   // -n/--no-act is a dry run: inspect, not wipe. Only OPTIONS (before any
@@ -759,39 +831,7 @@ const RULES: GateRule[] = [
     name: "destructive git operation",
     test: (command) =>
       segments(command).some((seg) =>
-        commandChain(seg).some(({ cmd, args: parsedArgs }) => {
-          if (cmd !== "git") return false;
-          // Skip git GLOBAL options (before the subcommand); -C/-c/--git-dir/
-          // --work-tree/--namespace take an operand. (-p paginates: NO operand.)
-          const GIT_OPT_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
-          const args = parsedArgs;
-          let i = 0;
-          while (i < args.length && args[i].startsWith("-")) {
-            i += GIT_OPT_WITH_ARG.has(args[i]) ? 2 : 1;
-          }
-          const [sub, ...rest] = args.slice(i);
-          if (sub === "push")
-            return rest.some(
-              (a) =>
-                a === "--force" ||
-                a === "--force-with-lease" ||
-                a.startsWith("--force-with-lease=") ||
-                a === "-f" ||
-                a === "--delete" ||
-                a.startsWith("+"),
-            );
-          if (sub === "reset") return rest.includes("--hard");
-          if (sub === "clean")
-            return rest.some((a) => a === "-f" || a === "--force" || /^-[a-z]*f/.test(a));
-          if (sub === "branch")
-            return (
-              rest.includes("-D") ||
-              (rest.includes("-d") && rest.includes("-f")) ||
-              rest.some((a) => /^-(?!-)[A-Za-z]+$/.test(a) && /[dD]/.test(a) && /f/.test(a)) ||
-              (rest.includes("--delete") && (rest.includes("-f") || rest.includes("--force")))
-            );
-          return sub === "filter-repo" || sub === "filter-branch";
-        }),
+        commandChain(seg).some(({ cmd, args }) => cmd === "git" && destructiveGitArgs(args)),
       ),
   },
   {

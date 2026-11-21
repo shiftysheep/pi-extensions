@@ -114,7 +114,6 @@ import {
   type RunnerContext,
   SANDBOX_RUNNER_CHOICES,
   type SandboxConfig,
-  type SandboxPolicy,
   type SandboxRunnerChoice,
   type SandboxScope,
   type SandboxState,
@@ -560,7 +559,18 @@ export default function (pi: ExtensionAPI) {
       );
       return undefined;
     }
-    const verdict = decideClassifier(probs, effectiveThresholds(config));
+    return handleClassifierVerdict(
+      decideClassifier(probs, effectiveThresholds(config)),
+      command,
+      ctx,
+    );
+  }
+
+  async function handleClassifierVerdict(
+    verdict: ReturnType<typeof decideClassifier>,
+    command: string,
+    ctx: ExtensionContext,
+  ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
     if (verdict.action === "deny") {
       return blocked(
         `Blocked: Jev classified this command as high-risk (${verdict.label}). This is a model judgment, not a static rule — review before running it manually.`,
@@ -811,20 +821,8 @@ export default function (pi: ExtensionAPI) {
       );
     }
     const match = findStaticMatch(isPowerShell ? "powershell" : "bash", command);
-    if (match) {
-      if (match.disposition === "deny") {
-        return blocked(
-          `Blocked: "${match.name}" is hard-blocked (human-only). Run it manually outside the agent.`,
-        );
-      }
-      if (!ctx.hasUI) {
-        return blocked(`Blocked: "${match.name}" heuristic matched and there is no UI to confirm`);
-      }
-      const ok = await ctx.ui.confirm(`⚠️ Dangerous command (${match.name})`, command, {
-        signal: ctx.signal,
-      });
-      if (!ok) return blocked("Blocked by user");
-    }
+    const staticBlock = match ? await confirmStaticMatch(match, command, ctx) : undefined;
+    if (staticBlock) return staticBlock;
     if (!match) {
       const jevBlock = await runJevClassifier(command, ctx, isPowerShell ? "powershell" : "bash");
       if (jevBlock) return jevBlock;
@@ -838,6 +836,23 @@ export default function (pi: ExtensionAPI) {
       );
     }
     return undefined;
+  }
+
+  async function confirmStaticMatch(
+    match: NonNullable<ReturnType<typeof findStaticMatch>>,
+    command: string,
+    ctx: ExtensionContext,
+  ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
+    if (match.disposition === "deny")
+      return blocked(
+        `Blocked: "${match.name}" is hard-blocked (human-only). Run it manually outside the agent.`,
+      );
+    if (!ctx.hasUI)
+      return blocked(`Blocked: "${match.name}" heuristic matched and there is no UI to confirm`);
+    const ok = await ctx.ui.confirm(`⚠️ Dangerous command (${match.name})`, command, {
+      signal: ctx.signal,
+    });
+    return ok ? undefined : blocked("Blocked by user");
   }
 
   pi.on("tool_call", async (event, ctx) => {
@@ -993,32 +1008,46 @@ export default function (pi: ExtensionAPI) {
           "deny",
         );
       case "classifierModel": {
-        const v = await ctx.ui.input(
-          "Classifier model id (empty = default jev-latest)",
-          draft.classifierModel ?? DEFAULT_JEV_MODEL,
-          { signal: ctx.signal },
-        );
-        if (v === undefined) return undefined;
-        const t = v.trim();
-        return t === "" ? { classifierModel: undefined } : { classifierModel: t };
+        return promptClassifierModel(ctx, draft);
       }
       case "classifierTimeoutMs": {
-        const v = await ctx.ui.input(
-          "Classifier timeout in ms",
-          String(draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS),
-          { signal: ctx.signal },
-        );
-        if (v === undefined) return undefined;
-        if (v.trim() === "") throw new Error("enter a positive number of ms");
-        const n = Number(v);
-        if (!Number.isFinite(n) || n < 1 || n > MAX_CLASSIFIER_TIMEOUT_MS)
-          throw new Error(`timeout must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS} ms`);
-        return { classifierTimeoutMs: Math.round(n) };
+        return promptClassifierTimeout(ctx, draft);
       }
     }
     // Unreachable: the switch above is exhaustive over ClassifierOption.
     const exhaustive: never = option;
     return exhaustive;
+  }
+
+  async function promptClassifierModel(
+    ctx: ExtensionCommandContext,
+    draft: SandboxConfig,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    const value = await ctx.ui.input(
+      "Classifier model id (empty = default jev-latest)",
+      draft.classifierModel ?? DEFAULT_JEV_MODEL,
+      { signal: ctx.signal },
+    );
+    if (value === undefined) return undefined;
+    const trimmed = value.trim();
+    return trimmed === "" ? { classifierModel: undefined } : { classifierModel: trimmed };
+  }
+
+  async function promptClassifierTimeout(
+    ctx: ExtensionCommandContext,
+    draft: SandboxConfig,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    const value = await ctx.ui.input(
+      "Classifier timeout in ms",
+      String(draft.classifierTimeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS),
+      { signal: ctx.signal },
+    );
+    if (value === undefined) return undefined;
+    if (value.trim() === "") throw new Error("enter a positive number of ms");
+    const timeout = Number(value);
+    if (!Number.isFinite(timeout) || timeout < 1 || timeout > MAX_CLASSIFIER_TIMEOUT_MS)
+      throw new Error(`timeout must be a number between 1 and ${MAX_CLASSIFIER_TIMEOUT_MS} ms`);
+    return { classifierTimeoutMs: Math.round(timeout) };
   }
 
   // --- one option edit in the config UI; undefined = the user bailed ---
@@ -1088,49 +1117,10 @@ export default function (pi: ExtensionAPI) {
         { value: "allow", label: "allow", description: "sandboxed commands can reach the network" },
         { value: "deny", label: "deny", description: "block outbound network (no-op on landlock)" },
       ]);
-    if (option === "home")
-      return promptEnumOption(ctx, "home", "$HOME access in the sandbox", [
-        { value: "ro", label: "ro", description: "$HOME is read-only (default)" },
-        { value: "rw", label: "rw", description: "$HOME is writable" },
-      ]);
-    if (option === "homeCaches")
-      return promptEnumOption(ctx, "homeCaches", "Writable $HOME cache dirs", [
-        { value: "ro", label: "ro", description: "every $HOME subdir stays read-only (default)" },
-        {
-          value: "rw",
-          label: "rw",
-          description:
-            "~/.cache, ~/.npm, ~/.cargo, … are writable (opt-in; some hold credentials/executables)",
-        },
-      ]);
-    if (option === "userCommands")
-      return promptBoolOption(
-        ctx,
-        "userCommands",
-        "Sandbox user ! commands",
-        "user ! commands also run sandboxed",
-        "user ! commands bypass the sandbox (default)",
-        true,
-      );
-    if (option === "loginShell")
-      return promptBoolOption(
-        ctx,
-        "loginShell",
-        "Login shell for sandboxed commands",
-        "bash -lc — sources /etc/profile + ~/.bash_profile (default)",
-        "bash -c — no login profiles; inherited env and BASH_ENV still apply",
-        true,
-      );
-    if (option === "landlockHelper") {
-      const v = await ctx.ui.input(
-        "Prebuilt Landlock helper path (empty = compile on first use)",
-        draft.landlockHelper ?? "",
-        { signal: ctx.signal },
-      );
-      if (v === undefined) return undefined;
-      const trimmed = v.trim();
-      return trimmed === "" ? { landlockHelper: undefined } : { landlockHelper: trimmed };
-    }
+    if (option === "home" || option === "homeCaches" || option === "userCommands")
+      return editSandboxAccessOption(ctx, option);
+    if (option === "loginShell" || option === "landlockHelper")
+      return editSandboxRuntimeOption(ctx, option, draft);
     if (option === "failIfUnavailable")
       return promptBoolOption(
         ctx,
@@ -1151,6 +1141,59 @@ export default function (pi: ExtensionAPI) {
       return editClassifierOption(ctx, option, draft);
     }
     return promptWritable(ctx, draft);
+  }
+
+  async function editSandboxAccessOption(
+    ctx: ExtensionCommandContext,
+    option: string,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    if (option === "home")
+      return promptEnumOption(ctx, "home", "$HOME access in the sandbox", [
+        { value: "ro", label: "ro", description: "$HOME is read-only (default)" },
+        { value: "rw", label: "rw", description: "$HOME is writable" },
+      ]);
+    if (option === "homeCaches")
+      return promptEnumOption(ctx, "homeCaches", "Writable $HOME cache dirs", [
+        { value: "ro", label: "ro", description: "every $HOME subdir stays read-only (default)" },
+        {
+          value: "rw",
+          label: "rw",
+          description:
+            "~/.cache, ~/.npm, ~/.cargo, … are writable (opt-in; some hold credentials/executables)",
+        },
+      ]);
+    return promptBoolOption(
+      ctx,
+      "userCommands",
+      "Sandbox user ! commands",
+      "user ! commands also run sandboxed",
+      "user ! commands bypass the sandbox (default)",
+      true,
+    );
+  }
+
+  async function editSandboxRuntimeOption(
+    ctx: ExtensionCommandContext,
+    option: string,
+    draft: SandboxConfig,
+  ): Promise<Partial<SandboxConfig> | undefined> {
+    if (option === "loginShell")
+      return promptBoolOption(
+        ctx,
+        "loginShell",
+        "Login shell for sandboxed commands",
+        "bash -lc — sources /etc/profile + ~/.bash_profile (default)",
+        "bash -c — no login profiles; inherited env and BASH_ENV still apply",
+        true,
+      );
+    const value = await ctx.ui.input(
+      "Prebuilt Landlock helper path (empty = compile on first use)",
+      draft.landlockHelper ?? "",
+      { signal: ctx.signal },
+    );
+    if (value === undefined) return undefined;
+    const trimmed = value.trim();
+    return trimmed === "" ? { landlockHelper: undefined } : { landlockHelper: trimmed };
   }
 
   /** Prompt for writable paths (comma-separated) and return the partial config. */
@@ -1175,60 +1218,11 @@ export default function (pi: ExtensionAPI) {
     const files = sandboxConfigFiles(ctx.cwd);
     const scopeLabel = (scope: SandboxScope) =>
       `${scope} — ${files[scope]}${scope === "project" && !trusted ? " (not trusted)" : ""}`;
-    const scopeChoice = await promptSelect(ctx, "Sandbox config scope", [
-      {
-        value: "project",
-        label: scopeLabel("project"),
-        description: "this repo only — shared with the project (needs trust)",
-      },
-      {
-        value: "global",
-        label: scopeLabel("global"),
-        description: "applies to all your projects",
-      },
-    ]);
-    if (scopeChoice === undefined) {
-      ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
-      return;
-    }
-    const scope: SandboxScope = scopeChoice === "project" ? "project" : "global";
-    if (scope === "project" && !trusted) {
-      ctx.ui.notify(
-        "Project is not trusted; refusing to write its sandbox config. Trust the project or pick the global scope.",
-        "warning",
-      );
-      return;
-    }
+    const scope = await chooseSandboxScope(ctx, trusted, scopeLabel);
+    if (!scope) return;
     const file = files[scope];
-    let draft: SandboxConfig;
-    try {
-      draft = readScopeConfig(file);
-    } catch (err) {
-      ctx.ui.notify(
-        `Cannot edit: ${String(err instanceof Error ? err.message : err)} — fix the file by hand, then retry.`,
-        "error",
-      );
-      return;
-    }
-    for (;;) {
-      const choice = await promptSelect(
-        ctx,
-        `Sandbox config (${scopeLabel(scope)})`,
-        sandboxOptionItems(draft),
-      );
-      // promptSelect resolves to the item's value in every UI mode.
-      if (choice === undefined || choice === "cancel") {
-        ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
-        return;
-      }
-      if (choice === "save") break;
-      const edited = await editSandboxOption(ctx, choice, draft);
-      if (edited === undefined) {
-        ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
-        return;
-      }
-      Object.assign(draft, edited);
-    }
+    const draft = await editSandboxDraft(ctx, file, scopeLabel(scope));
+    if (!draft) return;
     writeScopeConfig(file, draft);
     ctx.ui.notify(`sandbox config saved: ${file}`, "info");
     const reloaded = loadSandboxConfigs(ctx.cwd, trusted);
@@ -1241,6 +1235,69 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
     applySandbox(reloaded.config, ctx.ui, ctx.cwd, true, reloaded.managedConfig);
+  }
+
+  async function chooseSandboxScope(
+    ctx: ExtensionCommandContext,
+    trusted: boolean,
+    scopeLabel: (scope: SandboxScope) => string,
+  ): Promise<SandboxScope | undefined> {
+    const choice = await promptSelect(ctx, "Sandbox config scope", [
+      {
+        value: "project",
+        label: scopeLabel("project"),
+        description: "this repo only — shared with the project (needs trust)",
+      },
+      { value: "global", label: scopeLabel("global"), description: "applies to all your projects" },
+    ]);
+    if (choice === undefined) {
+      ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
+      return undefined;
+    }
+    const scope: SandboxScope = choice === "project" ? "project" : "global";
+    if (scope === "project" && !trusted) {
+      ctx.ui.notify(
+        "Project is not trusted; refusing to write its sandbox config. Trust the project or pick the global scope.",
+        "warning",
+      );
+      return undefined;
+    }
+    return scope;
+  }
+
+  async function editSandboxDraft(
+    ctx: ExtensionCommandContext,
+    file: string,
+    label: string,
+  ): Promise<SandboxConfig | undefined> {
+    let draft: SandboxConfig;
+    try {
+      draft = readScopeConfig(file);
+    } catch (error) {
+      ctx.ui.notify(
+        `Cannot edit: ${String(error instanceof Error ? error.message : error)} — fix the file by hand, then retry.`,
+        "error",
+      );
+      return undefined;
+    }
+    for (;;) {
+      const choice = await promptSelect(
+        ctx,
+        `Sandbox config (${label})`,
+        sandboxOptionItems(draft),
+      );
+      if (choice === undefined || choice === "cancel") {
+        ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
+        return undefined;
+      }
+      if (choice === "save") return draft;
+      const edited = await editSandboxOption(ctx, choice, draft);
+      if (edited === undefined) {
+        ctx.ui.notify("sandbox config cancelled: no changes saved.", "warning");
+        return undefined;
+      }
+      Object.assign(draft, edited);
+    }
   }
 
   pi.registerCommand("sandbox", {

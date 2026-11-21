@@ -194,14 +194,35 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
   const config = parsed as Record<string, unknown>;
   // Strict key validation: a typo'd key ("fallBack", "reasoning_effort", ...) used to be
   // silently ignored, leaving the advisor running on defaults with no warning.
+  validateConfigKeys(config, configPath);
+  validateConfigFields(config, configPath);
+  const primary = parseTarget(config.primary, "primary", configPath);
+  const fallback = parseTarget(config.fallback, "fallback", configPath);
+  validateDistinctTargets(primary, fallback, configPath);
+  return {
+    primary,
+    fallback,
+    reasoningEffort: config.reasoningEffort as AdvisorReasoningEffort | undefined,
+    activeModelFallback: config.activeModelFallback as boolean | undefined,
+    timeoutMs: config.timeoutMs as number | undefined,
+    piBinary: config.piBinary as string | undefined,
+    awsProfile: config.awsProfile as string | undefined,
+    awsRegion: config.awsRegion as string | undefined,
+    env: config.env as Record<string, string> | undefined,
+  };
+}
+
+function validateConfigKeys(config: Record<string, unknown>, configPath: string): void {
   const unknownKeys = Object.keys(config).filter(
     (k) => !(ALLOWED_CONFIG_KEYS as readonly string[]).includes(k),
   );
-  if (unknownKeys.length > 0) {
-    throw new Error(
-      `${configPath}: unknown key${unknownKeys.length > 1 ? "s" : ""} ${unknownKeys.map((k) => `"${k}"`).join(", ")} (allowed: ${ALLOWED_CONFIG_KEYS.join(", ")}).`,
-    );
-  }
+  if (unknownKeys.length === 0) return;
+  throw new Error(
+    `${configPath}: unknown key${unknownKeys.length > 1 ? "s" : ""} ${unknownKeys.map((k) => `"${k}"`).join(", ")} (allowed: ${ALLOWED_CONFIG_KEYS.join(", ")}).`,
+  );
+}
+
+function validateConfigFields(config: Record<string, unknown>, configPath: string): void {
   if (config.reasoningEffort !== undefined && !isReasoningEffort(config.reasoningEffort)) {
     throw new Error(
       `${configPath}: reasoningEffort must be one of: ${REASONING_EFFORTS.join(", ")}.`,
@@ -235,24 +256,18 @@ export function parseConfig(parsed: unknown, configPath: string): AdvisorConfig 
       `${configPath}: env must be an object mapping names to non-empty string values.`,
     );
   }
-  const primary = parseTarget(config.primary, "primary", configPath);
-  const fallback = parseTarget(config.fallback, "fallback", configPath);
+}
+
+function validateDistinctTargets(
+  primary: AdvisorTarget | undefined,
+  fallback: AdvisorTarget | undefined,
+  configPath: string,
+): void {
   if (primary && fallback && sameModel(primary, fallback)) {
     throw new Error(
       `${configPath}: primary and fallback are the same model ("${primary.provider ?? "*"}/${primary.model}"), so the fallback would just rerun it; configure a different model or omit one slot.`,
     );
   }
-  return {
-    primary,
-    fallback,
-    reasoningEffort: config.reasoningEffort,
-    activeModelFallback: config.activeModelFallback,
-    timeoutMs: config.timeoutMs,
-    piBinary: config.piBinary,
-    awsProfile: config.awsProfile,
-    awsRegion: config.awsRegion,
-    env: config.env,
-  };
 }
 
 /** True when two targets resolve to the same model (an absent provider matches any provider). */
