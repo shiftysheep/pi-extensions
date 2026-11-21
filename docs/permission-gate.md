@@ -34,7 +34,7 @@ Off by default; enabling it makes **every** non-static-matched bash/PowerShell c
 - `risk ≥ classifierDenyThreshold` (default `0.85`) → **hard-block** (a model judgment, not a static rule — the message says so).
 - `risk ≥ classifierConfirmThreshold` (default `0.7`) → **confirm** prompt naming the concern(s) and probabilities.
 - otherwise → proceed.
-- **Fails open**: if `TYPESAFE_API_KEY` is unset, or the call errors / times out / returns a malformed body, the command proceeds (with a one-time warning) — the static tier still guards the hard cases. Pressing Esc during the call aborts it (no warning); in headless/print/JSON modes the one-time warning goes to stderr so stdout stays clean.
+- **Fails open**: if no API key is configured, or the call errors / times out / returns a malformed body, the command proceeds (with a one-time warning) — the static tier still guards the hard cases. Pressing Esc during the call aborts it (no warning); in headless/print/JSON modes the one-time warning goes to stderr so stdout stays clean.
 
 ### Config (`sandbox.json`)
 
@@ -46,7 +46,24 @@ Off by default; enabling it makes **every** non-static-matched bash/PowerShell c
 | `classifierModel` | `"jev-latest"` | Jev model id. |
 | `classifierTimeoutMs` | `8000` | Per-call request timeout (ms), capped at `60000`. |
 
-The API key is read from the **`TYPESAFE_API_KEY` environment variable** — it is never stored in `sandbox.json`. All keys are editable in `/sandbox config` and shown in `/sandbox` status.
+The API key can be read from **`TYPESAFE_API_KEY`** or a private per-user file. The environment variable takes precedence. The key is never stored in `sandbox.json`.
+
+### Setting up the API key file
+
+Create `~/.pi/credentials/typesafe-api-key` with the raw token on one line. On macOS or Linux, this command prompts without echoing the token and creates the private directory and file:
+
+```sh
+install -d -m 700 "$HOME/.pi/credentials"
+umask 077
+read -r -s -p "TypeSafe API key: " key; printf '\n'
+printf '%s\n' "$key" > "$HOME/.pi/credentials/typesafe-api-key"
+unset key
+chmod 600 "$HOME/.pi/credentials/typesafe-api-key"
+```
+
+The extension ignores a missing, malformed, symlinked, or insufficiently private file. On POSIX systems it requires a regular file owned by your user with no group/other permissions and a private parent directory. On Windows, protect the file and directory with an ACL that grants access only to your account; Node does not validate Windows ACLs.
+
+`TYPESAFE_API_KEY` remains useful for terminal sessions and CI. For GUI launches such as VS Code or T3 Code, use the private file when the host does not pass that environment variable through. OS keychain support is not available yet.
 
 ### Benchmarking
 

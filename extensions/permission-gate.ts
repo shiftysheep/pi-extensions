@@ -121,6 +121,7 @@ import {
   sandboxStateSignature,
   wrapCommand,
 } from "./lib/sandbox-utils.js";
+import { resolveApiKey } from "./permission-gate/api-key.js";
 import {
   buildClassifierRequest,
   type ClassifierShell,
@@ -524,16 +525,17 @@ export default function (pi: ExtensionAPI) {
     shell: ClassifierShell,
   ): Promise<{ block: boolean; reason: string; terminate?: boolean } | undefined> {
     if (config.classifier !== "jev" || !command) return undefined;
-    const apiKey = process.env[TYPESAFE_API_KEY_ENV];
-    if (!apiKey) {
+    const resolved = resolveApiKey();
+    if (!resolved) {
       warnClassifierOnce(
         ctx,
         () => classifierNoKeyWarned,
         () => (classifierNoKeyWarned = true),
-        `Classifier enabled (classifier: jev) but ${TYPESAFE_API_KEY_ENV} is not set — Jev classification is skipped.`,
+        `Classifier enabled (classifier: jev) but no TypeSafe API key found (${TYPESAFE_API_KEY_ENV} is unset and ~/.pi/credentials/typesafe-api-key is absent or unsafe) — Jev classification is skipped.`,
       );
       return undefined;
     }
+    const apiKey = resolved.key;
     const model = config.classifierModel ?? DEFAULT_JEV_MODEL;
     const result = await callJev(buildClassifierRequest(command, model, shell), {
       apiKey,
