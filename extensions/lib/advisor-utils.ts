@@ -751,19 +751,70 @@ export function stripRefreshTokens(authJsonText: string): string {
   try {
     parsed = JSON.parse(authJsonText);
   } catch {
-    return authJsonText;
+    throw new Error(
+      "auth.json could not be parsed; refusing to copy unverified credentials to the child",
+    );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return authJsonText;
+    throw new Error(
+      "auth.json must be an object of provider -> credential maps; refusing to copy it to the child",
+    );
   }
-  const providers = parsed as { [providerId: string]: unknown };
-  for (const id of Object.keys(providers)) {
-    const credential = providers[id];
-    if (typeof credential === "object" && credential !== null && !Array.isArray(credential)) {
-      delete (credential as { [field: string]: unknown }).refresh;
+  const clone = structuredClone(parsed) as Record<string, unknown>;
+  stripRefreshKeys(clone);
+  return JSON.stringify(clone);
+}
+
+/** Recursively delete every `refresh` field at any depth of a parsed credential document. */
+function stripRefreshKeys(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) stripRefreshKeys(item);
+    return;
+  }
+  if (typeof node !== "object" || node === null) return;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (key === "refresh") delete (node as Record<string, unknown>).refresh;
+    else stripRefreshKeys(value);
+  }
+}
+
+const SECRET_KEY_PATTERN =
+  /(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pwd|secret|refresh)/i;
+
+/**
+ * Best-effort scrub of secret-bearing fields from a parsed models.json document
+ * (e.g. `apiKey`, nested `accessToken`), keeping the structure (providers, models,
+ * baseUrl, compat) intact. Throws on unparseable input so the caller refuses to copy
+ * it — a raw copy of an unverified model catalog must never reach the child.
+ */
+export function scrubModelCatalog(modelJsonText: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(modelJsonText);
+  } catch {
+    throw new Error("models.json could not be parsed; refusing to copy it to the child");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("models.json must be an object; refusing to copy it to the child");
+  }
+  const clone = structuredClone(parsed);
+  scrubSecretKeys(clone);
+  return JSON.stringify(clone);
+}
+
+function scrubSecretKeys(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) scrubSecretKeys(item);
+    return;
+  }
+  if (typeof node !== "object" || node === null) return;
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (SECRET_KEY_PATTERN.test(key)) {
+      delete (node as Record<string, unknown>)[key];
+    } else {
+      scrubSecretKeys(value);
     }
   }
-  return JSON.stringify(parsed);
 }
 
 /**

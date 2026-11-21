@@ -40,6 +40,7 @@ import {
   requestCharBudget,
   resolveConsultTimeoutMs,
   resolvePiBinary,
+  scrubModelCatalog,
   splitEffortSuffix,
   splitNdjsonLines,
   stripRefreshTokens,
@@ -1183,10 +1184,50 @@ describe("stripRefreshTokens", () => {
     assert.equal(out.openai.type, "api_key");
   });
 
-  it("returns non-object / malformed input unchanged", () => {
-    assert.equal(stripRefreshTokens("not json"), "not json");
-    assert.equal(stripRefreshTokens("[1,2,3]"), "[1,2,3]");
-    assert.equal(stripRefreshTokens(`"just a string"`), `"just a string"`);
+  it("throws on non-object / malformed input (fail closed)", () => {
+    assert.throws(() => stripRefreshTokens("not json"), /could not be parsed/);
+    assert.throws(() => stripRefreshTokens("[1,2,3]"), /must be an object/);
+    assert.throws(() => stripRefreshTokens(`"just a string"`), /must be an object/);
+  });
+
+  it("strips refresh tokens at any depth of nested credential shapes", () => {
+    const input = JSON.stringify({
+      openai: { type: "api_key", keys: [{ access: "at", refresh: "rt" }, { access: "at2" }] },
+      nested: { cred: { token: "x", refresh: "nested-rt", extra: { refresh: "deep" } } },
+    });
+    const out = JSON.parse(stripRefreshTokens(input)) as any;
+    assert.equal(out.openai.keys[0].refresh, undefined);
+    assert.equal(out.openai.keys[0].access, "at");
+    assert.equal(out.nested.cred.refresh, undefined);
+    assert.equal(out.nested.cred.extra.refresh, undefined);
+    assert.equal(out.nested.cred.token, "x");
+  });
+});
+
+describe("scrubModelCatalog", () => {
+  it("removes secret-bearing fields recursively but preserves structure", () => {
+    const input = JSON.stringify({
+      providers: {
+        exllama: {
+          api: "openai-completions",
+          apiKey: "local",
+          baseUrl: "http://127.0.0.1:5000/v1",
+          models: [{ id: "m", accessToken: "at", secret: "s" }],
+        },
+      },
+    });
+    const out = JSON.parse(scrubModelCatalog(input)) as any;
+    assert.equal(out.providers.exllama.apiKey, undefined);
+    assert.equal(out.providers.exllama.baseUrl, "http://127.0.0.1:5000/v1");
+    assert.equal(out.providers.exllama.api, "openai-completions");
+    assert.equal(out.providers.exllama.models[0].accessToken, undefined);
+    assert.equal(out.providers.exllama.models[0].secret, undefined);
+    assert.equal(out.providers.exllama.models[0].id, "m");
+  });
+
+  it("throws on unparseable input (fail closed)", () => {
+    assert.throws(() => scrubModelCatalog("not json"), /could not be parsed/);
+    assert.throws(() => scrubModelCatalog("[1,2,3]"), /must be an object/);
   });
 });
 

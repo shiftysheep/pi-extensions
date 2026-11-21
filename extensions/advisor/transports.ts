@@ -12,15 +12,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
-import {
-  chmodSync,
-  copyFileSync,
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model, Usage } from "@earendil-works/pi-ai";
@@ -39,6 +31,7 @@ import {
   parseNdjsonLine,
   remainingBudgetMs,
   resolvePiBinary,
+  scrubModelCatalog,
   stripRefreshTokens,
 } from "../lib/advisor-utils.js";
 import { ADVISOR_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT } from "./request.js";
@@ -77,17 +70,52 @@ function prepareChildWorkDir(
   const hostAgentDir = getAgentDir();
   for (const name of ["models.json", "models-store.json"]) {
     const hostFile = join(hostAgentDir, name);
-    if (existsSync(hostFile)) {
-      copyFileSync(hostFile, join(workDir, name));
+    if (!existsSync(hostFile)) continue;
+    // Scrub secret-bearing fields (apiKey, accessToken, ...) before copying;
+    // an unparseable catalog is never copied raw.
+    try {
+      const scrubbed = scrubModelCatalog(readFileSync(hostFile, "utf8"));
+      writeFileSync(join(workDir, name), scrubbed, { mode: 0o600 });
       chmodSync(join(workDir, name), 0o600);
+    } catch {
+      // Never copy an unverified model catalog to the child.
     }
   }
   const hostAuth = join(hostAgentDir, "auth.json");
   if (existsSync(hostAuth)) {
-    writeFileSync(join(workDir, "auth.json"), stripRefreshTokens(readFileSync(hostAuth, "utf8")), {
-      mode: 0o400,
-    });
+    try {
+      writeFileSync(
+        join(workDir, "auth.json"),
+        stripRefreshTokens(readFileSync(hostAuth, "utf8")),
+        {
+          mode: 0o400,
+        },
+      );
+    } catch {
+      // Fail closed: skip the copy entirely rather than let the child see an
+      // unverified credential file. The child then fails auth and the fallback
+      // chain takes over.
+    }
   }
+}
+
+/**
+ * Create the child's throwaway work dir and run setup; on any setup failure remove
+ * the temp directory before re-throwing so nothing leaks.
+ */
+function createChildWorkDir(
+  systemPrompt: string,
+  opts: { model: Model<any>; question: string; transcript: string; config?: AdvisorConfig },
+): { workDir: string; promptPath: string } {
+  const workDir = mkdtempSync(join(tmpdir(), "pi-advisor-"));
+  const promptPath = join(workDir, "prompt.txt");
+  try {
+    prepareChildWorkDir(workDir, promptPath, systemPrompt, opts);
+  } catch (error) {
+    rmSync(workDir, { recursive: true, force: true });
+    throw error;
+  }
+  return { workDir, promptPath };
 }
 
 /**
@@ -133,9 +161,7 @@ export async function consultWithChildProcess(opts: {
 
   const systemPrompt = opts.mode === "review" ? REVIEW_SYSTEM_PROMPT : ADVISOR_SYSTEM_PROMPT;
   const tools = opts.mode === "explore" ? ADVISOR_TOOLS : [];
-  const workDir = mkdtempSync(join(tmpdir(), "pi-advisor-"));
-  const promptPath = join(workDir, "prompt.txt");
-  prepareChildWorkDir(workDir, promptPath, systemPrompt, opts);
+  const { workDir, promptPath } = createChildWorkDir(systemPrompt, opts);
   // Test seam (see the opts.__test doc): fake spawn / mocked group-kill / short
   // margin, all defaulting to the real implementations (no production change).
   const spawnImpl =

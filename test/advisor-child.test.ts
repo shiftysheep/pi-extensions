@@ -232,6 +232,67 @@ describe("consultWithChildProcess (fake pi lifecycle)", () => {
     }
   });
 
+  it("scrubs secret fields from the copied models.json", async () => {
+    const hostDir = mkdtempSync(join(tmpdir(), "advisor-host-scrub-"));
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = hostDir;
+    const outFile = join(process.cwd(), ".advisor-child-test-scrub");
+    try {
+      writeFileSync(
+        join(hostDir, "models.json"),
+        JSON.stringify({
+          providers: {
+            p: { apiKey: "secret", baseUrl: "https://x", models: [{ id: "m", accessToken: "at" }] },
+          },
+        }),
+      );
+      const bin = fakePi(
+        'const fs=require("node:fs");const p=require("node:path");const dir=process.env.PI_CODING_AGENT_DIR;' +
+          "fs.writeFileSync(" +
+          JSON.stringify(outFile) +
+          ',fs.readFileSync(p.join(dir,"models.json"),"utf8"));' +
+          msgEndScript("ok", { stopReason: "stop" }),
+      );
+      const result = await consult(bin);
+      assert.equal(result.status, "completed");
+      const copied = JSON.parse(readFileSync(outFile, "utf8")) as any;
+      assert.equal(copied.providers.p.apiKey, undefined);
+      assert.equal(copied.providers.p.models[0].accessToken, undefined);
+      assert.equal(copied.providers.p.baseUrl, "https://x");
+      assert.equal(copied.providers.p.models[0].id, "m");
+    } finally {
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(hostDir, { recursive: true, force: true });
+      rmSync(outFile, { force: true });
+    }
+  });
+
+  it("refuses to copy auth.json at all when it cannot be parsed", async () => {
+    const hostDir = mkdtempSync(join(tmpdir(), "advisor-host-badauth-"));
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = hostDir;
+    const outFile = join(process.cwd(), ".advisor-child-test-badauth");
+    try {
+      writeFileSync(join(hostDir, "auth.json"), "not json at all");
+      const bin = fakePi(
+        'const fs=require("node:fs");const p=require("node:path");const dir=process.env.PI_CODING_AGENT_DIR;' +
+          "fs.writeFileSync(" +
+          JSON.stringify(outFile) +
+          ',fs.existsSync(p.join(dir,"auth.json"))?"yes":"no");' +
+          msgEndScript("ok", { stopReason: "stop" }),
+      );
+      const result = await consult(bin);
+      assert.equal(result.status, "completed");
+      assert.equal(readFileSync(outFile, "utf8").trim(), "no", "auth.json must not be written");
+    } finally {
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(hostDir, { recursive: true, force: true });
+      rmSync(outFile, { force: true });
+    }
+  });
+
   it("removes the work dir when the fake pi crashes", async () => {
     const before = workDirs();
     const bin = fakePi("process.exit(1);");
